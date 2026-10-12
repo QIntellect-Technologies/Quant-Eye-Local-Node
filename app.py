@@ -352,34 +352,39 @@ class NodeCameraReader:
     def _grabber_loop(self):
         last_reconnect_attempt = 0
         while self.running:
-            if not self.cap.isOpened():
-                now = time.time()
-                if now - last_reconnect_attempt > 1.0:
-                    last_reconnect_attempt = now
+            try:
+                if not self.cap or not self.cap.isOpened():
+                    now = time.time()
+                    if now - last_reconnect_attempt > 1.5:
+                        last_reconnect_attempt = now
+                        try:
+                            if self.is_webcam:
+                                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
+                                if not self.cap.isOpened():
+                                    self.cap = cv2.VideoCapture(self.rtsp_url)
+                            else:
+                                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                            if self.cap.isOpened():
+                                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                                logger.info(f"[CAMERA CONNECTED] {self.camera_name} ({self.camera_id}) opened successfully.")
+                        except Exception as ce:
+                            logger.debug(f"Reconnect attempt failed for {self.camera_id}: {ce}")
+                    time.sleep(0.5)
+                    continue
+
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.latest_frame = frame
+                else:
                     try:
-                        if self.is_webcam:
-                            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
-                            if not self.cap.isOpened():
-                                self.cap = cv2.VideoCapture(self.rtsp_url)
-                        else:
-                            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-                        if self.cap.isOpened():
-                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                            logger.info(f"[CAMERA CONNECTED] {self.camera_name} ({self.camera_id}) opened successfully.")
-                    except Exception as ce:
-                        logger.debug(f"Reconnect attempt failed for {self.camera_id}: {ce}")
-                time.sleep(0.5)
-                continue
-            ret, frame = self.cap.read()
-            if ret and frame is not None:
-                with self.lock:
-                    self.latest_frame = frame
-            else:
-                # If frame read failed, release and force fast reconnect
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+            except Exception as e:
+                # Catch any C++ / OpenCV exceptions gracefully so thread never terminates
+                logger.debug(f"Grabber loop exception in {self.camera_id}: {e}")
                 time.sleep(0.5)
 
     def _ai_loop(self):
@@ -540,26 +545,43 @@ def init_camera_streams():
                 logger.debug(f"Direct portal check: {pe}")
 
     with readers_lock:
-        for reader in ACTIVE_CAMERA_READERS.values():
-            reader.release()
-        ACTIVE_CAMERA_READERS.clear()
-
+        valid_cams = {}
         for cam in cameras_to_use:
             cid = str(cam.get("id") or cam.get("camera_id"))
             cname = cam.get("name") or cam.get("camera_name", f"Camera {cid}")
             source = cam.get("rtsp_url", "")
             cam_type = str(cam.get("camera_type", "rtsp")).lower()
-            
-            # Never open default 0 webcam unless explicitly requested
             if not source or (str(source).strip() in ("0", "") and cam_type != "webcam"):
-                logger.info(f"Skipping camera without RTSP source: {cname} ({cid})")
                 continue
+            valid_cams[cid] = (cname, source)
 
-            try:
-                ACTIVE_CAMERA_READERS[cid] = NodeCameraReader(cid, cname, source)
-                logger.info(f"Started camera stream reader: {cname} ({cid}) -> {source}")
-            except Exception as e:
-                logger.error(f"Failed to start camera {cid}: {e}")
+        # 1. Stop and remove only stale cameras
+        stale_cids = [cid for cid in list(ACTIVE_CAMERA_READERS.keys()) if cid not in valid_cams]
+        for cid in stale_cids:
+            reader = ACTIVE_CAMERA_READERS.pop(cid, None)
+            if reader:
+                try:
+                    reader.release()
+                    logger.info(f"[*] Safely released deleted camera stream: {cid}")
+                except Exception as e:
+                    logger.debug(f"Error releasing camera {cid}: {e}")
+
+        # 2. Add only new cameras or update changed sources
+        for cid, (cname, source) in valid_cams.items():
+            existing = ACTIVE_CAMERA_READERS.get(cid)
+            if existing is None:
+                try:
+                    ACTIVE_CAMERA_READERS[cid] = NodeCameraReader(cid, cname, source)
+                    logger.info(f"Started camera stream reader: {cname} ({cid}) -> {source}")
+                except Exception as e:
+                    logger.error(f"Failed to start camera {cid}: {e}")
+            elif str(existing.rtsp_source) != str(source):
+                try:
+                    existing.release()
+                    ACTIVE_CAMERA_READERS[cid] = NodeCameraReader(cid, cname, source)
+                    logger.info(f"Updated camera stream reader: {cname} ({cid}) -> {source}")
+                except Exception as e:
+                    logger.error(f"Failed to update camera {cid}: {e}")
 
 _last_cloud_cam_hash = None
 
