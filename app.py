@@ -16,6 +16,7 @@ import threading
 import queue
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+import sqlite3
 import urllib.request
 import urllib.error
 
@@ -161,6 +162,46 @@ def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: floa
 # FAST VECTORIZED FACE MATCHING
 # ==============================================================================
 
+def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str) -> int:
+    """
+    Sync client employees and embeddings from local database or cloud for this specific organization & branch.
+    Strict tenant isolation: ensures profiles strictly belong to org_id and branch_id.
+    """
+    try:
+        # Check if local database already has users scoped to this branch
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM users WHERE organization_id = ? AND branch_id = ?", (org_id, branch_id))
+            scoped_count = cur.fetchone()[0]
+
+            # If node DB doesn't have them yet, check if master Local-Dashboard has them
+            if scoped_count == 0:
+                master_db = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Local-Dashboard", "attendance.db"))
+                if os.path.exists(master_db):
+                    with sqlite3.connect(master_db) as mconn:
+                        mcur = mconn.cursor()
+                        mcur.execute("SELECT id, name, email, department, active, organization_id, branch_id FROM users WHERE organization_id = ? AND branch_id = ?", (org_id, branch_id))
+                        musers = mcur.fetchall()
+                        for u in musers:
+                            cur.execute("""
+                                INSERT OR REPLACE INTO users (id, name, email, department, active, organization_id, branch_id)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, u)
+                            # Copy embeddings
+                            mcur.execute("SELECT id, user_id, embedding, source_video, created_at FROM embeddings WHERE user_id = ?", (u[0],))
+                            membs = mcur.fetchall()
+                            for emb in membs:
+                                cur.execute("""
+                                    INSERT OR REPLACE INTO embeddings (id, user_id, embedding, source_video, created_at)
+                                    VALUES (?, ?, ?, ?, ?)
+                                """, emb)
+                        conn.commit()
+                        logger.info(f"[TENANT SYNC] Imported {len(musers)} employees and embeddings for {org_id} / {branch_id}")
+    except Exception as e:
+        logger.warning(f"Could not synchronize employee profiles: {e}")
+    return 0
+
+
 def reload_face_cache():
     global EMBEDDING_CACHE, ENROLLED_MATRIX, ENROLLED_USER_IDS, ENROLLED_USER_METADATA
     logger.info("[*] Refreshing in-memory facial embedding cache from database...")
@@ -169,8 +210,21 @@ def reload_face_cache():
     user_ids = []
     user_metadata = []
 
+    target_org = CONFIG.get("organization_id")
+    target_branch = CONFIG.get("branch_id")
+
+    # Scope users strictly to authenticated tenant
     all_users = db.get_all_users()
     for user in all_users:
+        u_org = user.get('organization_id')
+        u_branch = user.get('branch_id')
+        
+        # If tenant is set in node config, enforce tenant filtering
+        if target_org and u_org and u_org != target_org:
+            continue
+        if target_branch and u_branch and u_branch != target_branch:
+            continue
+
         user_embeddings = db.get_embeddings_for_user(user['id'])
         if len(user_embeddings) == 0:
             continue
@@ -206,11 +260,12 @@ def reload_face_cache():
             ENROLLED_MATRIX = np.vstack(matrix_rows).astype(np.float32)
             ENROLLED_USER_IDS = user_ids
             ENROLLED_USER_METADATA = user_metadata
-            logger.info(f"[OK] Cached {len(user_ids)} profiles in vectorized matrix for instant live recognition.")
+            logger.info(f"[OK] Cached {len(user_ids)} profiles in vectorized matrix for instant live recognition ({target_org or 'ALL'}).")
         else:
             ENROLLED_MATRIX = None
             ENROLLED_USER_IDS = []
             ENROLLED_USER_METADATA = []
+            logger.info(f"[INFO] 0 profiles found for tenant {target_org} / {target_branch}.")
 
 
 # ==============================================================================
@@ -473,60 +528,140 @@ def get_node_detections():
     return jsonify({"success": True, "detections": feed})
 
 
-@app.route('/api/node/activate-key', methods=['POST'])
-def api_node_activate_key():
+@app.route('/api/node/cloud-status')
+def get_node_cloud_status():
+    """Check connectivity to Cloud Main Dashboard."""
+    cloud_url = CONFIG.get('cloud_url', 'http://127.0.0.1:5100').rstrip('/')
+    is_connected = False
+    try:
+        health_url = f"{cloud_url}/api/integration/local/status"
+        req = urllib.request.Request(health_url, method="GET")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            if resp.status == 200:
+                is_connected = True
+    except Exception:
+        is_connected = False
+    return jsonify({
+        "success": True,
+        "cloud_connected": is_connected,
+        "cloud_url": cloud_url,
+        "organization_id": CONFIG.get("organization_id"),
+        "branch_id": CONFIG.get("branch_id")
+    })
+
+
+@app.route('/api/node/login-auth', methods=['POST'])
+def api_node_login_auth():
     """
-    Activate the Standalone Edge Node with an Organization/Branch Key.
-    Dynamic: Works for any client branch without hardcoding.
+    Step 1: Authenticate Client credentials + Branch Key against Cloud.
+    Accepts: username/email, password, branch_key, cloud_url.
+    Authenticates against Cloud `/api/client/authenticate` and `/api/edge/validate-key`.
+    Saves configuration, binds tenant, triggers camera reload and profile sync.
     """
     global CONFIG
     data = request.get_json(silent=True) or {}
-    branch_key = data.get('branch_key', '').strip()
+    username = (data.get('username') or data.get('email') or '').strip()
+    password = (data.get('password') or '').strip()
+    branch_key = (data.get('branch_key') or '').strip()
     cloud_url = (data.get('cloud_url') or CONFIG.get('cloud_url', 'http://127.0.0.1:5100')).strip().rstrip('/')
 
-    if not branch_key:
-        return jsonify({"success": False, "error": "Branch Key is required"}), 400
+    if not branch_key and not username:
+        return jsonify({"success": False, "error": "Username/Email and Branch Key are required"}), 400
 
     try:
+        # Step 1.1: If username and password provided, authenticate against Cloud
+        auth_info = {}
+        if username and password:
+            auth_url = f"{cloud_url}/api/client/authenticate"
+            auth_body = json.dumps({
+                "username": username,
+                "password": password,
+                "branch_key": branch_key
+            }).encode('utf-8')
+            req_auth = urllib.request.Request(auth_url, data=auth_body, headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(req_auth, timeout=5.0) as resp_auth:
+                    if resp_auth.status == 200:
+                        auth_info = json.loads(resp_auth.read().decode('utf-8'))
+                        # If branch_key wasn't provided, use the one associated with the user's branch
+                        if not branch_key and auth_info.get('branch_key'):
+                            branch_key = auth_info['branch_key']
+            except urllib.error.HTTPError as he:
+                err_text = "Invalid username or password"
+                try:
+                    err_text = json.loads(he.read().decode('utf-8')).get('error', err_text)
+                except Exception:
+                    pass
+                return jsonify({"success": False, "error": err_text}), 401
+
+        if not branch_key:
+            return jsonify({"success": False, "error": "Branch Key is required"}), 400
+
+        # Step 1.2: Validate Branch Key to get cameras and branch status
         val_url = f"{cloud_url}/api/edge/validate-key"
         val_payload = json.dumps({"branch_key": branch_key}).encode('utf-8')
-        req = urllib.request.Request(val_url, data=val_payload, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=4.0) as resp:
-            if resp.status == 200:
-                val_data = json.loads(resp.read().decode('utf-8'))
-                # Update runtime config
-                CONFIG['organization_id'] = val_data['organization_id']
-                CONFIG['organization_name'] = val_data['organization_name']
-                CONFIG['branch_id'] = val_data['branch_id']
-                CONFIG['branch_name'] = val_data['branch_name']
-                CONFIG['branch_key'] = branch_key
-                CONFIG['cloud_url'] = cloud_url
-                CONFIG['cameras'] = val_data.get('cameras', [])
-                
-                # Persist to config_node.json
-                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                    json.dump(CONFIG, f, indent=2)
+        req_val = urllib.request.Request(val_url, data=val_payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req_val, timeout=5.0) as resp_val:
+            if resp_val.status != 200:
+                return jsonify({"success": False, "error": "Branch Key rejected by Cloud"}), 401
+            val_data = json.loads(resp_val.read().decode('utf-8'))
 
-                # Reload camera streams dynamically
-                threading.Thread(target=init_camera_streams, daemon=True).start()
+        org_id = val_data['organization_id']
+        branch_id = val_data['branch_id']
+        org_name = val_data['organization_name']
+        branch_name = val_data['branch_name']
+        cameras = val_data.get('cameras', [])
 
-                return jsonify({
-                    "success": True,
-                    "organization_name": val_data['organization_name'],
-                    "branch_name": val_data['branch_name'],
-                    "camera_count": len(val_data.get('cameras', [])),
-                    "message": f"Successfully activated {val_data['organization_name']} - {val_data['branch_name']}"
-                }), 200
-            else:
-                return jsonify({"success": False, "error": "Authentication failed"}), 401
+        # Update runtime config
+        CONFIG['linked'] = True
+        CONFIG['organization_id'] = org_id
+        CONFIG['organization_name'] = org_name
+        CONFIG['branch_id'] = branch_id
+        CONFIG['branch_name'] = branch_name
+        CONFIG['branch_key'] = branch_key
+        CONFIG['cloud_url'] = cloud_url
+        CONFIG['username'] = username
+        CONFIG['cameras'] = cameras
+
+        # Persist securely to config_node.json
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=2)
+
+        # Synchronize employee profiles & face embeddings for this tenant
+        sync_client_profiles_from_cloud(org_id, branch_id, cloud_url)
+        reload_face_cache()
+
+        # Reload camera streams dynamically
+        threading.Thread(target=init_camera_streams, daemon=True).start()
+
+        return jsonify({
+            "success": True,
+            "linked": True,
+            "organization_id": org_id,
+            "organization_name": org_name,
+            "branch_id": branch_id,
+            "branch_name": branch_name,
+            "camera_count": len(cameras),
+            "message": f"Successfully activated {org_name} • {branch_name}"
+        }), 200
+
     except urllib.error.HTTPError as he:
         try:
             err_body = json.loads(he.read().decode('utf-8'))
             return jsonify({"success": False, "error": err_body.get('error', f"HTTP {he.code}")}), he.code
         except Exception:
-            return jsonify({"success": False, "error": f"Cloud rejected key (HTTP {he.code})"}), he.code
+            return jsonify({"success": False, "error": f"Server rejected login (HTTP {he.code})"}), he.code
     except Exception as e:
-        return jsonify({"success": False, "error": f"Could not reach server: {str(e)}"}), 502
+        return jsonify({"success": False, "error": f"Connection error: {str(e)}"}), 502
+
+
+@app.route('/api/node/activate-key', methods=['POST'])
+def api_node_activate_key():
+    """
+    Activate the Standalone Edge Node with an Organization/Branch Key.
+    Delegates to full api_node_login_auth flow.
+    """
+    return api_node_login_auth()
 
 
 def start_client_node(port: int = 5005):
