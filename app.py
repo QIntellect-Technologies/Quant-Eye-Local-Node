@@ -260,11 +260,13 @@ def reload_face_cache():
         u_org = user.get('organization_id')
         u_branch = user.get('branch_id')
         
-        # If tenant is set in node config, enforce tenant filtering
-        if target_org and u_org and u_org != target_org:
-            continue
-        if target_branch and u_branch and u_branch != target_branch:
-            continue
+        # Enforce strict tenant filtering: NEVER match legacy or unassigned profiles
+        if target_org:
+            if not u_org or str(u_org).strip() != str(target_org).strip():
+                continue
+        if target_branch:
+            if u_branch and str(u_branch).strip() != str(target_branch).strip():
+                continue
 
         user_embeddings = db.get_embeddings_for_user(user['id'])
         if len(user_embeddings) == 0:
@@ -352,23 +354,33 @@ class NodeCameraReader:
         while self.running:
             if not self.cap.isOpened():
                 now = time.time()
-                if now - last_reconnect_attempt > 5.0:
+                if now - last_reconnect_attempt > 1.0:
                     last_reconnect_attempt = now
                     try:
                         if self.is_webcam:
-                            self.cap = cv2.VideoCapture(self.rtsp_url)
+                            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
+                            if not self.cap.isOpened():
+                                self.cap = cv2.VideoCapture(self.rtsp_url)
                         else:
                             self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-                    except Exception:
-                        pass
-                time.sleep(1.0)
+                        if self.cap.isOpened():
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            logger.info(f"[CAMERA CONNECTED] {self.camera_name} ({self.camera_id}) opened successfully.")
+                    except Exception as ce:
+                        logger.debug(f"Reconnect attempt failed for {self.camera_id}: {ce}")
+                time.sleep(0.5)
                 continue
             ret, frame = self.cap.read()
             if ret and frame is not None:
                 with self.lock:
                     self.latest_frame = frame
             else:
-                time.sleep(0.03)
+                # If frame read failed, release and force fast reconnect
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
     def _ai_loop(self):
         last_ai_time = 0
@@ -843,8 +855,7 @@ def api_node_list_employees():
                            COALESCE(u.notes, ''), COUNT(e.id) as emb_count
                     FROM users u
                     LEFT JOIN embeddings e ON u.id = e.user_id
-                    WHERE (u.organization_id = ? AND u.branch_id = ?) 
-                       OR (u.organization_id IS NULL OR u.organization_id = '')
+                    WHERE u.organization_id = ? AND u.branch_id = ?
                     GROUP BY u.id
                     ORDER BY u.id DESC
                 """, (org_id, branch_id))
