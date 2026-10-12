@@ -49,12 +49,24 @@ import database as db
 import face_processor as fp
 from logger_config import get_logger
 
-logger = get_logger("client_node")
+logger = get_logger(__name__)
 
-app = Flask(__name__, template_folder='templates', static_folder='static')
+# Resolve persistent working directory vs bundle directory
+if getattr(sys, 'frozen', False):
+    EXE_DIR = os.path.dirname(sys.executable)
+    BUNDLE_DIR = getattr(sys, '_MEIPASS', EXE_DIR)
+else:
+    EXE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE_DIR = EXE_DIR
+
+templates_dir = os.path.join(BUNDLE_DIR, 'templates')
+static_dir = os.path.join(BUNDLE_DIR, 'static')
+
+app = Flask(__name__, template_folder=templates_dir, static_folder=static_dir)
 app.secret_key = "quanteye-client-node-secret-key"
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config_node.json')
+# Persistent config must reside next to EXE, NOT inside temporary _MEIPASS
+CONFIG_PATH = os.path.join(EXE_DIR, 'config_node.json')
 
 def load_config() -> Dict[str, Any]:
     default_cfg = {
@@ -482,6 +494,34 @@ def live_node_page():
     return render_template('live_node.html', config=CONFIG)
 
 
+@app.route('/api/node/health')
+def api_node_health():
+    """Healthcheck endpoint for standalone packaging & node monitor."""
+    return jsonify({
+        "status": "healthy",
+        "service": "QuantEye Client AI Node",
+        "port": 5005,
+        "linked": CONFIG.get("linked", False),
+        "organization_id": CONFIG.get("organization_id"),
+        "branch_id": CONFIG.get("branch_id")
+    })
+
+
+@app.route('/api/node/status')
+def api_node_status():
+    """Status endpoint for node state and active camera count."""
+    with readers_lock:
+        active_count = len(ACTIVE_CAMERA_READERS)
+    return jsonify({
+        "success": True,
+        "linked": CONFIG.get("linked", False),
+        "organization_id": CONFIG.get("organization_id"),
+        "branch_id": CONFIG.get("branch_id"),
+        "active_cameras": active_count,
+        "face_match_threshold": CONFIG.get("face_match_threshold", 0.45)
+    })
+
+
 @app.route('/stream/<camera_id>')
 def camera_stream_feed(camera_id):
     """Multipart video feed for each camera box."""
@@ -668,7 +708,7 @@ def start_client_node(port: int = 5005):
     logger.info("Initializing QuantEye Client AI Node...")
     db.init_db()
     reload_face_cache()
-    init_camera_streams()
+    threading.Thread(target=init_camera_streams, daemon=True).start()
     logger.info(f"Starting QuantEye Client AI Node on http://127.0.0.1:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
 
