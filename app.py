@@ -505,21 +505,44 @@ def init_camera_streams():
         try:
             cloud_cams_url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={org_id}"
             req = urllib.request.Request(cloud_cams_url, method="GET")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
-                    if "cameras" in data:
-                        cameras_to_use = data.get("cameras", [])
-                        CONFIG["cameras"] = cameras_to_use
-                        # Persist fetched cameras
-                        try:
-                            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                                json.dump(CONFIG, f, indent=2)
-                        except Exception:
-                            pass
-                        logger.info(f"[CLOUD CONNECTED] Loaded {len(cameras_to_use)} camera streams configured in Cloud for {org_id} / {branch_id}.")
+                    if "cameras" in data and len(data.get("cameras", [])) > 0:
+                        fetched = data.get("cameras", [])
+                        # Prefer real stream if present
+                        if any(c.get("rtsp_url") and str(c.get("rtsp_url")) != "0" for c in fetched) or not cameras_to_use:
+                            cameras_to_use = fetched
+                            CONFIG["cameras"] = cameras_to_use
+                            try:
+                                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                                    json.dump(CONFIG, f, indent=2)
+                            except Exception:
+                                pass
+                            logger.info(f"[CLOUD CONNECTED] Loaded {len(cameras_to_use)} camera streams configured in Cloud for {org_id} / {branch_id}.")
         except Exception as ce:
-            logger.info(f"[STANDALONE] Cloud unreachable or offline ({ce}). Operating with local camera config.")
+            logger.info(f"[STANDALONE] Cloud camera sync attempt ({ce}).")
+
+        # Secondary direct check: If no cameras or only default webcam, query Client Portal directly
+        if not cameras_to_use or all(str(c.get("rtsp_url", "0")) == "0" for c in cameras_to_use):
+            try:
+                portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
+                portal_req = urllib.request.Request(f"{portal_url}/api/cameras?active_only=true", headers={"User-Agent": "QuantEye-Node"})
+                with urllib.request.urlopen(portal_req, timeout=3.5) as p_resp:
+                    if p_resp.status == 200:
+                        p_cams = json.loads(p_resp.read().decode('utf-8'))
+                        matching = [c for c in p_cams if (not c.get("organization_id") or c.get("organization_id") in (org_id, 'DEFAULT_ORG')) and (not c.get("branch_id") or c.get("branch_id") in (branch_id, 'DEFAULT_BRANCH'))]
+                        if matching:
+                            cameras_to_use = matching
+                            CONFIG["cameras"] = cameras_to_use
+                            try:
+                                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                                    json.dump(CONFIG, f, indent=2)
+                            except Exception:
+                                pass
+                            logger.info(f"[PORTAL SYNC] Loaded {len(matching)} camera streams from Client Portal.")
+            except Exception as pe:
+                logger.debug(f"Direct portal check: {pe}")
 
     with readers_lock:
         for reader in ACTIVE_CAMERA_READERS.values():
