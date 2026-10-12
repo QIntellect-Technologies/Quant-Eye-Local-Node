@@ -1,0 +1,6072 @@
+import sqlite3
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional, Tuple, Any, Union
+from logger_config import get_logger
+from config import DB_PATH, ATTENDANCE_LOG_RETENTION_DAYS
+
+logger = get_logger(__name__)
+
+
+def init_db():
+    """Initialize SQLite database with proper schema, columns, and indexes."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+
+            # Users table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    email TEXT,
+                    phone TEXT,
+                    department TEXT,
+                    enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    active INTEGER DEFAULT 1,
+                    notes TEXT
+                )
+            ''')
+
+            # Automatic Migration: Add optional columns if they don't exist
+            for col, col_type in [
+                ("photo_path", "TEXT"),
+                ("password", "TEXT DEFAULT '123456'"),
+                ("role", "TEXT DEFAULT 'staff'"),
+                ("cnic", "TEXT"),
+                ("position", "TEXT"),
+                ("salary", "REAL DEFAULT 0"),
+                ("join_date", "TEXT"),
+                ("shift_id", "INTEGER DEFAULT 1"),
+                ("checkin_cameras", "TEXT DEFAULT 'all'"),
+                ("checkout_cameras", "TEXT DEFAULT 'all'"),
+                ("exit_date", "TEXT")
+            ]:
+                try:
+                    cursor.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass
+
+            # Create the base table before applying migrations that alter it.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS leave_types (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    code TEXT NOT NULL UNIQUE,
+                    yearly_allowance REAL DEFAULT 12.0,
+                    is_paid INTEGER DEFAULT 1,
+                    description TEXT,
+                    active INTEGER DEFAULT 1,
+                    allowance_period TEXT DEFAULT 'yearly',
+                    allowance_months INTEGER NOT NULL DEFAULT 12,
+                    half_leave_enabled INTEGER NOT NULL DEFAULT 0,
+                    half_leave_mode TEXT NOT NULL DEFAULT 'separate',
+                    half_leave_allowance_count INTEGER NOT NULL DEFAULT 0,
+                    half_leave_allowance_months INTEGER NOT NULL DEFAULT 12,
+                    half_leaves_per_quota_day INTEGER NOT NULL DEFAULT 2,
+                    half_leave_quota_type_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            try:
+                cursor.execute("SELECT allowance_period FROM leave_types LIMIT 1")
+            except sqlite3.OperationalError:
+                cursor.execute("ALTER TABLE leave_types ADD COLUMN allowance_period TEXT DEFAULT 'yearly'")
+                conn.commit()
+
+            leave_type_columns = {row[1] for row in cursor.execute("PRAGMA table_info(leave_types)").fetchall()}
+            if 'allowance_months' not in leave_type_columns:
+                cursor.execute("ALTER TABLE leave_types ADD COLUMN allowance_months INTEGER NOT NULL DEFAULT 12")
+                cursor.execute('''
+                    UPDATE leave_types
+                    SET allowance_months = CASE allowance_period
+                        WHEN 'monthly' THEN 1
+                        WHEN 'quarterly' THEN 3
+                        WHEN 'half_yearly' THEN 6
+                        ELSE 12
+                    END
+                ''')
+
+            for column, column_type in [
+                ('half_leave_enabled', 'INTEGER NOT NULL DEFAULT 0'),
+                ('half_leave_mode', "TEXT NOT NULL DEFAULT 'separate'"),
+                ('half_leave_allowance_count', 'INTEGER NOT NULL DEFAULT 0'),
+                ('half_leave_allowance_months', 'INTEGER NOT NULL DEFAULT 12'),
+                ('half_leaves_per_quota_day', 'INTEGER NOT NULL DEFAULT 2'),
+                ('half_leave_quota_type_id', 'INTEGER'),
+            ]:
+                if column not in leave_type_columns:
+                    cursor.execute(f"ALTER TABLE leave_types ADD COLUMN {column} {column_type}")
+            conn.commit()
+
+            # Face embeddings are required by enrollment and indexed below.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    embedding BLOB NOT NULL,
+                    source_video TEXT,
+                    quality_score REAL DEFAULT 1.0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+
+            # Attendance logs migration
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS attendance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    detected_name TEXT,
+                    confidence REAL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    source TEXT,
+                    frame_quality TEXT,
+                    location TEXT,
+                    device_id TEXT,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+            for col, col_type in [
+                ("checkout_camera_id", "TEXT"),
+                ("checkout_location", "TEXT"),
+                ("notes", "TEXT DEFAULT ''"),
+                ("marked_by", "TEXT DEFAULT 'System'"),
+                ("shift_id", "INTEGER DEFAULT NULL")
+            ]:
+                try:
+                    cursor.execute(f"ALTER TABLE attendance ADD COLUMN {col} {col_type}")
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass
+
+            # Manual absent overrides for today
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS manual_absent (
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(user_id, date),
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+
+            # Persistent room-presence snapshots, throttled by the app to one per user every five minutes.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS locator_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    department TEXT,
+                    camera_id TEXT NOT NULL,
+                    camera_name TEXT NOT NULL,
+                    room_name TEXT NOT NULL,
+                    confidence REAL DEFAULT 0,
+                    first_seen TEXT,
+                    last_seen TEXT,
+                    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+
+            # Leave requests table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS leave_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    user_name TEXT,
+                    leave_type TEXT NOT NULL,
+                    leave_duration TEXT NOT NULL DEFAULT 'full',
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    reason TEXT,
+                    status TEXT DEFAULT 'pending',
+                    approved_by TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+            leave_request_columns = {row[1] for row in cursor.execute("PRAGMA table_info(leave_requests)").fetchall()}
+            for column, column_type in [
+                ('leave_duration', "TEXT NOT NULL DEFAULT 'full'"),
+                ('half_leave_quota_type_id', 'INTEGER'),
+                ('half_leave_quota_charge', 'INTEGER NOT NULL DEFAULT 0'),
+                ('paid_days', 'INTEGER'),
+                ('unpaid_days', 'INTEGER'),
+                ('quota_days', 'INTEGER'),
+                ('paid_through_date', 'TEXT'),
+                ('quota_through_date', 'TEXT'),
+            ]:
+                if column not in leave_request_columns:
+                    cursor.execute(f"ALTER TABLE leave_requests ADD COLUMN {column} {column_type}")
+
+            # Seed default leave types if empty
+            cursor.execute("SELECT COUNT(*) FROM leave_types")
+            if cursor.fetchone()[0] == 0:
+                default_types = [
+                    ('Casual Leave', 'casual', 10.0, 1, 'Short-term casual leave'),
+                    ('Sick Leave', 'sick', 8.0, 1, 'Medical or health related leave'),
+                    ('Annual / Paid Leave', 'annual', 14.0, 1, 'Earned annual paid leave'),
+                    ('Unpaid Leave (LWP)', 'unpaid', 0.0, 0, 'Leave without pay'),
+                    ('Excess Paid Leave', 'excess_paid', 0.0, 1, 'Approved paid leave beyond standard quota')
+                ]
+                cursor.executemany(
+                    "INSERT INTO leave_types (name, code, yearly_allowance, is_paid, description) VALUES (?, ?, ?, ?, ?)",
+                    default_types
+                )
+
+            # Company holidays table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS company_holidays (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    holiday_date DATE NOT NULL UNIQUE,
+                    end_date DATE,
+                    description TEXT,
+                    is_recurring INTEGER DEFAULT 0,
+                    overtime_premium_percent REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            company_holiday_columns = {row[1] for row in cursor.execute("PRAGMA table_info(company_holidays)").fetchall()}
+            if 'end_date' not in company_holiday_columns:
+                cursor.execute("ALTER TABLE company_holidays ADD COLUMN end_date DATE")
+                cursor.execute("UPDATE company_holidays SET end_date = holiday_date")
+            if 'overtime_premium_percent' not in company_holiday_columns:
+                cursor.execute("ALTER TABLE company_holidays ADD COLUMN overtime_premium_percent REAL")
+            conn.commit()
+
+            # Employee leave balances table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS employee_leave_balances (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    leave_type_id INTEGER NOT NULL,
+                    year INTEGER NOT NULL,
+                    allocated_days REAL NOT NULL DEFAULT 0.0,
+                    used_days REAL NOT NULL DEFAULT 0.0,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(leave_type_id) REFERENCES leave_types(id) ON DELETE CASCADE,
+                    UNIQUE(user_id, leave_type_id, year)
+                )
+            ''')
+
+            # Overtime table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS overtime (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    user_name TEXT,
+                    ot_date TEXT NOT NULL,
+                    hours REAL NOT NULL,
+                    reason TEXT,
+                    status TEXT DEFAULT 'pending',
+                    approved_by TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+
+            # Salary configs table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS salary_configs (
+                    user_id INTEGER PRIMARY KEY,
+                    basic_salary REAL DEFAULT 0,
+                    allowances REAL DEFAULT 0,
+                    deductions REAL DEFAULT 0,
+                    ot_rate REAL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+
+            # Finalized payroll is stored as a monthly snapshot of employee and attendance data.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payroll_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payroll_month TEXT NOT NULL UNIQUE,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    employee_count INTEGER NOT NULL DEFAULT 0,
+                    total_basic_salary REAL NOT NULL DEFAULT 0,
+                    total_deduction REAL NOT NULL DEFAULT 0,
+                    total_net_salary REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'Finalized',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    finalized_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payroll_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payroll_run_id INTEGER NOT NULL,
+                    employee_id INTEGER NOT NULL,
+                    employee_name TEXT NOT NULL,
+                    department TEXT DEFAULT '',
+                    designation TEXT DEFAULT '',
+                    basic_salary REAL NOT NULL DEFAULT 0,
+                    scheduled_workdays INTEGER NOT NULL DEFAULT 0,
+                    present_days INTEGER NOT NULL DEFAULT 0,
+                    absent_days INTEGER NOT NULL DEFAULT 0,
+                    late_days INTEGER NOT NULL DEFAULT 0,
+                    approved_leave_days INTEGER NOT NULL DEFAULT 0,
+                    paid_leave_days INTEGER NOT NULL DEFAULT 0,
+                    unpaid_leave_days INTEGER NOT NULL DEFAULT 0,
+                    total_leave_days INTEGER NOT NULL DEFAULT 0,
+                    payable_days REAL NOT NULL DEFAULT 0,
+                    net_salary REAL NOT NULL DEFAULT 0,
+                    applied_rule_id INTEGER,
+                    matched_rule TEXT DEFAULT '',
+                    shift_details TEXT NOT NULL DEFAULT '[]',
+                    calendar_details TEXT NOT NULL DEFAULT '[]',
+                    deduction_type TEXT NOT NULL DEFAULT 'percentage',
+                    deduction_percent REAL,
+                    fixed_amount REAL NOT NULL DEFAULT 0,
+                    deduction_amount REAL,
+                    status TEXT NOT NULL DEFAULT 'Finalized',
+                    FOREIGN KEY(payroll_run_id) REFERENCES payroll_runs(id) ON DELETE CASCADE,
+                    UNIQUE(payroll_run_id, employee_id)
+                )
+            ''')
+            payroll_record_columns = {row[1] for row in cursor.execute("PRAGMA table_info(payroll_records)")}
+            for column, column_type in [
+                ("applied_rule_id", "INTEGER"),
+                ("matched_rule", "TEXT DEFAULT ''"),
+                ("shift_details", "TEXT NOT NULL DEFAULT '[]'"),
+                ("calendar_details", "TEXT NOT NULL DEFAULT '[]'"),
+                ("deduction_type", "TEXT NOT NULL DEFAULT 'percentage'"),
+                ("deduction_percent", "REAL"),
+                ("fixed_amount", "REAL NOT NULL DEFAULT 0"),
+                ("deduction_amount", "REAL"),
+                ("allowances", "REAL NOT NULL DEFAULT 0.0"),
+                ("custom_deductions", "REAL NOT NULL DEFAULT 0.0"),
+                ("overtime_hours", "REAL NOT NULL DEFAULT 0.0"),
+                ("overtime_rate", "REAL NOT NULL DEFAULT 0.0"),
+                ("overtime_amount", "REAL NOT NULL DEFAULT 0.0"),
+                ("overtime_breakdown", "TEXT NOT NULL DEFAULT '[]'"),
+                ("gross_salary", "REAL NOT NULL DEFAULT 0.0"),
+                ("paid_leave_days", "INTEGER NOT NULL DEFAULT 0"),
+                ("unpaid_leave_days", "INTEGER NOT NULL DEFAULT 0"),
+                ("unpaid_leave_deduction", "REAL NOT NULL DEFAULT 0.0"),
+                ("total_leave_days", "INTEGER NOT NULL DEFAULT 0"),
+            ]:
+                if column not in payroll_record_columns:
+                    cursor.execute(f"ALTER TABLE payroll_records ADD COLUMN {column} {column_type}")
+            payroll_run_columns = {row[1] for row in cursor.execute("PRAGMA table_info(payroll_runs)")}
+            if 'total_deduction' not in payroll_run_columns:
+                cursor.execute("ALTER TABLE payroll_runs ADD COLUMN total_deduction REAL NOT NULL DEFAULT 0")
+            if 'total_allowances' not in payroll_run_columns:
+                cursor.execute("ALTER TABLE payroll_runs ADD COLUMN total_allowances REAL NOT NULL DEFAULT 0")
+            if 'total_overtime' not in payroll_run_columns:
+                cursor.execute("ALTER TABLE payroll_runs ADD COLUMN total_overtime REAL NOT NULL DEFAULT 0")
+            cursor.executescript('''
+                CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_run_update
+                BEFORE UPDATE ON payroll_runs
+                WHEN OLD.status = 'Finalized'
+                BEGIN
+                    SELECT RAISE(ABORT, 'Finalized payroll runs are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_run_delete
+                BEFORE DELETE ON payroll_runs
+                WHEN OLD.status = 'Finalized'
+                BEGIN
+                    SELECT RAISE(ABORT, 'Finalized payroll runs are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_record_insert
+                BEFORE INSERT ON payroll_records
+                WHEN EXISTS (SELECT 1 FROM payroll_runs WHERE id = NEW.payroll_run_id AND status = 'Finalized')
+                BEGIN
+                    SELECT RAISE(ABORT, 'Finalized payroll records are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_record_update
+                BEFORE UPDATE ON payroll_records
+                WHEN EXISTS (SELECT 1 FROM payroll_runs WHERE id = OLD.payroll_run_id AND status = 'Finalized')
+                BEGIN
+                    SELECT RAISE(ABORT, 'Finalized payroll records are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_record_delete
+                BEFORE DELETE ON payroll_records
+                WHEN EXISTS (SELECT 1 FROM payroll_runs WHERE id = OLD.payroll_run_id AND status = 'Finalized')
+                BEGIN
+                    SELECT RAISE(ABORT, 'Finalized payroll records are immutable');
+                END;
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payroll_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_basis TEXT NOT NULL DEFAULT 'absence',
+                    min_absent_days INTEGER NOT NULL,
+                    max_absent_days INTEGER,
+                    deduction_type TEXT NOT NULL DEFAULT 'percentage',
+                    deduction_percent REAL NOT NULL DEFAULT 0,
+                    fixed_amount REAL NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    CHECK(min_absent_days >= 1),
+                    CHECK(max_absent_days IS NULL OR max_absent_days >= min_absent_days),
+                    CHECK(deduction_percent >= 0 AND deduction_percent <= 100),
+                    CHECK(fixed_amount >= 0),
+                    CHECK(deduction_type IN ('percentage', 'fixed'))
+                )
+            ''')
+            payroll_rule_columns = {row[1] for row in cursor.execute("PRAGMA table_info(payroll_rules)")}
+            for column, column_type in [
+                ("rule_basis", "TEXT NOT NULL DEFAULT 'absence'"),
+                ("deduction_type", "TEXT NOT NULL DEFAULT 'percentage'"),
+                ("fixed_amount", "REAL NOT NULL DEFAULT 0"),
+            ]:
+                if column not in payroll_rule_columns:
+                    cursor.execute(f"ALTER TABLE payroll_rules ADD COLUMN {column} {column_type}")
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payroll_settings (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    deduct_unpaid_leave INTEGER NOT NULL DEFAULT 0 CHECK(deduct_unpaid_leave IN (0, 1)),
+                    half_leave_quota_mode TEXT NOT NULL DEFAULT 'category',
+                    half_leaves_per_quota_day INTEGER NOT NULL DEFAULT 2,
+                    holiday_ot_premium_percent REAL NOT NULL DEFAULT 0,
+                    non_working_day_ot_premium_percent REAL NOT NULL DEFAULT 0,
+                    holiday_ot_premium_active INTEGER NOT NULL DEFAULT 0,
+                    non_working_day_ot_premium_active INTEGER NOT NULL DEFAULT 0,
+                    overtime_max_hours REAL NOT NULL DEFAULT 0,
+                    overtime_max_period TEXT NOT NULL DEFAULT 'day',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            payroll_setting_columns = {row[1] for row in cursor.execute("PRAGMA table_info(payroll_settings)")}
+            migrate_holiday_rule_active = "holiday_ot_premium_active" not in payroll_setting_columns
+            migrate_non_working_rule_active = "non_working_day_ot_premium_active" not in payroll_setting_columns
+            for column, column_type in [
+                ("half_leave_quota_mode", "TEXT NOT NULL DEFAULT 'separate'"),
+                ("half_leaves_per_quota_day", "INTEGER NOT NULL DEFAULT 2"),
+                ("holiday_ot_premium_percent", "REAL NOT NULL DEFAULT 0"),
+                ("non_working_day_ot_premium_percent", "REAL NOT NULL DEFAULT 0"),
+                ("holiday_ot_premium_active", "INTEGER NOT NULL DEFAULT 0"),
+                ("non_working_day_ot_premium_active", "INTEGER NOT NULL DEFAULT 0"),
+                ("overtime_max_hours", "REAL NOT NULL DEFAULT 0"),
+                ("overtime_max_period", "TEXT NOT NULL DEFAULT 'day'"),
+            ]:
+                if column not in payroll_setting_columns:
+                    cursor.execute(f"ALTER TABLE payroll_settings ADD COLUMN {column} {column_type}")
+            if migrate_holiday_rule_active:
+                cursor.execute("UPDATE payroll_settings SET holiday_ot_premium_active = 1 WHERE holiday_ot_premium_percent > 0")
+            if migrate_non_working_rule_active:
+                cursor.execute("UPDATE payroll_settings SET non_working_day_ot_premium_active = 1 WHERE non_working_day_ot_premium_percent > 0")
+            cursor.execute("INSERT OR IGNORE INTO payroll_settings (id, deduct_unpaid_leave) VALUES (1, 0)")
+            cursor.execute("UPDATE payroll_settings SET half_leave_quota_mode = 'category' WHERE half_leave_quota_mode = 'separate'")
+            cursor.execute("UPDATE payroll_settings SET half_leave_quota_mode = 'monthly_convert' WHERE half_leave_quota_mode = 'convert'")
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payroll_scoped_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    policy_type TEXT NOT NULL CHECK(policy_type IN ('half_leave_quota', 'overtime_premium', 'overtime_limit')),
+                    scope_type TEXT NOT NULL CHECK(scope_type IN ('department', 'employee')),
+                    scope_id INTEGER NOT NULL,
+                    day_type TEXT NOT NULL DEFAULT '',
+                    half_leave_quota_mode TEXT,
+                    half_leaves_per_quota_day INTEGER,
+                    overtime_premium_percent REAL,
+                    overtime_max_hours REAL,
+                    overtime_max_period TEXT,
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(policy_type, scope_type, scope_id, day_type)
+                )
+            ''')
+            
+            payroll_rules_columns = {row[1] for row in cursor.execute("PRAGMA table_info(payroll_scoped_rules)")}
+            if 'overtime_max_hours' not in payroll_rules_columns:
+                cursor.execute("ALTER TABLE payroll_scoped_rules RENAME TO payroll_scoped_rules_legacy")
+                cursor.execute('''
+                    CREATE TABLE payroll_scoped_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        policy_type TEXT NOT NULL CHECK(policy_type IN ('half_leave_quota', 'overtime_premium', 'overtime_limit')),
+                        scope_type TEXT NOT NULL CHECK(scope_type IN ('department', 'employee')),
+                        scope_id INTEGER NOT NULL,
+                        day_type TEXT NOT NULL DEFAULT '',
+                        half_leave_quota_mode TEXT,
+                        half_leaves_per_quota_day INTEGER,
+                        overtime_premium_percent REAL,
+                        overtime_max_hours REAL,
+                        overtime_max_period TEXT,
+                        active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(policy_type, scope_type, scope_id, day_type)
+                    )
+                ''')
+                cursor.execute('''
+                    INSERT INTO payroll_scoped_rules (
+                        id, policy_type, scope_type, scope_id, day_type,
+                        half_leave_quota_mode, half_leaves_per_quota_day,
+                        overtime_premium_percent, active, created_at, updated_at
+                    )
+                    SELECT id, policy_type, scope_type, scope_id, day_type,
+                           half_leave_quota_mode, half_leaves_per_quota_day,
+                           overtime_premium_percent, active, created_at, updated_at
+                    FROM payroll_scoped_rules_legacy
+                ''')
+                cursor.execute("DROP TABLE payroll_scoped_rules_legacy")
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS special_date_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    calendar_date TEXT NOT NULL,
+                    override_type TEXT NOT NULL CHECK(override_type IN ('working_day', 'off_day', 'holiday')),
+                    note TEXT NOT NULL DEFAULT '',
+                    scope_type TEXT NOT NULL DEFAULT 'all' CHECK(scope_type IN ('all', 'shift', 'employee')),
+                    scope_id INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(calendar_date, scope_type, scope_id),
+                    CHECK((scope_type = 'all' AND scope_id = 0) OR (scope_type != 'all' AND scope_id > 0))
+                )
+            ''')
+            special_date_columns = {row[1] for row in cursor.execute("PRAGMA table_info(special_date_overrides)")}
+            if 'scope_type' not in special_date_columns:
+                cursor.execute("ALTER TABLE special_date_overrides RENAME TO special_date_overrides_legacy")
+                cursor.execute('''
+                    CREATE TABLE special_date_overrides (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        calendar_date TEXT NOT NULL,
+                        override_type TEXT NOT NULL CHECK(override_type IN ('working_day', 'off_day', 'holiday')),
+                        note TEXT NOT NULL DEFAULT '',
+                        scope_type TEXT NOT NULL DEFAULT 'all' CHECK(scope_type IN ('all', 'shift', 'employee')),
+                        scope_id INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(calendar_date, scope_type, scope_id),
+                        CHECK((scope_type = 'all' AND scope_id = 0) OR (scope_type != 'all' AND scope_id > 0))
+                    )
+                ''')
+                cursor.execute('''
+                    INSERT INTO special_date_overrides (
+                        id, calendar_date, override_type, note, scope_type, scope_id, created_at, updated_at
+                    )
+                    SELECT id, calendar_date, override_type, note, 'all', 0, created_at, updated_at
+                    FROM special_date_overrides_legacy
+                ''')
+                cursor.execute("DROP TABLE special_date_overrides_legacy")
+
+            # Branch / Organization Settings table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS branch_settings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    branch_name TEXT DEFAULT 'Main Branch',
+                    city TEXT DEFAULT '',
+                    company_name TEXT DEFAULT 'QIntellect AI',
+                    admin_name TEXT DEFAULT 'Admin',
+                    address TEXT DEFAULT '',
+                    phone TEXT DEFAULT '',
+                    email TEXT DEFAULT '',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            try:
+                cursor.execute("ALTER TABLE branch_settings ADD COLUMN admin_name TEXT DEFAULT 'Admin'")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+            cursor.execute("SELECT COUNT(*) FROM branch_settings")
+            if cursor.fetchone()[0] == 0:
+                # Neutral placeholder row - the Admin configures real values from System Settings.
+                cursor.execute('''
+                    INSERT INTO branch_settings (id, branch_name, city, company_name, admin_name, address, phone, email)
+                    VALUES (1, 'Main Branch', '', 'QIntellect AI', 'Admin', '', '', '')
+                ''')
+
+            # Departments table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS departments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    code TEXT DEFAULT '',
+                    description TEXT DEFAULT '',
+                    active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute("SELECT COUNT(*) FROM departments")
+            if cursor.fetchone()[0] == 0:
+                # One-time migration: register departments already used by existing staff so
+                # their records stay intact. New departments are created by the Admin only.
+                try:
+                    cursor.execute(
+                        "SELECT DISTINCT TRIM(department) FROM users "
+                        "WHERE department IS NOT NULL AND TRIM(department) != ''"
+                    )
+                    existing_depts = [(r[0], '', 'Migrated from existing staff records') for r in cursor.fetchall()]
+                    if existing_depts:
+                        cursor.executemany(
+                            "INSERT OR IGNORE INTO departments (name, code, description) VALUES (?, ?, ?)",
+                            existing_depts
+                        )
+                except sqlite3.Error as e:
+                    logger.warning(f"Department migration skipped: {e}")
+
+            # Designations table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS designations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    department_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(department_id) REFERENCES departments(id) ON DELETE CASCADE
+                )
+            ''')
+            cursor.execute("SELECT COUNT(*) FROM designations")
+            if cursor.fetchone()[0] == 0:
+                # One-time migration: register (department, position) pairs already used by staff.
+                try:
+                    cursor.execute('''
+                        SELECT DISTINCT d.id, TRIM(u.position)
+                        FROM users u
+                        JOIN departments d ON d.name = TRIM(u.department)
+                        WHERE u.position IS NOT NULL AND TRIM(u.position) != ''
+                    ''')
+                    existing_desigs = [(r[0], r[1], 'Migrated from existing staff records') for r in cursor.fetchall()]
+                    if existing_desigs:
+                        cursor.executemany(
+                            "INSERT INTO designations (department_id, title, description) VALUES (?, ?, ?)",
+                            existing_desigs
+                        )
+                except sqlite3.Error as e:
+                    logger.warning(f"Designation migration skipped: {e}")
+
+            # Cameras table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cameras (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    camera_id TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    room_name TEXT NOT NULL,
+                    camera_type TEXT NOT NULL,
+                    rtsp_url TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute("SELECT COUNT(*) FROM cameras")
+            if cursor.fetchone()[0] == 0:
+                # No RTSP URLs are seeded. Only the machine's default local webcam (index 0) is
+                # registered so a fresh install has one working feed; the Admin adds all
+                # DVR / NVR / IP cameras from System Settings > Camera Management.
+                cursor.execute(
+                    "INSERT INTO cameras (camera_id, name, room_name, camera_type, rtsp_url) VALUES (?, ?, ?, ?, ?)",
+                    ('webcam', 'Local Webcam', 'Main Entrance', 'webcam', '0')
+                )
+
+            # Shifts table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS shifts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    grace_period_minutes INTEGER DEFAULT 15,
+                    checkout_grace_period_minutes INTEGER DEFAULT 0,
+                    working_days TEXT NOT NULL DEFAULT '[0,1,2,3,4,5]',
+                    is_default INTEGER DEFAULT 0,
+                    active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            try:
+                cursor.execute("ALTER TABLE shifts ADD COLUMN is_default INTEGER DEFAULT 0")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("ALTER TABLE shifts ADD COLUMN working_days TEXT NOT NULL DEFAULT '[0,1,2,3,4,5]'")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("ALTER TABLE shifts ADD COLUMN checkout_grace_period_minutes INTEGER DEFAULT 0")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+            cursor.execute("SELECT COUNT(*) FROM shifts")
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "INSERT INTO shifts (id, name, start_time, end_time, grace_period_minutes, is_default) VALUES (?, ?, ?, ?, ?, ?)",
+                    (1, 'Morning Shift', '09:00', '17:00', 15, 1)
+                )
+            else:
+                cursor.execute("SELECT COUNT(*) FROM shifts WHERE is_default = 1")
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute("UPDATE shifts SET is_default = 1 WHERE id = (SELECT id FROM shifts ORDER BY id ASC LIMIT 1)")
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS employee_shift_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    shift_id INTEGER NOT NULL,
+                    effective_from TEXT NOT NULL,
+                    shift_name TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    grace_period_minutes INTEGER NOT NULL DEFAULT 15,
+                    checkout_grace_period_minutes INTEGER NOT NULL DEFAULT 0,
+                    working_days TEXT NOT NULL,
+                    history_source TEXT NOT NULL DEFAULT 'recorded',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, effective_from),
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            ''')
+            try:
+                cursor.execute("ALTER TABLE employee_shift_history ADD COLUMN checkout_grace_period_minutes INTEGER DEFAULT 0")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+            cursor.execute('''
+                INSERT OR IGNORE INTO employee_shift_history (
+                    user_id, shift_id, effective_from, shift_name, start_time, end_time,
+                    grace_period_minutes, checkout_grace_period_minutes, working_days, history_source
+                )
+                SELECT u.id, COALESCE(u.shift_id, 1),
+                      '2020-01-01',
+                       COALESCE(s.name, 'Morning Shift'), COALESCE(s.start_time, '09:00'),
+                       COALESCE(s.end_time, '17:00'), COALESCE(s.grace_period_minutes, 15),
+                       COALESCE(s.checkout_grace_period_minutes, 0),
+                       COALESCE(s.working_days, '[0,1,2,3,4,5]'), 'legacy_backfill'
+                FROM users u
+                LEFT JOIN shifts s ON COALESCE(u.shift_id, 1) = s.id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM employee_shift_history h WHERE h.user_id = u.id
+                )
+            ''')
+            cursor.execute('''
+                DELETE FROM employee_shift_history
+                WHERE history_source = 'legacy_backfill'
+                AND effective_from != '2020-01-01'
+            ''')
+
+            # Create indexes for performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_name ON users(name)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_embeddings_user ON embeddings(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_user ON attendance(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_timestamp ON attendance(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_source ON attendance(source)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_manual_absent_user_date ON manual_absent(user_id, date)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_locator_history_user_time ON locator_history(user_id, recorded_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_locator_history_room_time ON locator_history(room_name, recorded_at)')
+
+            conn.commit()
+            
+        logger.info(f"✓ Database initialized at {DB_PATH}")
+        return True
+    except Exception as e:
+        logger.error(f"✗ Database initialization failed: {e}")
+        return False
+
+
+def add_user(
+    name: str,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    department: Optional[str] = None,
+    password: str = '123456',
+    role: str = 'staff',
+    notes: str = '',
+    cnic: str = '',
+    position: str = '',
+    salary: float = 0,
+    join_date: str = '',
+    shift_id: int = 1,
+    checkin_cameras: str = 'all',
+    checkout_cameras: str = 'all'
+) -> Optional[int]:
+    """Add a new user with validation, HR profile attributes, shift assignment, and camera assignments."""
+    if not name or len(name.strip()) == 0:
+        logger.warning("Attempted to add user with empty name")
+        return None
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''INSERT INTO users
+                   (name, email, phone, department, password, role, notes, cnic, position, salary, join_date, shift_id, checkin_cameras, checkout_cameras)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (name.strip(), email, phone, department, password, role, notes, cnic, position, salary, join_date, shift_id or 1, checkin_cameras or 'all', checkout_cameras or 'all')
+            )
+            user_id = cursor.lastrowid
+            if user_id is None:
+                raise RuntimeError("Failed to create employee record")
+            effective_from = join_date if join_date else None
+            if effective_from:
+                try:
+                    datetime.strptime(effective_from, "%Y-%m-%d")
+                except ValueError:
+                    effective_from = None
+            _record_employee_shift_history(cursor, user_id, shift_id or 1, effective_from)
+            conn.commit()
+
+        logger.info(f"✓ User '{name}' created (ID: {user_id}, Shift ID: {shift_id}, In-Cams: {checkin_cameras}, Out-Cams: {checkout_cameras}")
+        return user_id
+    except sqlite3.IntegrityError:
+        logger.warning(f"User '{name}' or email already exists")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to add user: {e}")
+        return None
+
+
+def get_user_by_name(name: str) -> Optional[Dict]:
+    """Retrieve user by name."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, name, email, COALESCE(shift_id, 1), COALESCE(checkin_cameras, "all"), COALESCE(checkout_cameras, "all") FROM users WHERE name = ?', (name,))
+            row = cursor.fetchone()
+        if row:
+            return {'id': row[0], 'name': row[1], 'email': row[2], 'shift_id': row[3], 'checkin_cameras': row[4], 'checkout_cameras': row[5]}
+    except Exception as e:
+        logger.error(f"Failed to fetch user by name: {e}")
+    return None
+
+
+def get_all_users(role: Optional[str] = None) -> List[Dict]:
+    """Get all active users with today's attendance status, shift details, and camera assignments via optimized join."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT u.id, u.name, u.email, u.phone, u.department, u.enrollment_date, 
+                       u.created_at, u.active, u.notes, u.photo_path,
+                       CASE 
+                           WHEN ma.user_id IS NOT NULL THEN 'Absent'
+                           WHEN a.user_id IS NOT NULL THEN 'Present'
+                           ELSE 'Absent'
+                       END as status_today,
+                       COALESCE(u.position, '') as position,
+                       COALESCE(u.cnic, '') as cnic,
+                       COALESCE(u.salary, 0) as salary,
+                       COALESCE(u.join_date, '') as join_date,
+                       COALESCE(u.shift_id, 1) as shift_id,
+                       COALESCE(s.name, 'Morning Shift') as shift_name,
+                       COALESCE(s.start_time, '09:00') as shift_start,
+                       COALESCE(s.end_time, '17:00') as shift_end,
+                       COALESCE(s.grace_period_minutes, 15) as shift_grace,
+                       COALESCE(u.checkin_cameras, 'all') as checkin_cameras,
+                       COALESCE(u.checkout_cameras, 'all') as checkout_cameras
+                FROM users u
+                LEFT JOIN shifts s ON COALESCE(u.shift_id, 1) = s.id
+                LEFT JOIN (
+                    SELECT DISTINCT user_id 
+                    FROM attendance 
+                    WHERE date(timestamp) = date('now', 'localtime')
+                ) a ON u.id = a.user_id
+                LEFT JOIN (
+                    SELECT DISTINCT user_id
+                    FROM manual_absent
+                    WHERE date = date('now', 'localtime')
+                ) ma ON u.id = ma.user_id
+                WHERE u.active = 1
+            ''')
+            rows = cursor.fetchall()
+            
+        return [{
+            'id': r[0], 'name': r[1], 'email': r[2], 'phone': r[3],
+            'department': r[4], 'enrollment_date': r[5], 'created_at': r[6],
+            'active': r[7], 'notes': r[8], 'photo_path': r[9], 'status_today': r[10],
+            'position': r[11], 'cnic': r[12], 'salary': r[13], 'join_date': r[14],
+            'shift_id': r[15], 'shift_name': r[16], 'shift_start': r[17],
+            'shift_end': r[18], 'shift_grace': r[19],
+            'checkin_cameras': r[20], 'checkout_cameras': r[21]
+        } for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to get all users: {e}")
+        return []
+
+
+def update_user(user_id: int, name: str, email: str | None = None, phone: str | None = None, department: str | None = None, notes: str | None = None,
+                position: str | None = None, cnic: str | None = None, salary: float | None = None, join_date: str | None = None,
+                shift_id: int | None = None, checkin_cameras: str | None = None, checkout_cameras: str | None = None,
+                shift_effective_from: str | None = None) -> bool:
+    """Update user information in database. HR fields and camera assignments left as None are preserved."""
+    if not name or len(name.strip()) == 0:
+        logger.warning("Attempted to update user with empty name")
+        return False
+        
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COALESCE(shift_id, 1) FROM users WHERE id = ?", (user_id,))
+            current_shift_row = cursor.fetchone()
+            if not current_shift_row:
+                return False
+            previous_shift_id = current_shift_row[0]
+            effective_date = _normalize_shift_effective_date(shift_effective_from)
+            persisted_shift_id = shift_id if effective_date <= datetime.now().date().isoformat() else None
+            cursor.execute('''
+                UPDATE users 
+                SET name = ?, email = ?, phone = ?, department = ?, notes = ?,
+                    position = COALESCE(?, position),
+                    cnic = COALESCE(?, cnic),
+                    salary = COALESCE(?, salary),
+                    join_date = COALESCE(?, join_date),
+                    shift_id = COALESCE(?, shift_id),
+                    checkin_cameras = COALESCE(?, checkin_cameras),
+                    checkout_cameras = COALESCE(?, checkout_cameras)
+                WHERE id = ?
+            ''', (name.strip(), email, phone, department, notes, position, cnic, salary, join_date, persisted_shift_id, checkin_cameras, checkout_cameras, user_id))
+            updated = cursor.rowcount > 0
+            if updated and shift_id is not None and (shift_id != previous_shift_id or shift_effective_from is not None):
+                _record_employee_shift_history(cursor, user_id, shift_id, effective_date)
+            conn.commit()
+            
+        if updated:
+            logger.info(f"✓ User ID {user_id} updated: {name} (Shift: {shift_id}, In: {checkin_cameras}, Out: {checkout_cameras})")
+        return updated
+    except Exception as e:
+        logger.error(f"Failed to update user ID {user_id}: {e}")
+        return False
+
+
+def bulk_assign_cameras(user_ids: List[int] | str, checkin_cameras: str = 'all', checkout_cameras: str = 'all') -> Tuple[bool, int]:
+    """
+    Bulk assign Check-In and Check-Out cameras to multiple or all employees.
+    Pass user_ids='all' or a list of user IDs.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            checkin_val = (checkin_cameras or 'all').strip()
+            checkout_val = (checkout_cameras or 'all').strip()
+
+            if user_ids == 'all' or not user_ids or (isinstance(user_ids, list) and len(user_ids) == 0):
+                cursor.execute(
+                    "UPDATE users SET checkin_cameras = ?, checkout_cameras = ? WHERE active = 1",
+                    (checkin_val, checkout_val)
+                )
+            else:
+                placeholders = ','.join('?' for _ in user_ids)
+                cursor.execute(
+                    f"UPDATE users SET checkin_cameras = ?, checkout_cameras = ? WHERE id IN ({placeholders}) AND active = 1",
+                    (checkin_val, checkout_val, *user_ids)
+                )
+            count = cursor.rowcount
+            conn.commit()
+            logger.info(f"✓ Bulk camera assignment applied to {count} staff members (In: '{checkin_val}', Out: '{checkout_val}')")
+            return True, count
+    except Exception as e:
+        logger.error(f"Failed to bulk assign cameras: {e}")
+        return False, 0
+
+
+def check_user_camera_allowed(user_id: int, camera_id: str, action: str = 'checkin') -> Tuple[bool, str]:
+    """
+    Validate whether the detected camera is authorized to mark Check-In or Check-Out for this employee.
+    Strict enforcement: If camera is not in the employee's assigned camera list, attendance is blocked.
+    """
+    if not camera_id:
+        return False, "Invalid camera identifier"
+
+    action = action.lower().strip()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(checkin_cameras, 'all'), COALESCE(checkout_cameras, 'all'), name FROM users WHERE id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False, f"User ID {user_id} not found"
+
+            checkin_cams_raw, checkout_cams_raw, user_name = row[0], row[1], row[2]
+
+            # Fetch camera info from cameras table to match by camera_id, room_name, or name
+            cam_str = str(camera_id).strip()
+            cursor.execute("SELECT camera_id, name, room_name, camera_type, rtsp_url FROM cameras WHERE camera_id = ? OR id = ?", (cam_str, cam_str))
+            cam_row = cursor.fetchone()
+            
+            cam_id_token = cam_str.lower()
+            room_token = cam_row[2].lower() if cam_row else ''
+            name_token = cam_row[1].lower() if cam_row else ''
+            rtsp_token = str(cam_row[4]).lower() if cam_row else ''
+
+        assigned_str = checkin_cams_raw if action == 'checkin' else checkout_cams_raw
+        if not assigned_str or assigned_str.strip() == '' or assigned_str.strip().lower() == 'all':
+            return True, f"All cameras authorized for {action}"
+
+        allowed_tokens = [t.strip().lower() for t in assigned_str.split(',') if t.strip()]
+        if 'all' in allowed_tokens or '*' in allowed_tokens:
+            return True, f"All cameras authorized for {action}"
+
+        # Match against camera_id, room_name, camera name, or RTSP index
+        for token in allowed_tokens:
+            if token == cam_id_token:
+                return True, f"Camera '{camera_id}' matches assigned camera ID for {action}"
+            if room_token and (token == room_token or token in room_token or room_token in token):
+                return True, f"Camera room '{cam_row[2]}' matches assigned room for {action}"
+            if name_token and (token == name_token or token in name_token):
+                return True, f"Camera name '{cam_row[1]}' matches assigned camera for {action}"
+            if rtsp_token and token == rtsp_token:
+                return True, f"Camera source matches assigned camera for {action}"
+
+        room_disp = f" ({cam_row[2]})" if cam_row else ""
+        action_disp = "Check-In" if action == 'checkin' else "Check-Out"
+        logger.info(f"[CAMERA REJECTED] Staff '{user_name}' (ID {user_id}) appeared on '{camera_id}'{room_disp} but camera is NOT authorized for {action_disp} (Assigned: '{assigned_str}')")
+        return False, f"Camera '{camera_id}'{room_disp} is not authorized for {action_disp} (Allowed: {assigned_str})"
+
+    except Exception as e:
+        logger.error(f"Error checking user camera permissions: {e}")
+        return False, f"Camera validation error: {e}"
+
+
+def delete_user(user_id: int) -> bool:
+    """Delete a user, associated embeddings and logs cascade automatically."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA foreign_keys = ON")
+            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            
+        if deleted:
+            logger.info(f"✓ User ID {user_id} deleted successfully with related data.")
+        return deleted
+    except Exception as e:
+        logger.error(f"Failed to delete user ID {user_id}: {e}")
+        return False
+
+
+def store_embedding(user_id: int, embedding: List[float], source_video: str | None = None):
+    """Store face embedding for a user."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            embedding_blob = json.dumps(embedding).encode()
+            cursor.execute(
+                'INSERT INTO embeddings (user_id, embedding, source_video) VALUES (?, ?, ?)',
+                (user_id, embedding_blob, source_video)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to store embedding for user {user_id}: {e}")
+
+
+def get_embeddings_for_user(user_id: int) -> List[Dict]:
+    """Retrieve all embeddings for a user."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT id, embedding, source_video, created_at FROM embeddings WHERE user_id = ?',
+                (user_id,)
+            )
+            rows = cursor.fetchall()
+            
+        return [{
+            'id': row[0],
+            'embedding': json.loads(row[1].decode()),
+            'source_video': row[2],
+            'created_at': row[3]
+        } for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to get embeddings for user {user_id}: {e}")
+        return []
+
+
+# ============================================
+# SHIFT MANAGEMENT & VALIDATION FUNCTIONS
+# ============================================
+
+def parse_time_to_minutes(time_str: str) -> int:
+    """Convert any time string (24h '20:11', 12h '08:11 PM', '8:11 pm', '08:11:11') to minutes from midnight."""
+    if not time_str:
+        return 0
+    try:
+        t_str = str(time_str).strip().upper()
+        is_pm = 'PM' in t_str
+        is_am = 'AM' in t_str
+        clean_str = t_str.replace('PM', '').replace('AM', '').strip()
+        parts = clean_str.split(':')
+        hours = int(parts[0])
+        minutes = int(parts[1]) if len(parts) > 1 else 0
+        if is_pm and hours < 12:
+            hours += 12
+        elif is_am and hours == 12:
+            hours = 0
+        return (hours % 24) * 60 + (minutes % 60)
+    except Exception:
+        return 0
+
+
+def is_time_in_grace_window(start_time_str: str, grace_minutes: int, check_dt: Optional[datetime] = None, end_time_str: Optional[str] = None) -> bool:
+    """
+    Check if check_dt (defaults to local now) falls within allowed shift/grace window.
+    If grace_minutes > 0: allowed within [start_time, start_time + grace_minutes].
+    If grace_minutes <= 0 (disabled): allowed during full shift [start_time, end_time].
+    """
+    if check_dt is None:
+        check_dt = datetime.now()
+    
+    try:
+        start_minutes = parse_time_to_minutes(start_time_str)
+        current_minutes = check_dt.hour * 60 + check_dt.minute
+
+        if grace_minutes <= 0 and end_time_str:
+            end_minutes = parse_time_to_minutes(end_time_str)
+            if start_minutes <= end_minutes:
+                return start_minutes <= current_minutes <= end_minutes
+            else:
+                return current_minutes >= start_minutes or current_minutes <= end_minutes
+
+        grace_end_minutes = start_minutes + max(0, int(grace_minutes))
+        
+        if grace_end_minutes < 1440:
+            return start_minutes <= current_minutes <= grace_end_minutes
+        else:
+            end_minutes_next_day = grace_end_minutes % 1440
+            return current_minutes >= start_minutes or current_minutes <= end_minutes_next_day
+    except Exception as e:
+        logger.error(f"Error checking grace window for {start_time_str} + {grace_minutes}m: {e}")
+        return True
+
+
+def check_user_shift_allowed(user_id: int, dt: Optional[datetime] = None) -> Tuple[bool, str, Optional[Dict]]:
+    """
+    Check if attendance can be marked for user_id at datetime dt (default now).
+    Returns (is_allowed: bool, reason: str, shift_info: dict).
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT u.id, u.name, COALESCE(u.shift_id, 1),
+                       s.id, s.name, s.start_time, s.end_time, s.grace_period_minutes
+                FROM users u
+                LEFT JOIN shifts s ON COALESCE(u.shift_id, 1) = s.id
+                WHERE u.id = ?
+            ''', (user_id,))
+            row = cursor.fetchone()
+
+        if not row:
+            return False, "User not found", None
+
+        shift_id = row[3] or 1
+        shift_name = row[4] or "Morning Shift"
+        start_time = row[5] or "09:00"
+        end_time = row[6] or "17:00"
+        grace_minutes = row[7] if row[7] is not None else 15
+
+        shift_info = {
+            'id': shift_id,
+            'name': shift_name,
+            'start_time': start_time,
+            'end_time': end_time,
+            'grace_period_minutes': grace_minutes
+        }
+
+        allowed = is_time_in_grace_window(start_time, grace_minutes, dt, end_time)
+        if allowed:
+            return True, f"Allowed: Within '{shift_name}' window", shift_info
+        else:
+            if grace_minutes > 0:
+                try:
+                    start_mins = parse_time_to_minutes(start_time)
+                    em_total = start_mins + grace_minutes
+                    end_grace_str = f"{(em_total // 60) % 24:02d}:{em_total % 60:02d}"
+                except Exception:
+                    end_grace_str = f"{start_time}+{grace_minutes}m"
+                reason_str = f"Outside '{shift_name}' grace window ({start_time} - {end_grace_str})"
+            else:
+                reason_str = f"Outside '{shift_name}' shift hours ({start_time} - {end_time})"
+
+            return False, f"Attendance rejected: {reason_str}", shift_info
+
+    except Exception as e:
+        logger.error(f"Error checking user shift for user {user_id}: {e}")
+        return True, f"Shift check error: {e}", None
+
+
+def _normalize_shift_working_days(working_days: Any = None) -> List[int]:
+    if working_days is None:
+        return [0, 1, 2, 3, 4, 5]
+    if isinstance(working_days, str):
+        try:
+            working_days = json.loads(working_days)
+        except (TypeError, ValueError):
+            working_days = [day.strip() for day in working_days.split(',')]
+    if not isinstance(working_days, (list, tuple, set)):
+        raise ValueError("Working days must be a list of weekdays")
+    try:
+        normalized = sorted({int(day) for day in working_days})
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ValueError("Working days must use weekday numbers from 0 to 6") from e
+    if not normalized or any(day < 0 or day > 6 for day in normalized):
+        raise ValueError("Select at least one working day from Monday through Sunday")
+    return normalized
+
+
+def _normalize_shift_effective_date(effective_from: Optional[str] = None) -> str:
+    effective_date = effective_from or datetime.now().date().isoformat()
+    try:
+        return datetime.strptime(effective_date, "%Y-%m-%d").date().isoformat()
+    except (TypeError, ValueError) as e:
+        raise ValueError("Shift effective date must use YYYY-MM-DD format") from e
+
+
+def _record_employee_shift_history(
+    cursor: sqlite3.Cursor,
+    user_id: int,
+    shift_id: int,
+    effective_from: Optional[str] = None,
+    history_source: str = 'recorded',
+) -> None:
+    effective_date = _normalize_shift_effective_date(effective_from)
+    cursor.execute(
+        "SELECT name, start_time, end_time, grace_period_minutes, checkout_grace_period_minutes, working_days FROM shifts WHERE id = ?",
+        (shift_id,),
+    )
+    shift = cursor.fetchone()
+    if not shift:
+        raise ValueError("Shift not found")
+    cursor.execute('''
+        INSERT INTO employee_shift_history (
+            user_id, shift_id, effective_from, shift_name, start_time, end_time,
+            grace_period_minutes, checkout_grace_period_minutes, working_days, history_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, effective_from) DO UPDATE SET
+            shift_id = excluded.shift_id,
+            shift_name = excluded.shift_name,
+            start_time = excluded.start_time,
+            end_time = excluded.end_time,
+            grace_period_minutes = excluded.grace_period_minutes,
+            checkout_grace_period_minutes = excluded.checkout_grace_period_minutes,
+            working_days = excluded.working_days,
+            history_source = excluded.history_source
+    ''', (user_id, shift_id, effective_date, shift[0], shift[1], shift[2], shift[3] or 15, shift[4] or 0,
+          shift[5] or '[0,1,2,3,4,5]', history_source))
+
+
+def _resolve_calendar_override(
+    calendar_overrides: Dict[Tuple[str, str, int], str],
+    calendar_date: str,
+    employee_id: int,
+    shift_id: int,
+) -> Optional[str]:
+    return (
+        calendar_overrides.get((calendar_date, 'employee', employee_id))
+        or calendar_overrides.get((calendar_date, 'shift', shift_id))
+        or calendar_overrides.get((calendar_date, 'all', 0))
+    )
+
+
+def _get_company_holiday_for_date(cursor: sqlite3.Cursor, overtime_date: str) -> Optional[Dict[str, Any]]:
+    """Find the company holiday covering a date, including recurring holidays."""
+    date_key = overtime_date[5:]
+    cursor.execute("SELECT * FROM company_holidays ORDER BY holiday_date, id")
+    for row in cursor.fetchall():
+        holiday = dict(row)
+        holiday_start = str(holiday.get('holiday_date') or '')
+        holiday_end = str(holiday.get('end_date') or holiday_start)
+        if holiday_start <= overtime_date <= holiday_end:
+            return holiday
+        if holiday.get('is_recurring'):
+            start_key, end_key = holiday_start[5:], holiday_end[5:]
+            recurring_match = (
+                start_key <= date_key <= end_key
+                if start_key <= end_key
+                else date_key >= start_key or date_key <= end_key
+            )
+            if recurring_match:
+                return holiday
+    return None
+
+
+def _get_overtime_premium_percent(
+    cursor: sqlite3.Cursor,
+    overtime_date: str,
+    day_type: str,
+    settings: Optional[Any],
+    holiday: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Return a holiday override or the configured day-type premium fallback."""
+    if day_type == 'holiday':
+        holiday = _get_company_holiday_for_date(cursor, overtime_date)
+        if holiday and holiday.get('overtime_premium_percent') is not None:
+            return float(holiday['overtime_premium_percent'])
+        if settings and settings['holiday_ot_premium_active']:
+            return float(settings['holiday_ot_premium_percent'] or 0.0)
+    elif day_type == 'non_working_day' and settings and settings['non_working_day_ot_premium_active']:
+        return float(settings['non_working_day_ot_premium_percent'] or 0.0)
+    return 0.0
+
+
+def _get_overtime_day_type(cursor: sqlite3.Cursor, user_id: int, overtime_date: str) -> str:
+    """Classify overtime by its effective shift schedule and calendar exceptions."""
+    try:
+        work_date = datetime.strptime(overtime_date, "%Y-%m-%d").date()
+        cursor.execute('''
+            SELECT shift_id, working_days FROM employee_shift_history
+            WHERE user_id = ? AND effective_from <= ?
+            ORDER BY effective_from DESC, id DESC LIMIT 1
+        ''', (user_id, overtime_date))
+        history = cursor.fetchone()
+        if history:
+            shift_id, working_days = history['shift_id'], history['working_days']
+        else:
+            cursor.execute('''
+                SELECT COALESCE(u.shift_id, 1) AS shift_id,
+                       COALESCE(s.working_days, '[0,1,2,3,4,5]') AS working_days
+                FROM users u LEFT JOIN shifts s ON s.id = COALESCE(u.shift_id, 1)
+                WHERE u.id = ?
+            ''', (user_id,))
+            current = cursor.fetchone()
+            if not current:
+                return 'regular'
+            shift_id, working_days = current['shift_id'], current['working_days']
+
+        cursor.execute('''
+            SELECT calendar_date, override_type, scope_type, scope_id
+            FROM special_date_overrides WHERE calendar_date = ?
+        ''', (overtime_date,))
+        overrides = {
+            (row['calendar_date'], row['scope_type'], row['scope_id']): row['override_type']
+            for row in cursor.fetchall()
+        }
+        override_type = _resolve_calendar_override(overrides, overtime_date, user_id, int(shift_id or 1))
+        if override_type == 'holiday':
+            return 'holiday'
+        if override_type == 'working_day':
+            return 'regular'
+        if override_type == 'off_day':
+            return 'non_working_day'
+
+        if _get_company_holiday_for_date(cursor, overtime_date):
+            return 'holiday'
+
+        working_days_set = set(_normalize_shift_working_days(working_days))
+        return 'regular' if work_date.weekday() in working_days_set else 'non_working_day'
+    except Exception as e:
+        logger.error(f"Failed to classify overtime date {overtime_date} for user {user_id}: {e}")
+        return 'regular'
+
+
+def _is_scheduled_workday(work_date, working_days: Any, override_type: Optional[str] = None) -> bool:
+    if override_type == 'working_day':
+        return True
+    if override_type in ('off_day', 'holiday'):
+        return False
+    weekdays = working_days if isinstance(working_days, set) else set(_normalize_shift_working_days(working_days))
+    return work_date.weekday() in weekdays
+
+
+def get_all_shifts(active_only: bool = True) -> List[Dict]:
+    """Retrieve all defined shifts along with assigned employee count and default flag."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            where_clause = "WHERE s.active = 1" if active_only else ""
+            cursor.execute(f'''
+                SELECT s.id, s.name, s.start_time, s.end_time, s.grace_period_minutes, 
+                       COALESCE(s.is_default, CASE WHEN s.id = 1 THEN 1 ELSE 0 END) as is_default,
+                       s.active, s.created_at,
+                       COUNT(u.id) as user_count, s.working_days, s.checkout_grace_period_minutes
+                FROM shifts s
+                LEFT JOIN users u ON COALESCE(u.shift_id, 1) = s.id AND u.active = 1
+                {where_clause}
+                GROUP BY s.id
+                ORDER BY s.id ASC
+            ''')
+            rows = cursor.fetchall()
+
+        return [{
+            'id': r[0],
+            'name': r[1],
+            'start_time': r[2],
+            'end_time': r[3],
+            'grace_period_minutes': r[4],
+            'is_default': bool(r[5]),
+            'active': r[6],
+            'created_at': r[7],
+            'user_count': r[8],
+            'working_days': _normalize_shift_working_days(r[9]),
+            'checkout_grace_period_minutes': r[10] or 0
+        } for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch shifts: {e}")
+        return []
+
+
+def set_default_shift(shift_id: int) -> bool:
+    """Set a specific shift as the organization-wide default shift."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE shifts SET is_default = 0")
+            cursor.execute("UPDATE shifts SET is_default = 1 WHERE id = ?", (shift_id,))
+            conn.commit()
+            logger.info(f"✓ Shift ID #{shift_id} set as system default shift")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to set default shift {shift_id}: {e}")
+        return False
+
+
+def get_default_shift() -> Optional[Dict]:
+    """Retrieve current system default shift."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, start_time, end_time, grace_period_minutes, is_default, active FROM shifts WHERE is_default = 1 AND active = 1 LIMIT 1")
+            row = cursor.fetchone()
+            if not row:
+                cursor.execute("SELECT id, name, start_time, end_time, grace_period_minutes, is_default, active FROM shifts WHERE active = 1 ORDER BY id ASC LIMIT 1")
+                row = cursor.fetchone()
+            if row:
+                return {
+                    'id': row[0],
+                    'name': row[1],
+                    'start_time': row[2],
+                    'end_time': row[3],
+                    'grace_period_minutes': row[4],
+                    'is_default': bool(row[5]),
+                    'active': row[6]
+                }
+    except Exception as e:
+        logger.error(f"Failed to get default shift: {e}")
+    return None
+
+
+def get_shift_by_id(shift_id: int) -> Optional[Dict]:
+    """Retrieve a single shift by ID."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, name, start_time, end_time, grace_period_minutes, active FROM shifts WHERE id = ?', (shift_id,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'id': row[0],
+                    'name': row[1],
+                    'start_time': row[2],
+                    'end_time': row[3],
+                    'grace_period_minutes': row[4],
+                    'active': row[5]
+                }
+    except Exception as e:
+        logger.error(f"Failed to fetch shift ID {shift_id}: {e}")
+    return None
+
+
+def add_shift(name: str, start_time: str, end_time: str, grace_period_minutes: int = 15, checkout_grace_period_minutes: int = 0, working_days: Any = None) -> Optional[int]:
+    """Add a new custom shift."""
+    if not name or not name.strip():
+        logger.warning("Attempted to add shift with empty name")
+        return None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO shifts (name, start_time, end_time, grace_period_minutes, checkout_grace_period_minutes, working_days) VALUES (?, ?, ?, ?, ?, ?)',
+                (name.strip(), start_time, end_time, max(0, int(grace_period_minutes)), max(0, int(checkout_grace_period_minutes)),
+                 json.dumps(_normalize_shift_working_days(working_days)))
+            )
+            conn.commit()
+            shift_id = cursor.lastrowid
+            logger.info(f"✓ Shift '{name}' created (ID: {shift_id})")
+            return shift_id
+    except ValueError:
+        raise
+    except sqlite3.IntegrityError:
+        logger.warning(f"Shift '{name}' already exists")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to add shift: {e}")
+        return None
+
+
+def update_shift(shift_id: int, name: str, start_time: str, end_time: str, grace_period_minutes: int = 15, checkout_grace_period_minutes: int = 0, working_days: Any = None) -> bool:
+    """Update custom shift configuration."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            if working_days is None:
+                cursor.execute(
+                    'UPDATE shifts SET name = ?, start_time = ?, end_time = ?, grace_period_minutes = ?, checkout_grace_period_minutes = ? WHERE id = ?',
+                    (name.strip(), start_time, end_time, max(0, int(grace_period_minutes)), max(0, int(checkout_grace_period_minutes)), shift_id)
+                )
+            else:
+                cursor.execute(
+                    'UPDATE shifts SET name = ?, start_time = ?, end_time = ?, grace_period_minutes = ?, checkout_grace_period_minutes = ?, working_days = ? WHERE id = ?',
+                    (name.strip(), start_time, end_time, max(0, int(grace_period_minutes)), max(0, int(checkout_grace_period_minutes)),
+                     json.dumps(_normalize_shift_working_days(working_days)), shift_id)
+                )
+            updated = cursor.rowcount > 0
+            if updated:
+                cursor.execute("SELECT id FROM users WHERE COALESCE(shift_id, 1) = ?", (shift_id,))
+                for (user_id,) in cursor.fetchall():
+                    _record_employee_shift_history(cursor, user_id, shift_id)
+            conn.commit()
+            if updated:
+                logger.info(f"✓ Shift ID {shift_id} updated: {name}")
+            return updated
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update shift ID {shift_id}: {e}")
+        return False
+
+
+def delete_shift(shift_id: int) -> bool:
+    """Delete shift (reassigns users of this shift back to shift ID 1)."""
+    if shift_id == 1:
+        logger.warning("Cannot delete default Morning Shift")
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM users WHERE shift_id = ?", (shift_id,))
+            reassigned_users = [row[0] for row in cursor.fetchall()]
+            cursor.execute('UPDATE users SET shift_id = 1 WHERE shift_id = ?', (shift_id,))
+            for user_id in reassigned_users:
+                _record_employee_shift_history(cursor, user_id, 1)
+            cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            if deleted:
+                logger.info(f"✓ Shift ID {shift_id} deleted successfully.")
+            return deleted
+    except Exception as e:
+        logger.error(f"Failed to delete shift ID {shift_id}: {e}")
+        return False
+
+
+def assign_user_shift(user_id: int, shift_id: int, effective_from: Optional[str] = None) -> bool:
+    """Assign a shift to an individual user immediately in the database."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            effective_date = _normalize_shift_effective_date(effective_from)
+            cursor.execute("SELECT COALESCE(shift_id, 1) FROM users WHERE id = ? AND active = 1", (user_id,))
+            current_shift = cursor.fetchone()
+            if not current_shift:
+                return False
+            is_current = effective_date <= datetime.now().date().isoformat()
+            if is_current:
+                cursor.execute("UPDATE users SET shift_id = ? WHERE id = ? AND active = 1", (shift_id, user_id))
+            updated = True
+            if effective_date > datetime.now().date().isoformat() or current_shift[0] != shift_id or effective_from is not None:
+                _record_employee_shift_history(cursor, user_id, shift_id, effective_date)
+            conn.commit()
+            if updated:
+                logger.info(f"✓ Shift ID {shift_id} assigned to User ID {user_id}")
+            return updated
+    except Exception as e:
+        logger.error(f"Failed to assign shift {shift_id} to user {user_id}: {e}")
+        return False
+
+
+def bulk_assign_shifts(user_ids: Union[str, List[int]], shift_id: int, effective_from: Optional[str] = None) -> Tuple[bool, int]:
+    """Bulk assign shift to multiple or all employees."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            effective_date = _normalize_shift_effective_date(effective_from)
+            if user_ids == 'all' or not user_ids or (isinstance(user_ids, list) and len(user_ids) == 0):
+                cursor.execute("SELECT id, COALESCE(shift_id, 1) FROM users WHERE active = 1")
+                selected_users = cursor.fetchall()
+                if effective_date <= datetime.now().date().isoformat():
+                    cursor.execute("UPDATE users SET shift_id = ? WHERE active = 1", (shift_id,))
+            else:
+                placeholders = ','.join('?' for _ in user_ids)
+                cursor.execute(
+                    f"SELECT id, COALESCE(shift_id, 1) FROM users WHERE id IN ({placeholders}) AND active = 1",
+                    (*user_ids,),
+                )
+                selected_users = cursor.fetchall()
+                if effective_date <= datetime.now().date().isoformat():
+                    cursor.execute(f"UPDATE users SET shift_id = ? WHERE id IN ({placeholders}) AND active = 1", (shift_id, *user_ids))
+            count = len(selected_users)
+            for user_id, current_shift_id in selected_users:
+                if effective_date > datetime.now().date().isoformat() or current_shift_id != shift_id or effective_from is not None:
+                    _record_employee_shift_history(cursor, user_id, shift_id, effective_date)
+            conn.commit()
+            logger.info(f"✓ Bulk shift ID {shift_id} assigned to {count} staff members")
+            return True, count
+    except Exception as e:
+        logger.error(f"Failed to bulk assign shift: {e}")
+        return False, 0
+
+
+def _record_automatic_checkout_overtime(
+    cursor: sqlite3.Cursor,
+    user_id: int,
+    user_name: str,
+    checkout_time: datetime,
+) -> float:
+    actual_date = checkout_time.strftime('%Y-%m-%d')
+    actual_time = checkout_time.strftime('%H:%M')
+    cursor.execute('''
+        SELECT start_time, end_time, checkout_grace_period_minutes
+        FROM employee_shift_history
+        WHERE user_id = ? AND effective_from <= ?
+        ORDER BY effective_from DESC, id DESC LIMIT 1
+    ''', (user_id, actual_date))
+    shift = cursor.fetchone()
+    if not shift:
+        cursor.execute('''
+            SELECT s.start_time, s.end_time, s.checkout_grace_period_minutes
+            FROM users u LEFT JOIN shifts s ON s.id = COALESCE(u.shift_id, 1)
+            WHERE u.id = ?
+        ''', (user_id,))
+        shift = cursor.fetchone()
+    if not shift:
+        return 0.0
+
+    shift_start, shift_end, grace_minutes = shift[0], shift[1], shift[2] or 0
+    overtime_hours = calculate_eligible_overtime(shift_start, shift_end, actual_time, grace_minutes)
+    if overtime_hours <= 0:
+        return 0.0
+
+    reason = f"Automatic camera checkout at {actual_time}"
+    cursor.execute(
+        "SELECT id, status, reason FROM overtime WHERE user_id = ? AND ot_date = ? ORDER BY id LIMIT 1",
+        (user_id, actual_date),
+    )
+    existing = cursor.fetchone()
+    limit_status = _get_overtime_limit_status_for_cursor(
+        cursor, user_id, actual_date, overtime_hours,
+        exclude_id=existing[0] if existing else None,
+    )
+    if limit_status.get('exceeded'):
+        reason += limit_status.get('review_note', '')
+    if existing:
+        if str(existing[1] or 'pending').lower() == 'pending' and str(existing[2] or '').startswith('Automatic camera checkout'):
+            cursor.execute(
+                "UPDATE overtime SET hours = ?, reason = ? WHERE id = ?",
+                (overtime_hours, reason, existing[0]),
+            )
+        return overtime_hours
+
+    cursor.execute(
+        "INSERT INTO overtime (user_id, user_name, ot_date, hours, reason, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+        (user_id, user_name, actual_date, overtime_hours, reason),
+    )
+    return overtime_hours
+
+
+def log_attendance(user_id: int, detected_name: str, confidence: float, source: str = 'camera', location: str | None = None, device_id: str | None = None, bypass_shift_check: bool = False, checkout_camera_id: str | None = None, checkout_location: str | None = None) -> Tuple[bool, str]:
+    """Log attendance detection with room location, device ID, and shift grace period verification."""
+    if not bypass_shift_check:
+        allowed, reason, shift_info = check_user_shift_allowed(user_id)
+        if not allowed:
+            logger.info(f"Skipped attendance log for '{detected_name}' (User ID {user_id}): {reason}")
+            return False, reason
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            attendance_time = datetime.now()
+            cursor.execute(
+                'DELETE FROM manual_absent WHERE user_id = ? AND date = date("now", "localtime")',
+                (user_id,)
+            )
+            cursor.execute(
+                '''INSERT INTO attendance (
+                       user_id, detected_name, confidence, source, location, device_id,
+                       checkout_camera_id, checkout_location, timestamp
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, detected_name, confidence, source, location, device_id,
+                 checkout_camera_id, checkout_location, attendance_time.strftime('%Y-%m-%d %H:%M:%S'))
+            )
+            if checkout_camera_id:
+                overtime_hours = _record_automatic_checkout_overtime(
+                    cursor, user_id, detected_name, attendance_time
+                )
+            conn.commit()
+            logger.info(f"✓ Attendance logged for '{detected_name}' (User ID {user_id})")
+            if checkout_camera_id and overtime_hours > 0:
+                logger.info(f"✓ Pending automatic overtime created for '{detected_name}': {overtime_hours:.2f} hour(s)")
+            return True, "Attendance marked successfully"
+    except Exception as e:
+        logger.error(f"Failed to log attendance for user {user_id}: {e}")
+        return False, f"Database error: {e}"
+
+
+def get_latest_user_location(user_id: int) -> Optional[Dict]:
+    """Get the most recent location/room detection log for a user from database history."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT location, device_id, timestamp, confidence, source
+                FROM attendance
+                WHERE user_id = ? AND location IS NOT NULL AND location != ''
+                ORDER BY timestamp DESC LIMIT 1
+            ''', (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'location': row[0],
+                    'device_id': row[1],
+                    'timestamp': row[2],
+                    'confidence': row[3],
+                    'source': row[4]
+                }
+    except Exception as e:
+        logger.error(f"Failed to fetch latest location for user {user_id}: {e}")
+    return None
+
+
+def record_locator_snapshot(user_id: int, name: str, department: str, camera_id: str,
+                            camera_name: str, room_name: str, confidence: float,
+                            first_seen: float, last_seen: float, interval_seconds: int = 300) -> bool:
+    """Persist at most one room snapshot per user during each five-minute interval."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT recorded_at FROM locator_history
+                WHERE user_id = ?
+                ORDER BY recorded_at DESC LIMIT 1
+            ''', (user_id,))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute("SELECT (julianday('now', 'localtime') - julianday(?)) * 86400", (row[0],))
+                elapsed = cursor.fetchone()[0] or 0
+                if elapsed < interval_seconds:
+                    return False
+
+            cursor.execute('''
+                INSERT INTO locator_history
+                    (user_id, name, department, camera_id, camera_name, room_name,
+                     confidence, first_seen, last_seen, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime(?, 'unixepoch', 'localtime'),
+                        datetime(?, 'unixepoch', 'localtime'), datetime('now', 'localtime'))
+            ''', (user_id, name, department or '', camera_id, camera_name, room_name,
+                  float(confidence or 0), first_seen, last_seen))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to record locator history for user {user_id}: {e}")
+        return False
+
+
+def get_locator_history(user_id: Optional[int] = None, room_name: Optional[str] = None, limit: int = 500) -> List[Dict]:
+    """Return persistent room snapshots, newest first."""
+    try:
+        clauses = []
+        params = []
+        if user_id is not None:
+            clauses.append('user_id = ?')
+            params.append(user_id)
+        if room_name:
+            clauses.append('room_name = ?')
+            params.append(room_name)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f'''
+                SELECT id, user_id, name, department, camera_id, camera_name,
+                       room_name, confidence, first_seen, last_seen, recorded_at
+                FROM locator_history
+                {where}
+                ORDER BY recorded_at DESC LIMIT ?
+            ''', (*params, max(1, min(limit, 2000))))
+            rows = cursor.fetchall()
+        return [{
+            'id': r[0], 'user_id': r[1], 'name': r[2], 'department': r[3],
+            'camera_id': r[4], 'camera_name': r[5], 'room_name': r[6],
+            'confidence': r[7], 'first_seen': r[8], 'last_seen': r[9],
+            'recorded_at': r[10]
+        } for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch locator history: {e}")
+        return []
+
+
+def get_attendance_logs(limit: int = 100) -> List[Dict]:
+    """Retrieve recent attendance logs with location and device."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT a.id, u.name, a.detected_name, a.confidence, a.timestamp, a.source, a.location, a.device_id
+                FROM attendance a
+                JOIN users u ON a.user_id = u.id
+                ORDER BY a.timestamp DESC LIMIT ?
+            ''', (limit,))
+            rows = cursor.fetchall()
+            
+        def serialize_timestamp(value):
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone().isoformat(timespec='seconds')
+            except (TypeError, ValueError):
+                return str(value)
+
+        return [{
+            'id': r[0], 'name': r[1], 'detected_name': r[2],
+            'confidence': r[3], 'timestamp': serialize_timestamp(r[4]), 'source': r[5],
+            'location': r[6], 'device_id': r[7]
+        } for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch logs: {e}")
+        return []
+
+
+def get_attendance_by_user(
+    user_id: int,
+    days: int = 7,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> List[Dict]:
+    """Get attendance logs for a user in the last N days, or between start_date and end_date (YYYY-MM-DD)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            if start_date and end_date:
+                cursor.execute('''
+                    SELECT id, timestamp, confidence, source FROM attendance
+                    WHERE user_id = ?
+                      AND date(timestamp) >= ?
+                      AND date(timestamp) <= ?
+                    ORDER BY timestamp DESC
+                ''', (user_id, start_date, end_date))
+            else:
+                cursor.execute('''
+                    SELECT id, timestamp, confidence, source FROM attendance
+                    WHERE user_id = ? AND date(timestamp) >= date('now', 'localtime', '-' || ? || ' days')
+                    ORDER BY timestamp DESC
+                ''', (user_id, days))
+            rows = cursor.fetchall()
+
+        return [{
+            'id': r[0], 'timestamp': r[1], 'confidence': r[2], 'source': r[3]
+        } for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to get attendance logs: {e}")
+        return []
+
+
+def cleanup_old_logs(days: int = ATTENDANCE_LOG_RETENTION_DAYS):
+    """Delete attendance logs older than specified days."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM attendance
+                WHERE date(timestamp) < date('now', 'localtime', '-' || ? || ' days')
+            ''', (days,))
+            deleted = cursor.rowcount
+            conn.commit()
+            
+        logger.info(f"✓ Cleaned up {deleted} old attendance records")
+        return deleted
+    except Exception as e:
+        logger.error(f"Failed to cleanup logs: {e}")
+        return 0
+
+
+def get_attendance_statistics() -> Dict:
+    """Get comprehensive attendance statistics."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) FROM attendance')
+            total_records = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM attendance
+                WHERE date(timestamp) = date('now', 'localtime')
+            ''')
+            today_count = cursor.fetchone()[0]
+
+            cursor.execute('''
+                SELECT COUNT(DISTINCT user_id) FROM attendance
+                WHERE date(timestamp) = date('now', 'localtime')
+                AND user_id NOT IN (
+                    SELECT user_id FROM manual_absent WHERE date = date('now', 'localtime')
+                )
+            ''')
+            unique_today = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT AVG(confidence) FROM attendance')
+            avg_confidence = cursor.fetchone()[0] or 0
+            
+            cursor.execute('''
+                SELECT u.name, a.timestamp, a.confidence FROM attendance a
+                JOIN users u ON a.user_id = u.id
+                ORDER BY a.timestamp DESC LIMIT 10
+            ''')
+            recent = cursor.fetchall()
+            
+        return {
+            'total_records': total_records,
+            'today_count': today_count,
+            'unique_users_today': unique_today,
+            'avg_confidence': float(avg_confidence),
+            'recent_entries': [
+                {'name': r[0], 'timestamp': r[1], 'confidence': r[2]}
+                for r in recent
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Failed to get statistics: {e}")
+        return {}
+
+def get_attendance_today() -> List[Dict]:
+    """Get all attendance logs for today with room location and device info."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT a.id, u.name as user_name, a.detected_name, a.confidence, a.timestamp, a.source, a.user_id, u.department, a.location, a.device_id
+                FROM attendance a
+                JOIN users u ON a.user_id = u.id
+                WHERE date(a.timestamp) = date('now', 'localtime')
+                ORDER BY a.timestamp DESC
+            ''')
+            rows = cursor.fetchall()
+            
+        return [{
+            'id': r[0], 'user_name': r[1], 'detected_name': r[2],
+            'confidence': r[3], 'timestamp': r[4], 'source': r[5], 'user_id': r[6], 'department': r[7],
+            'location': r[8], 'device_id': r[9]
+        } for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch today's logs: {e}")
+        return []
+
+
+def get_all_departments() -> List[str]:
+    """Get list of distinct departments from registered active users."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT department FROM users WHERE active = 1 AND department IS NOT NULL AND department != '' ORDER BY department ASC")
+            rows = cursor.fetchall()
+            return [r[0] for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch departments: {e}")
+        return []
+
+
+def get_detailed_attendance_report(
+    target_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    department: Optional[str] = None,
+    shift_id: Optional[Any] = None,
+    status_filter: Optional[str] = None,
+    search_query: Optional[str] = None,
+    checkin_camera: Optional[str] = None,
+    checkout_camera: Optional[str] = None,
+    camera_id: Optional[str] = None,
+    late_time_threshold: str = "09:15:00",
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Generate comprehensive department-wise, shift-wise, staff-wise, and camera-wise attendance reports.
+    For multi-day periods (week, month, range): Returns ONE ROW PER EMPLOYEE with summary metrics
+    and a complete daily timeline attached for the 'Complete View' drilldown.
+    For single-day queries (today, yesterday, specific date): Returns standard daily attendance rows
+    with actual Check-In and Check-Out cameras recorded.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Determine query date parameters
+            if target_date == 'today' or (not target_date and not start_date):
+                cursor.execute("SELECT date('now', 'localtime')")
+                target_date = cursor.fetchone()[0]
+                start_date = target_date
+                end_date = target_date
+                is_multi_day = False
+            elif target_date == 'yesterday':
+                cursor.execute("SELECT date('now', 'localtime', '-1 day')")
+                target_date = cursor.fetchone()[0]
+                start_date = target_date
+                end_date = target_date
+                is_multi_day = False
+            elif target_date == 'this_week':
+                cursor.execute("SELECT date('now', 'localtime', 'weekday 0', '-6 days'), date('now', 'localtime')")
+                start_date, end_date = cursor.fetchone()
+                is_multi_day = (start_date != end_date)
+            elif target_date == 'this_month':
+                cursor.execute("SELECT date('now', 'localtime', 'start of month'), date('now', 'localtime')")
+                start_date, end_date = cursor.fetchone()
+                is_multi_day = (start_date != end_date)
+            elif target_date == 'last7':
+                cursor.execute("SELECT date('now', 'localtime', '-6 days'), date('now', 'localtime')")
+                start_date, end_date = cursor.fetchone()
+                is_multi_day = True
+            elif target_date == 'last30':
+                cursor.execute("SELECT date('now', 'localtime', '-29 days'), date('now', 'localtime')")
+                start_date, end_date = cursor.fetchone()
+                is_multi_day = True
+            elif target_date and not start_date:
+                start_date = target_date
+                end_date = target_date
+                is_multi_day = False
+            else:
+                end_date = end_date or start_date
+                start_date = start_date or end_date
+                is_multi_day = (start_date != end_date)
+
+            # Generate chronological list of dates in the range
+            dt_start = datetime.strptime(start_date, "%Y-%m-%d")
+            dt_end = datetime.strptime(end_date, "%Y-%m-%d")
+            total_days = (dt_end - dt_start).days + 1
+            date_list = [(dt_start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(total_days)]
+            cursor.execute(
+                "SELECT calendar_date, override_type, scope_type, scope_id FROM special_date_overrides WHERE calendar_date >= ? AND calendar_date <= ?",
+                (start_date, end_date),
+            )
+            calendar_overrides = {
+                (row['calendar_date'], row['scope_type'], row['scope_id']): row['override_type']
+                for row in cursor.fetchall()
+            }
+
+            # Automatically include company public holidays for all staff
+            cursor.execute("SELECT holiday_date, end_date, is_recurring FROM company_holidays")
+            for h_row in cursor.fetchall():
+                h_date = h_row['holiday_date']
+                e_date = h_row['end_date'] or h_date
+                is_rec = h_row['is_recurring']
+                
+                # Expand holiday date range
+                h_start = datetime.strptime(h_date, "%Y-%m-%d")
+                h_end = datetime.strptime(e_date, "%Y-%m-%d")
+                curr_h = h_start
+                while curr_h <= h_end:
+                    curr_h_str = curr_h.strftime("%Y-%m-%d")
+                    if start_date <= curr_h_str <= end_date:
+                        if (curr_h_str, 'all', 0) not in calendar_overrides:
+                            calendar_overrides[(curr_h_str, 'all', 0)] = 'holiday'
+                    elif is_rec:
+                        try:
+                            h_md = curr_h_str[5:]  # "MM-DD"
+                            for y in range(dt_start.year, dt_end.year + 1):
+                                occ = f"{y:04d}-{h_md}"
+                                if start_date <= occ <= end_date and (occ, 'all', 0) not in calendar_overrides:
+                                    calendar_overrides[(occ, 'all', 0)] = 'holiday'
+                        except Exception:
+                            pass
+                    curr_h += timedelta(days=1)
+
+
+
+            # Fetch users matching department and shift filters, including those who exited during/after the report period
+            user_query = '''
+                SELECT u.id, u.name, u.email, u.phone, u.department, u.photo_path, u.cnic, u.position, u.salary, 
+                       u.join_date, u.exit_date, u.enrollment_date, u.created_at, u.active,
+                       COALESCE(u.shift_id, 1) as shift_id,
+                       COALESCE(s.name, 'General Morning Shift') as shift_name,
+                       COALESCE(s.start_time, '08:00') as start_time,
+                       COALESCE(s.end_time, '20:00') as end_time,
+                       COALESCE(s.grace_period_minutes, 15) as grace_period_minutes,
+                       COALESCE(s.working_days, '[0,1,2,3,4,5]') as working_days,
+                       COALESCE(u.checkin_cameras, 'all') as checkin_cameras,
+                       COALESCE(u.checkout_cameras, 'all') as checkout_cameras
+                FROM users u
+                LEFT JOIN shifts s ON COALESCE(u.shift_id, 1) = s.id
+                WHERE (u.active = 1 OR (u.exit_date IS NOT NULL AND u.exit_date >= ?))
+            '''
+            user_params = [start_date]
+            if department and department.strip() and department.lower() != 'all':
+                user_query += " AND LOWER(TRIM(u.department)) = LOWER(TRIM(?))"
+                user_params.append(department.strip())
+            if shift_id and str(shift_id).strip() and str(shift_id).lower() != 'all':
+                user_query += " AND (u.shift_id = ? OR LOWER(TRIM(s.name)) = LOWER(TRIM(?)))"
+                user_params.extend([str(shift_id).strip(), str(shift_id).strip()])
+            if user_id is not None:
+                user_query += " AND u.id = ?"
+                user_params.append(int(user_id))
+
+            user_query += " ORDER BY u.department ASC, u.name ASC"
+            cursor.execute(user_query, user_params)
+            users = [dict(r) for r in cursor.fetchall()]
+
+            if not users:
+                return {
+                    'is_multi_day': is_multi_day,
+                    'date_label': start_date if not is_multi_day else f"{start_date} to {end_date}",
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'total_days': total_days,
+                    'summary': {
+                        'total_enrolled': 0,
+                        'total_matching': 0,
+                        'attended_count': 0,
+                        'zero_attendance_count': 0,
+                        'total_present_days': 0,
+                        'total_late_days': 0,
+                        'total_absent_days': 0,
+                        'attendance_rate': 0.0
+                    },
+                    'records': [],
+                    'departments': []
+                }
+
+            user_ids = [u['id'] for u in users]
+            placeholders = ','.join('?' for _ in user_ids)
+            cursor.execute(f'''
+                SELECT user_id, shift_id, effective_from, shift_name, start_time, end_time,
+                       grace_period_minutes, working_days, checkout_grace_period_minutes
+                FROM employee_shift_history
+                WHERE user_id IN ({placeholders}) AND effective_from <= ?
+                ORDER BY user_id, effective_from, id
+            ''', (*user_ids, end_date))
+            shift_history_by_user = {}
+            for history_row in cursor.fetchall():
+                shift_history_by_user.setdefault(history_row['user_id'], []).append(dict(history_row))
+
+            cursor.execute("SELECT id, name, start_time, end_time, grace_period_minutes, checkout_grace_period_minutes, working_days FROM shifts")
+            all_shifts_lookup = {r['id']: dict(r) for r in cursor.fetchall()}
+
+            # Retrieve attendance logs with Check-In camera and Check-Out camera subqueries
+            att_query = f'''
+                SELECT a.user_id, 
+                       date(a.timestamp) as log_date,
+                       MIN(a.timestamp) as first_seen,
+                       MAX(a.timestamp) as last_seen,
+                       COUNT(*) as log_count,
+                       (SELECT a1.location FROM attendance a1 WHERE a1.user_id = a.user_id AND date(a1.timestamp) = date(a.timestamp) ORDER BY a1.timestamp ASC LIMIT 1) as checkin_location,
+                       (SELECT a1.device_id FROM attendance a1 WHERE a1.user_id = a.user_id AND date(a1.timestamp) = date(a.timestamp) ORDER BY a1.timestamp ASC LIMIT 1) as checkin_camera,
+                       (SELECT COALESCE(a2.checkout_location, a2.location) FROM attendance a2 WHERE a2.user_id = a.user_id AND date(a2.timestamp) = date(a.timestamp) ORDER BY a2.timestamp DESC LIMIT 1) as checkout_location,
+                       (SELECT COALESCE(a2.checkout_camera_id, a2.device_id) FROM attendance a2 WHERE a2.user_id = a.user_id AND date(a2.timestamp) = date(a.timestamp) ORDER BY a2.timestamp DESC LIMIT 1) as checkout_camera,
+                       (SELECT a1.source FROM attendance a1 WHERE a1.user_id = a.user_id AND date(a1.timestamp) = date(a.timestamp) ORDER BY a1.timestamp ASC LIMIT 1) as source,
+                       (SELECT a1.notes FROM attendance a1 WHERE a1.user_id = a.user_id AND date(a1.timestamp) = date(a.timestamp) ORDER BY a1.timestamp ASC LIMIT 1) as notes,
+                       (SELECT a1.marked_by FROM attendance a1 WHERE a1.user_id = a.user_id AND date(a1.timestamp) = date(a.timestamp) ORDER BY a1.timestamp ASC LIMIT 1) as marked_by,
+                       (SELECT a1.shift_id FROM attendance a1 WHERE a1.user_id = a.user_id AND date(a1.timestamp) = date(a.timestamp) AND a1.shift_id IS NOT NULL LIMIT 1) as record_shift_id
+                FROM attendance a
+                WHERE a.user_id IN ({placeholders})
+                  AND date(a.timestamp) >= ?
+                  AND date(a.timestamp) <= ?
+                GROUP BY a.user_id, log_date
+            '''
+            cursor.execute(att_query, (*user_ids, start_date, end_date))
+            att_map = {(r['user_id'], r['log_date']): dict(r) for r in cursor.fetchall()}
+
+            # Retrieve manual absences
+            cursor.execute(
+                f"SELECT user_id, date FROM manual_absent WHERE user_id IN ({placeholders}) AND date >= ? AND date <= ?",
+                (*user_ids, start_date, end_date)
+            )
+            absent_set = set((r[0], r[1]) for r in cursor.fetchall())
+
+            # Retrieve approved leaves with leave_type & is_paid lookup
+            cursor.execute(f'''
+                  SELECT lr.user_id, lr.start_date, lr.end_date, lr.leave_type, lr.leave_duration,
+                      lr.paid_days, lr.unpaid_days, lr.paid_through_date,
+                       COALESCE(lt.is_paid, CASE WHEN lr.leave_type = 'unpaid' THEN 0 ELSE 1 END) as is_paid
+                FROM leave_requests lr
+                LEFT JOIN leave_types lt ON lt.code = lr.leave_type OR lt.name = lr.leave_type
+                WHERE lr.user_id IN ({placeholders}) AND lr.status = 'approved' AND lr.end_date >= ? AND lr.start_date <= ?
+            ''', (*user_ids, start_date, end_date))
+            leave_rows = cursor.fetchall()
+            leave_map = {}
+            for lr in leave_rows:
+                l_uid, l_start, l_end, l_type = lr['user_id'], lr['start_date'], lr['end_date'], lr['leave_type']
+                is_half_leave = lr['leave_duration'] == 'half'
+                explicit_allocation = not is_half_leave and lr['paid_days'] is not None and lr['unpaid_days'] is not None
+                paid_days = int(lr['paid_days'] or 0) if explicit_allocation else None
+                unpaid_days = int(lr['unpaid_days'] or 0) if explicit_allocation else None
+                paid_through_date = lr['paid_through_date']
+                leave_is_paid = bool(lr['is_paid'])
+                try:
+                    cur_l = datetime.strptime(l_start, "%Y-%m-%d")
+                    end_l = datetime.strptime(l_end, "%Y-%m-%d")
+                    while cur_l <= end_l:
+                        current_date = cur_l.strftime("%Y-%m-%d")
+                        is_paid_day = leave_is_paid
+                        if explicit_allocation:
+                            is_paid_day = unpaid_days == 0 or (
+                                paid_days > 0 and paid_through_date is not None and current_date <= paid_through_date
+                            )
+                        leave_map[(l_uid, current_date)] = {
+                            'leave_type': l_type,
+                            'is_paid': is_paid_day,
+                            'is_half_leave': is_half_leave,
+                        }
+                        cur_l += timedelta(days=1)
+                except Exception:
+                    pass
+
+            dept_stats = {}
+            for u in users:
+                d = u['department'] or 'General / Unassigned'
+                if d not in dept_stats:
+                    dept_stats[d] = {'total_staff': 0, 'attended_staff': 0, 'present_days': 0, 'absent_days': 0, 'late_days': 0}
+                dept_stats[d]['total_staff'] += 1
+
+            records = []
+            total_present_days_all = 0
+            total_late_days_all = 0
+            total_absent_days_all = 0
+            attended_users_count = 0
+
+            for u in users:
+                uid = u['id']
+                dept = u['department'] or 'General / Unassigned'
+                shift_history = shift_history_by_user.get(uid, [])
+                history_index = 0
+                effective_shift = None
+
+                emp_daily_records = []
+                emp_present_days = 0
+                emp_late_days = 0
+                emp_absent_days = 0
+                emp_working_days = 0
+                emp_leave_days = 0
+
+                for cur_date in date_list:
+                    while history_index < len(shift_history) and shift_history[history_index]['effective_from'] <= cur_date:
+                        effective_shift = shift_history[history_index]
+                        history_index += 1
+                    att = att_map.get((uid, cur_date))
+                    schedule_known = effective_shift is not None
+                    if att and att.get('record_shift_id') and att['record_shift_id'] in all_shifts_lookup:
+                        rec_shift = all_shifts_lookup[att['record_shift_id']]
+                        shift_id_for_day = rec_shift['id']
+                        day_shift_name = rec_shift['name']
+                        shift_start = rec_shift['start_time']
+                        shift_end = rec_shift['end_time']
+                        grace_mins = int(rec_shift.get('grace_period_minutes') or 15)
+                        shift_working_days = set(_normalize_shift_working_days(rec_shift.get('working_days')))
+                        schedule_known = True
+                    else:
+                        shift_id_for_day = effective_shift['shift_id'] if effective_shift is not None else u['shift_id']
+                        day_shift_name = effective_shift['shift_name'] if effective_shift is not None else u['shift_name']
+                        shift_start = effective_shift['start_time'] if effective_shift is not None else u.get('start_time') or '08:00'
+                        shift_end = effective_shift['end_time'] if effective_shift is not None else u.get('end_time') or '20:00'
+                        grace_mins = int(effective_shift['grace_period_minutes'] if effective_shift is not None else u.get('grace_period_minutes') or 15)
+                        shift_working_days = set(_normalize_shift_working_days(
+                            effective_shift['working_days'] if effective_shift is not None else u.get('working_days')
+                        ))
+                    start_mins = parse_time_to_minutes(shift_start)
+                    grace_deadline_mins = start_mins + grace_mins
+                    dt_obj = datetime.strptime(cur_date, "%Y-%m-%d")
+                    day_name = dt_obj.strftime("%a")
+                    override_type = _resolve_calendar_override(
+                        calendar_overrides, cur_date, uid, shift_id_for_day
+                    )
+                    is_scheduled_workday = schedule_known and _is_scheduled_workday(
+                        dt_obj, shift_working_days, override_type
+                    )
+
+                    # TICKET 18/19: Joiner/Exit Pro-Rata
+                    employed_from = (u.get('join_date') or str(u.get('enrollment_date') or '').split(' ')[0] or str(u.get('created_at') or '').split(' ')[0]).strip()
+                    exit_date_str = (u.get('exit_date') or '').strip()
+                    is_employed_on_date = True
+                    if employed_from and cur_date < employed_from:
+                        is_employed_on_date = False
+                    if exit_date_str and cur_date > exit_date_str:
+                        is_employed_on_date = False
+
+                    if not is_employed_on_date:
+                        is_scheduled_workday = False
+                        status_if_no_attendance = 'not_employed'
+                    else:
+                        status_if_no_attendance = 'absent'
+
+                    is_manual_absent = (uid, cur_date) in absent_set
+                    leave_info = leave_map.get((uid, cur_date))
+                    half_leave_active = False
+                    if leave_info and leave_info['is_half_leave'] and att:
+                        now = datetime.now()
+                        try:
+                            shift_end_mins = parse_time_to_minutes(shift_end)
+                            if shift_end_mins <= start_mins:
+                                shift_end_mins += 24 * 60
+                            midpoint_mins = start_mins + (shift_end_mins - start_mins) // 2
+                            first_seen_text = str(att.get('first_seen') or '')
+                            first_seen_time = first_seen_text.split(' ')[-1] if ' ' in first_seen_text else first_seen_text.split('T')[-1]
+                            first_seen_mins = parse_time_to_minutes(first_seen_time)
+                            if first_seen_mins <= midpoint_mins % (24 * 60):
+                                if dt_obj.date() < now.date():
+                                    half_leave_active = True
+                                elif dt_obj.date() == now.date():
+                                    now_mins = now.hour * 60 + now.minute
+                                    if midpoint_mins >= 24 * 60 and now_mins < start_mins:
+                                        now_mins += 24 * 60
+                                    half_leave_active = now_mins >= midpoint_mins
+                        except (TypeError, ValueError):
+                            half_leave_active = False
+
+                    # Priority order: Actual Face Attendance > Approved Leave > Manual Absent override only when no attendance exists > Unexcused Absence
+                    if att:
+                        first_seen = att['first_seen']
+                        raw_last_seen = att['last_seen']
+                        last_seen = None
+                        if first_seen and raw_last_seen and str(first_seen) != str(raw_last_seen):
+                            try:
+                                fmt = "%Y-%m-%d %H:%M:%S"
+                                t1 = datetime.strptime(str(first_seen).split('.')[0], fmt)
+                                t2 = datetime.strptime(str(raw_last_seen).split('.')[0], fmt)
+                                if (t2 - t1).total_seconds() >= 60:
+                                    last_seen = raw_last_seen
+                            except Exception:
+                                if str(first_seen) != str(raw_last_seen):
+                                    last_seen = raw_last_seen
+
+                        checkin_cam = att.get('checkin_camera') or att.get('device_id') or 'Camera #1'
+                        checkin_loc = att.get('checkin_location') or att.get('location') or 'Main Gate / Entrance'
+                        checkout_cam = att.get('checkout_camera') or (checkin_cam if last_seen else '-')
+                        checkout_loc = att.get('checkout_location') or (checkin_loc if last_seen else '-')
+                        loc = checkin_loc
+                        dev = checkin_cam
+
+                        # Determine late vs present vs checked_out
+                        try:
+                            time_part = str(first_seen).split(' ')[-1] if ' ' in str(first_seen) else str(first_seen).split('T')[-1]
+                            checkin_mins = parse_time_to_minutes(time_part)
+                            shift_end_mins = parse_time_to_minutes(shift_end)
+
+                            # Determine if last_seen is a genuine Check-Out at or near shift end time
+                            is_genuine_checkout = False
+                            if last_seen:
+                                last_time_part = str(last_seen).split(' ')[-1] if ' ' in str(last_seen) else str(last_seen).split('T')[-1]
+                                last_seen_mins = parse_time_to_minutes(last_time_part)
+                                if shift_end_mins >= start_mins:
+                                    is_genuine_checkout = (last_seen_mins >= shift_end_mins - 1)
+                                else:
+                                    is_genuine_checkout = (last_seen_mins >= shift_end_mins - 1)
+
+                            if checkin_mins > grace_deadline_mins:
+                                status = 'late'
+                                emp_late_days += 1
+                            elif is_genuine_checkout:
+                                status = 'checked_out'
+                            else:
+                                status = 'present'
+                        except Exception:
+                            status = 'present'
+
+                        emp_present_days += 1
+                        if is_scheduled_workday:
+                            emp_working_days += 1
+                    elif is_scheduled_workday and leave_info:
+                        if leave_info['is_paid']:
+                            status = 'on_leave'
+                            emp_leave_days += 1
+                        else:
+                            status = 'on_leave_unpaid'
+                            emp_absent_days += 1
+                        first_seen = None
+                        last_seen = None
+                        loc = '-'
+                        dev = '-'
+                        checkin_cam = '-'
+                        checkout_cam = '-'
+                        emp_working_days += 1
+                    elif is_manual_absent and is_scheduled_workday:
+                        status = 'absent'
+                        first_seen = None
+                        last_seen = None
+                        loc = '-'
+                        dev = '-'
+                        checkin_cam = '-'
+                        checkout_cam = '-'
+                        emp_absent_days += 1
+                        emp_working_days += 1
+                    else:
+                        # No attendance record
+                        if not is_scheduled_workday:
+                            if status_if_no_attendance == 'not_employed':
+                                status = 'not_employed'
+                            else:
+                                status = 'schedule_unknown' if not schedule_known else ('holiday' if override_type == 'holiday' else (
+                                    'off_day' if override_type == 'off_day' else 'weekend'
+                                ))
+                            first_seen = None
+                            last_seen = None
+                            loc = '-'
+                            dev = '-'
+                            checkin_cam = '-'
+                            checkout_cam = '-'
+                        else:
+                            status = 'absent'
+                            first_seen = None
+                            last_seen = None
+                            loc = '-'
+                            dev = '-'
+                            checkin_cam = '-'
+                            checkout_cam = '-'
+                            emp_absent_days += 1
+                            emp_working_days += 1
+
+                    day_source = att.get('source', 'manual' if is_manual_absent else 'auto') if att is not None else ('manual' if is_manual_absent else 'auto')
+                    day_marked_by = (att.get('marked_by', 'Admin') if att and att.get('source') == 'manual' else ('Admin' if is_manual_absent else 'System')) if att is not None or is_manual_absent else 'System'
+                    emp_daily_records.append({
+                        'date': cur_date,
+                        'date_formatted': dt_obj.strftime("%d %b %Y"),
+                        'day': day_name,
+                        'status': status,
+                        'scheduled_workday': is_scheduled_workday,
+                        'shift_history_missing': not schedule_known,
+                        'calendar_override': override_type,
+                        'day_classification': (
+                            'special_working_day' if override_type == 'working_day' else
+                            'special_off_day' if override_type == 'off_day' else
+                            'holiday' if override_type == 'holiday' else
+                            'scheduled_working_day' if is_scheduled_workday else
+                            'non_working_day' if schedule_known else 'schedule_unknown'
+                        ),
+                        'status_display': f"{status.upper().replace('_', ' ')} + HALF LEAVE" if half_leave_active else status.upper().replace('_', ' '),
+                        'half_leave_count': int(half_leave_active),
+                        'half_leave_type': leave_info['leave_type'] if half_leave_active and leave_info else None,
+                        'first_seen': first_seen,
+                        'last_seen': last_seen,
+                        'location': loc,
+                        'device_id': dev,
+                        'checkin_camera': checkin_cam,
+                        'checkout_camera': checkout_cam,
+                        'checkin_location': loc if att else '-',
+                        'checkout_location': checkout_loc if (att and last_seen) else '-',
+                        'source': day_source,
+                        'source_label': 'Manual by Admin' if str(day_source).lower() == 'manual' else ('Auto by System' if day_source else '-'),
+                        'marked_by': day_marked_by,
+                        'notes': att.get('notes', '') if att else '',
+                        'shift_id': shift_id_for_day if schedule_known else None,
+                        'shift_name': day_shift_name,
+                        'shift_effective_from': effective_shift['effective_from'] if effective_shift is not None else None,
+                        'shift_working_days': sorted(shift_working_days) if schedule_known else []
+                    })
+
+                if emp_present_days > 0:
+                    attended_users_count += 1
+                    dept_stats[dept]['attended_staff'] += 1
+
+                dept_stats[dept]['present_days'] += emp_present_days
+                dept_stats[dept]['absent_days'] += emp_absent_days
+                dept_stats[dept]['late_days'] += emp_late_days
+
+                total_present_days_all += emp_present_days
+                total_late_days_all += emp_late_days
+                total_absent_days_all += emp_absent_days
+
+                effective_working_days = max(emp_working_days, 1) if emp_working_days > 0 else total_days
+                emp_rate = round((emp_present_days / effective_working_days * 100), 1) if effective_working_days > 0 else 0.0
+
+                # Filter matching logic
+                if search_query and search_query.strip():
+                    sq = search_query.strip().lower()
+                    if not (sq in u['name'].lower() or sq in dept.lower() or sq in (u['position'] or '').lower() or sq in str(uid)):
+                        continue
+
+                if status_filter and status_filter.lower() != 'all':
+                    sf = status_filter.lower()
+                    if sf == 'present' and emp_present_days == 0:
+                        continue
+                    elif sf == 'absent' and emp_present_days > 0:
+                        continue
+                    elif sf == 'late' and emp_late_days == 0:
+                        continue
+                    elif sf == 'checked_out' and not any(d.get('status') == 'checked_out' for d in emp_daily_records):
+                        continue
+
+                # Camera filtering
+                if checkin_camera and checkin_camera.strip() and checkin_camera.lower() != 'all':
+                    cc = checkin_camera.strip().lower()
+                    if not any(cc in str(d.get('checkin_camera', '')).lower() or cc in str(d.get('checkin_location', '')).lower() for d in emp_daily_records if d.get('status') in ('present', 'checked_out', 'late')):
+                        continue
+
+                if checkout_camera and checkout_camera.strip() and checkout_camera.lower() != 'all':
+                    coc = checkout_camera.strip().lower()
+                    if not any(coc in str(d.get('checkout_camera', '')).lower() or coc in str(d.get('checkout_location', '')).lower() for d in emp_daily_records if d.get('status') == 'checked_out'):
+                        continue
+
+                if camera_id and camera_id.strip() and camera_id.lower() != 'all':
+                    cid = camera_id.strip().lower()
+                    if not any((cid in str(d.get('checkin_camera', '')).lower() or cid in str(d.get('checkout_camera', '')).lower() or cid in str(d.get('checkin_location', '')).lower() or cid in str(d.get('checkout_location', '')).lower()) for d in emp_daily_records if d.get('status') in ('present', 'checked_out', 'late')):
+                        continue
+
+                if is_multi_day:
+                    # ONE ROW PER EMPLOYEE
+                    unpaid_leave_days = sum(1 for day in emp_daily_records if day.get('status') == 'on_leave_unpaid')
+                    total_leave_days = emp_leave_days + unpaid_leave_days
+                    records.append({
+                        'user_id': uid,
+                        'name': u['name'],
+                        'email': u['email'] or '',
+                        'phone': u['phone'] or '',
+                        'department': dept,
+                        'position': u['position'] or 'Staff Member',
+                        'cnic': u['cnic'] or '',
+                        'salary': float(u['salary'] or 0),
+                        'join_date': u['join_date'] or '',
+                        'shift_name': u['shift_name'],
+                        'shift_start': u['start_time'],
+                        'shift_end': u['end_time'],
+                        'photo_path': u['photo_path'],
+                        'checkin_cameras': u['checkin_cameras'],
+                        'checkout_cameras': u['checkout_cameras'],
+                        'total_days': total_days,
+                        'working_days': emp_working_days,
+                        'present_days': emp_present_days,
+                        'absent_days': emp_absent_days,
+                        'late_days': emp_late_days,
+                        'leave_days': total_leave_days,
+                        'paid_leave_days': emp_leave_days,
+                        'unpaid_leave_days': unpaid_leave_days,
+                        'total_leave_days': total_leave_days,
+                        'payable_days': min(emp_working_days, emp_present_days + emp_late_days + emp_leave_days),
+                        'attendance_rate': emp_rate,
+                        'present_display': f"{emp_present_days} / {emp_working_days}",
+                        'absent_display': f"{emp_absent_days} / {emp_working_days}",
+                        'daily_records': emp_daily_records
+                    })
+                else:
+                    # Single day view: 1 row for that day
+                    day_entry = emp_daily_records[0] if emp_daily_records else {}
+                    records.append({
+                        'user_id': uid,
+                        'name': u['name'],
+                        'email': u['email'] or '',
+                        'phone': u['phone'] or '',
+                        'department': dept,
+                        'position': u['position'] or 'Staff Member',
+                        'cnic': u['cnic'] or '',
+                        'salary': float(u['salary'] or 0),
+                        'join_date': u['join_date'] or '',
+                        'shift_name': day_entry.get('shift_name') or u['shift_name'],
+                        'shift_start': u['start_time'],
+                        'shift_end': u['end_time'],
+                        'photo_path': u['photo_path'],
+                        'checkin_cameras': u['checkin_cameras'],
+                        'checkout_cameras': u['checkout_cameras'],
+                        'status': day_entry.get('status', 'absent'),
+                        'shift_id': day_entry.get('shift_id') or u['shift_id'],
+                        'first_seen': day_entry.get('first_seen'),
+                        'last_seen': day_entry.get('last_seen'),
+                        'location': day_entry.get('location', 'Main Gate / Entrance'),
+                        'device_id': day_entry.get('device_id', 'Camera #1'),
+                        'checkin_camera': day_entry.get('checkin_camera', '-'),
+                        'checkout_camera': day_entry.get('checkout_camera', '-'),
+                        'checkin_location': day_entry.get('checkin_location', '-'),
+                        'checkout_location': day_entry.get('checkout_location', '-'),
+                        'source': day_entry.get('source', 'auto'),
+                        'marked_by': day_entry.get('marked_by', 'System'),
+                        'notes': day_entry.get('notes', ''),
+                        'paid_leave_days': int(day_entry.get('status') == 'on_leave'),
+                        'unpaid_leave_days': int(day_entry.get('status') == 'on_leave_unpaid'),
+                        'total_leave_days': int(day_entry.get('status') in ('on_leave', 'on_leave_unpaid')),
+                        'leave_days': int(day_entry.get('status') in ('on_leave', 'on_leave_unpaid')),
+                        'date': start_date,
+                        'daily_records': emp_daily_records
+                    })
+
+            # Calculate overall attendance percentage
+            total_possible_workdays = len(users) * total_days
+            overall_rate = round((total_present_days_all / total_possible_workdays * 100), 1) if total_possible_workdays > 0 else 0.0
+
+            dept_summary = []
+            for dname, ddata in dept_stats.items():
+                tot_st = ddata['total_staff']
+                pres_d = ddata['present_days']
+                max_d = tot_st * total_days
+                d_rate = round((pres_d / max_d * 100), 1) if max_d > 0 else 0.0
+                dept_summary.append({
+                    'department': dname,
+                    'total_staff': tot_st,
+                    'total': tot_st,
+                    'attended_staff': ddata['attended_staff'],
+                    'present_days': pres_d,
+                    'present': pres_d,
+                    'absent_days': ddata['absent_days'],
+                    'absent': ddata['absent_days'],
+                    'late_days': ddata['late_days'],
+                    'late': ddata['late_days'],
+                    'attendance_rate': d_rate
+                })
+
+            employee_summary = {}
+            for record in records:
+                user_key = str(record.get('user_id'))
+                employee_summary[user_key] = {
+                    'user_id': record.get('user_id'),
+                    'name': record.get('name'),
+                    'department': record.get('department'),
+                    'shift_name': record.get('shift_name'),
+                    'present_days': record.get('present_days', 0),
+                    'late_days': record.get('late_days', 0),
+                    'absent_days': record.get('absent_days', 0),
+                    'leave_days': record.get('leave_days', 0),
+                    'paid_leave_days': record.get('paid_leave_days', 0),
+                    'unpaid_leave_days': record.get('unpaid_leave_days', 0),
+                    'total_leave_days': record.get('total_leave_days', record.get('leave_days', 0)),
+                    'payable_days': record.get('payable_days', 0),
+                    'attendance_rate': record.get('attendance_rate', 0.0),
+                    'status': record.get('status', 'absent'),
+                }
+
+            date_label = start_date if not is_multi_day else f"{start_date} to {end_date}"
+
+            for record in records:
+                source = record.get('source') or 'auto'
+                record['source_label'] = 'Manual by Admin' if str(source).lower() == 'manual' else ('Auto by System' if source else '-')
+
+            response = {
+                'is_multi_day': is_multi_day,
+                'date_label': date_label,
+                'start_date': start_date,
+                'end_date': end_date,
+                'total_days': total_days,
+                'summary': {
+                    'total_enrolled': len(users),
+                    'total_registered': len(users),
+                    'total_matching': len(records),
+                    'attended_count': attended_users_count,
+                    'zero_attendance_count': len(users) - attended_users_count,
+                    'total_present_days': total_present_days_all,
+                    'present': total_present_days_all,
+                    'total_late_days': total_late_days_all,
+                    'late': total_late_days_all,
+                    'total_absent_days': total_absent_days_all,
+                    'absent': total_absent_days_all,
+                    'attendance_rate': overall_rate,
+                    'employees': employee_summary,
+                },
+                'records': records,
+                'rows': records,
+                'departments': dept_summary
+            }
+            return response
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        logger.error(f"Error generating attendance report: {e}")
+        return {
+            'is_multi_day': False,
+            'summary': {
+                'total_enrolled': 0,
+                'total_matching': 0,
+                'attended_count': 0,
+                'zero_attendance_count': 0,
+                'total_present_days': 0,
+                'total_late_days': 0,
+                'total_absent_days': 0,
+                'attendance_rate': 0.0
+            },
+            'records': [],
+            'departments': []
+        }
+
+def is_user_present_today(user_id: int, source: str | None = None) -> bool:
+    """Check if a user is already marked present today, optionally scoped to a specific source."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT COUNT(*) FROM manual_absent
+                WHERE user_id = ? AND date = date('now', 'localtime')
+            ''', (user_id,))
+            if cursor.fetchone()[0] > 0:
+                return False
+
+            if source:
+                cursor.execute('''
+                    SELECT COUNT(*) FROM attendance 
+                    WHERE user_id = ? AND source = ? AND date(timestamp) = date('now', 'localtime')
+                ''', (user_id, source))
+                count = cursor.fetchone()[0]
+                return count > 0
+
+            cursor.execute('''
+                SELECT COUNT(*) FROM attendance 
+                WHERE user_id = ? AND date(timestamp) = date('now', 'localtime')
+            ''', (user_id,))
+            count = cursor.fetchone()[0]
+        return count > 0
+    except Exception as e:
+        logger.error(f"Failed to check today's attendance for user {user_id}: {e}")
+        return False
+
+
+def mark_user_absent_today(user_id: int, target_date: Optional[str] = None) -> bool:
+    """Manually mark a user absent today or on a specific date by removing logs and persisting the override."""
+    try:
+        if target_date == 'today':
+            target_date = None
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            if target_date:
+                cursor.execute('''
+                    DELETE FROM attendance 
+                    WHERE user_id = ? AND date(timestamp) = ?
+                ''', (user_id, target_date))
+                deleted_count = cursor.rowcount
+
+                cursor.execute('''
+                    INSERT OR REPLACE INTO manual_absent (user_id, date)
+                    VALUES (?, ?)
+                ''', (user_id, target_date))
+            else:
+                cursor.execute('''
+                    DELETE FROM attendance 
+                    WHERE user_id = ? AND date(timestamp) = date('now', 'localtime')
+                ''', (user_id,))
+                deleted_count = cursor.rowcount
+
+                cursor.execute('''
+                    INSERT OR REPLACE INTO manual_absent (user_id, date)
+                    VALUES (?, date('now', 'localtime'))
+                ''', (user_id,))
+            conn.commit()
+        logger.info(f"✓ Manually marked user ID {user_id} absent for {target_date or 'today'} (removed {deleted_count} logs, recorded manual_absent)")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to mark user ID {user_id} absent: {e}")
+        return False
+
+
+def calculate_eligible_overtime(shift_start: str, shift_end: str, actual_checkout: str, checkout_grace_period_minutes: int = 0) -> float:
+    """
+    Calculate eligible overtime duration in hours:
+    OT duration = max(0, actual checkout - (applicable shift end + checkout grace period))
+    Handles standard daytime shifts as well as overnight shifts.
+    """
+    try:
+        def to_mins(t_str: str) -> int:
+            t = str(t_str).strip()
+            if ' ' in t:
+                t = t.split(' ')[-1]
+            if 'T' in t:
+                t = t.split('T')[-1]
+            parts = t.split(':')
+            return int(parts[0]) * 60 + int(parts[1])
+
+        start_m = to_mins(shift_start)
+        end_m = to_mins(shift_end)
+        co_m = to_mins(actual_checkout)
+
+        is_overnight = end_m < start_m
+        if is_overnight:
+            end_m += 24 * 60
+            if co_m < start_m:
+                co_m += 24 * 60
+        elif co_m < start_m and (co_m + 24 * 60 - end_m) <= 16 * 60:
+            co_m += 24 * 60
+
+        grace_threshold = end_m + max(0, int(checkout_grace_period_minutes or 0))
+        if co_m > grace_threshold:
+            ot_mins = co_m - grace_threshold
+            return round(ot_mins / 60.0, 2)
+        return 0.0
+    except Exception as e:
+        logger.error(f"Error calculating eligible overtime: {e}")
+        return 0.0
+
+
+def validate_check_times(check_in_time: str, check_out_time: Optional[str], is_overnight: bool = False):
+    """
+    Validate check_in and check_out times.
+    Raises ValueError with explanatory message on invalid time or checkout <= checkin.
+    """
+    if not check_out_time or not str(check_out_time).strip():
+        return True
+    co_str = str(check_out_time).strip()
+    if co_str in ('0', '00', '0000'):
+        raise ValueError('Invalid check-out time.')
+    
+    def parse_m(s: str) -> int:
+        s = s.strip()
+        if ' ' in s: s = s.split(' ')[-1]
+        if 'T' in s: s = s.split('T')[-1]
+        parts = s.split(':')
+        if len(parts) < 2:
+            raise ValueError(f'Malformed time: {s}')
+        h, m = int(parts[0]), int(parts[1])
+        if h < 0 or h > 23 or m < 0 or m > 59:
+            raise ValueError(f'Time out of range: {s}')
+        return h * 60 + m
+
+    ci = parse_m(check_in_time)
+    co = parse_m(co_str)
+
+    if is_overnight:
+        if co < ci:
+            co += 24 * 60
+        elif co <= ci:
+            raise ValueError('Check-out time must be strictly after check-in time.')
+    elif co <= ci:
+        if co < ci and (co + 24 * 60 - ci) <= 16 * 60:
+            co += 24 * 60
+        else:
+            raise ValueError('Check-out time must be strictly after check-in time.')
+    return True
+
+
+def mark_user_present_today(
+    user_id: int, 
+    target_date: Optional[str] = None, 
+    check_in_time: Optional[str] = None, 
+    check_out_time: Optional[str] = None, 
+    shift_id: Optional[int] = None,
+    notes: str = "", 
+    marked_by: str = "Admin"
+) -> bool:
+    """
+    Manually mark a user present today or on a target date, recording check-in and optional check-out.
+    Applies the specified or applicable shift (preserving historical shifts), validates checkout,
+    and calculates eligible overtime taking into account the shift checkout grace period.
+    """
+    try:
+        if check_in_time is not None and str(check_in_time).strip() == '':
+            raise ValueError('Check-in time is required')
+        if check_out_time is not None and str(check_out_time).strip() == '':
+            raise ValueError('Check-out time is required')
+
+        if target_date == 'today' or not target_date:
+            target_date = datetime.now().strftime("%Y-%m-%d")
+        actual_date = target_date
+        
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            
+            # Verify user exists
+            cursor.execute('SELECT name, shift_id FROM users WHERE id = ?', (user_id,))
+            user_row = cursor.fetchone()
+            if not user_row:
+                return False
+            name, user_default_shift_id = user_row[0], user_row[1]
+            
+            # Clear manual absent
+            cursor.execute('DELETE FROM manual_absent WHERE user_id = ? AND date = ?', (user_id, actual_date))
+            
+            # Resolve applicable shift
+            selected_shift = None
+            if shift_id:
+                cursor.execute('SELECT id, name, start_time, end_time, grace_period_minutes, checkout_grace_period_minutes FROM shifts WHERE id = ?', (shift_id,))
+                selected_shift = cursor.fetchone()
+                if not selected_shift:
+                    raise ValueError(f"Shift ID {shift_id} not found")
+            else:
+                # Find historical shift effective on actual_date
+                cursor.execute('''
+                    SELECT shift_id FROM employee_shift_history 
+                    WHERE user_id = ? AND effective_from <= ? 
+                    ORDER BY effective_from DESC, id DESC LIMIT 1
+                ''', (user_id, actual_date))
+                hist_row = cursor.fetchone()
+                eff_shift_id = hist_row[0] if hist_row else (user_default_shift_id or 1)
+                cursor.execute('SELECT id, name, start_time, end_time, grace_period_minutes, checkout_grace_period_minutes FROM shifts WHERE id = ?', (eff_shift_id,))
+                selected_shift = cursor.fetchone()
+                if not selected_shift:
+                    cursor.execute('SELECT id, name, start_time, end_time, grace_period_minutes, checkout_grace_period_minutes FROM shifts WHERE id = 1')
+                    selected_shift = cursor.fetchone()
+
+            shift_db_id = selected_shift[0] if selected_shift else 1
+            shift_start = selected_shift[2] if selected_shift else '09:00'
+            shift_end = selected_shift[3] if selected_shift else '17:00'
+            checkout_grace = int(selected_shift[5] or 0) if selected_shift else 0
+            
+            # Check overnight shift
+            def _to_mins(t):
+                p = str(t).strip().split(':')
+                return int(p[0]) * 60 + int(p[1])
+            is_overnight = _to_mins(shift_end) < _to_mins(shift_start)
+            
+            # Determine check-in time
+            cursor.execute('SELECT MIN(timestamp), MAX(timestamp) FROM attendance WHERE user_id = ? AND date(timestamp) = ?', (user_id, actual_date))
+            ex_row = cursor.fetchone()
+            existing_first = ex_row[0] if ex_row else None
+            
+            if check_in_time and str(check_in_time).strip():
+                ci_clean = str(check_in_time).strip()
+                if len(ci_clean) > 5 and ':' in ci_clean:
+                    ci_clean = ci_clean[:5]
+            elif existing_first:
+                ci_clean = str(existing_first).split(' ')[-1][:5]
+            else:
+                ci_clean = shift_start[:5]
+
+            # Determine check-out time & validate
+            co_clean = None
+            if check_out_time and str(check_out_time).strip():
+                co_raw = str(check_out_time).strip()
+                if len(co_raw) > 5 and ':' in co_raw:
+                    co_raw = co_raw[:5]
+                validate_check_times(ci_clean, co_raw, is_overnight=is_overnight)
+                co_clean = co_raw
+
+            # Delete old attendance logs for this user on this day so we have clean manual records
+            cursor.execute('DELETE FROM attendance WHERE user_id = ? AND date(timestamp) = ?', (user_id, actual_date))
+
+            # Insert check-in log
+            timestamp_val_in = f"{actual_date} {ci_clean}:00"
+            cursor.execute(
+                "INSERT INTO attendance (user_id, detected_name, confidence, source, timestamp, notes, marked_by, shift_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, name, 1.0, 'manual', timestamp_val_in, notes, marked_by, shift_db_id)
+            )
+
+            # Insert check-out log if provided
+            if co_clean:
+                timestamp_val_out = f"{actual_date} {co_clean}:00"
+                cursor.execute(
+                    "INSERT INTO attendance (user_id, detected_name, confidence, source, timestamp, notes, marked_by, shift_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, name, 1.0, 'manual', timestamp_val_out, notes, marked_by, shift_db_id)
+                )
+
+                # Calculate OT
+                ot_hours = calculate_eligible_overtime(shift_start, shift_end, co_clean, checkout_grace)
+                cursor.execute("SELECT id, status FROM overtime WHERE user_id = ? AND ot_date = ?", (user_id, actual_date))
+                ot_existing = cursor.fetchone()
+
+                if ot_hours > 0:
+                    if ot_existing:
+                        ot_id, cur_status = ot_existing[0], (ot_existing[1] or 'pending').lower()
+                        if cur_status == 'pending':
+                            cursor.execute("UPDATE overtime SET hours = ?, reason = ? WHERE id = ?", 
+                                           (ot_hours, f"Manual attendance checkout {co_clean}", ot_id))
+                    else:
+                        cursor.execute("INSERT INTO overtime (user_id, user_name, ot_date, hours, reason, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                                       (user_id, name, actual_date, ot_hours, f"Manual attendance checkout {co_clean}"))
+                else:
+                    if ot_existing and (ot_existing[1] or 'pending').lower() == 'pending':
+                        cursor.execute("DELETE FROM overtime WHERE id = ?", (ot_existing[0],))
+            else:
+                # If no checkout provided, remove any pending OT for this date
+                cursor.execute("SELECT id, status FROM overtime WHERE user_id = ? AND ot_date = ?", (user_id, actual_date))
+                ot_existing = cursor.fetchone()
+                if ot_existing and (ot_existing[1] or 'pending').lower() == 'pending':
+                    cursor.execute("DELETE FROM overtime WHERE id = ?", (ot_existing[0],))
+
+            conn.commit()
+
+        logger.info(f"✓ Manually marked user ID {user_id} present for {actual_date} (shift={shift_db_id}, in={ci_clean}, out={co_clean})")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to manually mark user ID {user_id} present: {e}")
+        raise e
+
+
+def is_user_manually_absent_today(user_id: int) -> bool:
+    """Check if a user has been manually marked absent today."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) FROM manual_absent 
+                WHERE user_id = ? AND date = date('now', 'localtime')
+            ''', (user_id,))
+            count = cursor.fetchone()[0]
+        return count > 0
+    except Exception as e:
+        logger.error(f"Failed to check manual absent status for user {user_id}: {e}")
+        return False
+
+
+def clear_manual_absent_today(user_id: int) -> bool:
+    """Clear today's manual-absence override when the person is seen by a camera."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'DELETE FROM manual_absent WHERE user_id = ? AND date = date("now", "localtime")',
+                (user_id,)
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to clear manual absent status for user {user_id}: {e}")
+        return False
+
+
+def save_user_photo(user_id: int, photo_path: str) -> bool:
+    """Save the path of professional profile photo for a user."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET photo_path = ? WHERE id = ?", (photo_path, user_id))
+            updated = cursor.rowcount > 0
+            conn.commit()
+        return updated
+    except Exception as e:
+        logger.error(f"Failed to save photo path for user {user_id}: {e}")
+        return False
+
+
+def get_user_photo(user_id: int) -> Optional[str]:
+    """Get professional profile photo path for a user."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT photo_path FROM users WHERE id = ?", (user_id,))
+            row = cursor.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception as e:
+        logger.error(f"Failed to get photo path for user {user_id}: {e}")
+        return None
+
+
+# ============================================
+# HR / AUTH / LEAVE / OVERTIME / SALARY HELPERS
+# ============================================
+
+def get_user_by_id(user_id: int) -> Optional[Dict]:
+    """Retrieve full user profile by user_id."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+            row = cursor.fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Failed to get user by id {user_id}: {e}")
+        return None
+
+
+def authenticate_user(email: str, password: str) -> Optional[Dict]:
+    """Authenticate staff / admin by email or username and password."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM users WHERE (email = ? OR name = ?) AND active = 1",
+                (email.strip(), email.strip())
+            )
+            row = cursor.fetchone()
+            if row:
+                user_dict = dict(row)
+                # Check password (plain comparison or fallback default)
+                if user_dict.get('password') == password.strip():
+                    return user_dict
+        return None
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        return None
+
+
+def change_password(user_id: int, new_password: str) -> bool:
+    """Update user password."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET password = ? WHERE id = ?", (new_password.strip(), user_id))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Change password error: {e}")
+        return False
+
+
+def split_leave_request_dates(user_id: int, start_date: str, end_date: str, available_days: int) -> Tuple[Optional[Tuple[str, str]], Optional[Tuple[str, str]]]:
+    """Splits a leave date range into two based on available scheduled working days."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT working_days FROM shifts WHERE id = (SELECT shift_id FROM users WHERE id = ?)', (user_id,))
+            row = cursor.fetchone()
+            working_days = set(_normalize_shift_working_days(row['working_days'])) if row and row['working_days'] else {0,1,2,3,4,5,6}
+            
+            cursor.execute('SELECT holiday_date FROM company_holidays WHERE holiday_date >= ? AND holiday_date <= ?', (start_date, end_date))
+            holidays = {r['holiday_date'] for r in cursor.fetchall()}
+            
+            cursor.execute("SELECT calendar_date, override_type FROM special_date_overrides WHERE calendar_date >= ? AND calendar_date <= ? AND (scope_type = 'all' OR (scope_type = 'employee' AND scope_id = ?))", (start_date, end_date, user_id))
+            overrides = {r['calendar_date']: r['override_type'] for r in cursor.fetchall()}
+            
+            d1 = datetime.strptime(start_date, '%Y-%m-%d')
+            d2 = datetime.strptime(end_date, '%Y-%m-%d')
+
+            if available_days <= 0:
+                return None, (start_date, end_date)
+            
+            counted = 0
+            split_date = None
+            
+            for i in range((d2 - d1).days + 1):
+                curr = d1 + timedelta(days=i)
+                curr_str = curr.strftime('%Y-%m-%d')
+                
+                override = overrides.get(curr_str)
+                if override:
+                    is_work = (override == 'working_day')
+                elif curr_str in holidays:
+                    is_work = False
+                else:
+                    is_work = curr.weekday() in working_days
+                    
+                if is_work:
+                    counted += 1
+                    
+                if counted == available_days and split_date is None:
+                    split_date = curr
+                    
+            if split_date is None or split_date == d2:
+                return (start_date, end_date), None
+                
+            range1 = (start_date, split_date.strftime('%Y-%m-%d'))
+            next_day = split_date + timedelta(days=1)
+            range2 = (next_day.strftime('%Y-%m-%d'), end_date)
+            return range1, range2
+    except Exception as e:
+        logger.error(f"Error splitting leave dates: {e}")
+        return (start_date, end_date), None
+
+def _find_active_leave_overlap(cursor, user_id: int, start_date: str, end_date: str, exclude_id: Optional[int] = None):
+    query = """
+        SELECT lr.id, COALESCE(lt.name, lr.leave_type) AS type_name,
+               lr.start_date, lr.end_date, LOWER(COALESCE(lr.status, 'pending')) AS status
+        FROM leave_requests lr
+        LEFT JOIN leave_types lt ON lt.code = lr.leave_type OR lt.name = lr.leave_type
+        WHERE lr.user_id = ?
+          AND LOWER(COALESCE(lr.status, 'pending')) IN ('pending', 'approved', 'partially_approved')
+          AND lr.start_date <= ? AND lr.end_date >= ?
+    """
+    params = [user_id, end_date, start_date]
+    if exclude_id is not None:
+        query += " AND lr.id != ?"
+        params.append(exclude_id)
+    query += " ORDER BY lr.start_date, lr.id LIMIT 1"
+    cursor.execute(query, params)
+    return cursor.fetchone()
+
+
+def add_leave_request(
+    user_id: int,
+    user_name: str,
+    leave_type: str,
+    start_date: str,
+    end_date: str,
+    reason: str = '',
+    paid_days: Optional[int] = None,
+    unpaid_days: Optional[int] = None,
+    quota_days: Optional[int] = None,
+    paid_through_date: Optional[str] = None,
+    quota_through_date: Optional[str] = None,
+    leave_duration: str = 'full',
+    half_leave_quota_type_id: Optional[int] = None,
+    half_leave_quota_charge: bool = False,
+) -> Optional[int]:
+    """Insert a new leave request with strict date ordering validation."""
+    try:
+        s_str = (start_date or '').strip()
+        e_str = (end_date or '').strip()
+        d1 = datetime.strptime(s_str, '%Y-%m-%d')
+        d2 = datetime.strptime(e_str, '%Y-%m-%d')
+        if d2 < d1:
+            logger.error(f"Cannot add leave request: end_date ({e_str}) < start_date ({s_str})")
+            return None
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute('BEGIN IMMEDIATE')
+            conflict = _find_active_leave_overlap(cursor, user_id, s_str, e_str)
+            if conflict:
+                logger.warning(
+                    f"Cannot add leave request for user {user_id}: dates overlap active request #{conflict['id']}"
+                )
+                return None
+            cursor.execute(
+                     '''INSERT INTO leave_requests (
+                                user_id, user_name, leave_type, leave_duration, start_date, end_date, reason,
+                                paid_days, unpaid_days, quota_days, paid_through_date, quota_through_date,
+                                half_leave_quota_type_id, half_leave_quota_charge
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                         (user_id, user_name, leave_type, leave_duration, s_str, e_str, reason,
+                      paid_days, unpaid_days, quota_days, paid_through_date, quota_through_date,
+                      half_leave_quota_type_id, int(bool(half_leave_quota_charge)))
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Add leave request error: {e}")
+        return None
+
+
+def add_leave_requests(user_id: int, user_name: str, requests: List[Tuple[str, str, str, str]]) -> Optional[List[int]]:
+    """Insert related paid/unpaid leave segments atomically."""
+    try:
+        for _, start_date, end_date, _ in requests:
+            start = datetime.strptime(start_date, '%Y-%m-%d')
+            end = datetime.strptime(end_date, '%Y-%m-%d')
+            if end < start:
+                return None
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('BEGIN IMMEDIATE')
+            ids = []
+            for leave_type, start_date, end_date, reason in requests:
+                cursor.execute(
+                    '''INSERT INTO leave_requests (user_id, user_name, leave_type, start_date, end_date, reason)
+                       VALUES (?, ?, ?, ?, ?, ?)''',
+                    (user_id, user_name, leave_type, start_date, end_date, reason)
+                )
+                ids.append(cursor.lastrowid)
+            conn.commit()
+            return ids
+    except Exception as e:
+        logger.error(f"Add leave request segments error: {e}")
+        return None
+
+
+def get_leave_requests(user_id: Optional[int] = None, status: Optional[str] = None) -> List[Dict]:
+    """Get list of leave requests optionally filtered by user_id and status."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            query = "SELECT * FROM leave_requests WHERE 1=1"
+            params = []
+            if user_id:
+                query += " AND user_id = ?"
+                params.append(user_id)
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+            query += " ORDER BY created_at DESC"
+            cursor.execute(query, params)
+            requests = [dict(r) for r in cursor.fetchall()]
+            for leave_request in requests:
+                requested_days = 1 if leave_request.get('leave_duration') == 'half' else _count_scheduled_leave_days(
+                    cursor, leave_request['user_id'], leave_request['start_date'], leave_request['end_date']
+                )
+                leave_request['requested_days'] = requested_days
+                if leave_request.get('paid_days') is None or leave_request.get('unpaid_days') is None:
+                    leave_type = str(leave_request.get('leave_type') or '').lower()
+                    if leave_type == 'unpaid':
+                        leave_request['paid_days'] = 0
+                        leave_request['unpaid_days'] = requested_days
+                        leave_request['quota_days'] = 0
+                    elif leave_type == 'excess_paid':
+                        leave_request['paid_days'] = requested_days
+                        leave_request['unpaid_days'] = 0
+                        leave_request['quota_days'] = 0
+                    else:
+                        leave_request['paid_days'] = requested_days
+                        leave_request['unpaid_days'] = 0
+                        leave_request['quota_days'] = requested_days
+            return requests
+    except Exception as e:
+        logger.error(f"Get leave requests error: {e}")
+        return []
+
+
+def update_leave_status(leave_id: int, status: str = 'approved', approved_by: str = 'Admin') -> bool:
+    """Update status unless it would create overlapping active leave."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute('BEGIN IMMEDIATE')
+            cursor.execute(
+                "SELECT user_id, start_date, end_date FROM leave_requests WHERE id = ?",
+                (leave_id,)
+            )
+            leave = cursor.fetchone()
+            if not leave:
+                return False
+            if str(status or '').strip().lower() in ('pending', 'approved', 'partially_approved'):
+                conflict = _find_active_leave_overlap(
+                    cursor, leave['user_id'], leave['start_date'], leave['end_date'], exclude_id=leave_id
+                )
+                if conflict:
+                    logger.warning(
+                        f"Cannot set leave request #{leave_id} to {status}: dates overlap active request #{conflict['id']}"
+                    )
+                    return False
+            cursor.execute(
+                "UPDATE leave_requests SET status = ?, approved_by = ? WHERE id = ?",
+                (status, approved_by, leave_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Update leave status error: {e}")
+        return False
+
+
+def delete_leave_request(leave_id: int) -> bool:
+    """Delete a leave request."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM leave_requests WHERE id = ?", (leave_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Delete leave request error: {e}")
+        return False
+
+
+# ============================================
+# LEAVE TYPES & HOLIDAYS MANAGEMENT HELPERS
+# ============================================
+
+def get_leave_types() -> List[Dict]:
+    """Get all configured leave types."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM leave_types ORDER BY id ASC")
+            return [dict(r) for r in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Get leave types error: {e}")
+        return []
+
+
+def add_leave_type(
+    name: str, code: str, yearly_allowance: float = 12.0, is_paid: int = 1,
+    description: str = '', allowance_period: str = 'yearly',
+    allowance_months: Optional[int] = None, half_leave_enabled: bool = False,
+    half_leave_mode: str = 'separate', half_leave_allowance_count: int = 0,
+    half_leave_allowance_months: int = 12, half_leaves_per_quota_day: int = 2,
+    half_leave_quota_type_id: Optional[int] = None,
+) -> Optional[int]:
+    """Add a new leave type policy."""
+    try:
+        default_months = {'monthly': 1, 'half_yearly': 6, 'yearly': 12}.get(allowance_period, 12)
+        duration_months = int(allowance_months if allowance_months is not None else default_months)
+        half_mode = str(half_leave_mode or 'separate').strip().lower()
+        half_count = int(half_leave_allowance_count or 0)
+        half_months = int(half_leave_allowance_months or 12)
+        half_conversion = int(half_leaves_per_quota_day or 2)
+        if not 1 <= duration_months <= 12 or half_mode not in ('separate', 'convert') or half_count < 0 or not 1 <= half_months <= 12 or half_conversion < 1:
+            return None
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO leave_types (
+                       name, code, yearly_allowance, is_paid, description, allowance_period, allowance_months,
+                       half_leave_enabled, half_leave_mode, half_leave_allowance_count,
+                       half_leave_allowance_months, half_leaves_per_quota_day, half_leave_quota_type_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (name, code, yearly_allowance, is_paid, description, allowance_period, duration_months,
+                 int(bool(half_leave_enabled)), half_mode, half_count, half_months, half_conversion,
+                 half_leave_quota_type_id)
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Add leave type error: {e}")
+        return None
+
+
+def update_leave_type(
+    type_id: int, name: str, yearly_allowance: float, is_paid: int,
+    description: str, active: int = 1, allowance_period: str = 'yearly',
+    allowance_months: Optional[int] = None, half_leave_enabled: bool = False,
+    half_leave_mode: str = 'separate', half_leave_allowance_count: int = 0,
+    half_leave_allowance_months: int = 12, half_leaves_per_quota_day: int = 2,
+    half_leave_quota_type_id: Optional[int] = None,
+) -> bool:
+    """Update existing leave type policy."""
+    try:
+        default_months = {'monthly': 1, 'half_yearly': 6, 'yearly': 12}.get(allowance_period, 12)
+        duration_months = int(allowance_months if allowance_months is not None else default_months)
+        half_mode = str(half_leave_mode or 'separate').strip().lower()
+        half_count = int(half_leave_allowance_count or 0)
+        half_months = int(half_leave_allowance_months or 12)
+        half_conversion = int(half_leaves_per_quota_day or 2)
+        if not 1 <= duration_months <= 12 or half_mode not in ('separate', 'convert') or half_count < 0 or not 1 <= half_months <= 12 or half_conversion < 1:
+            return False
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """UPDATE leave_types SET name = ?, yearly_allowance = ?, is_paid = ?, description = ?, active = ?,
+                   allowance_period = ?, allowance_months = ?, half_leave_enabled = ?, half_leave_mode = ?,
+                   half_leave_allowance_count = ?, half_leave_allowance_months = ?,
+                   half_leaves_per_quota_day = ?, half_leave_quota_type_id = ? WHERE id = ?""",
+                (name, yearly_allowance, is_paid, description, active, allowance_period, duration_months,
+                 int(bool(half_leave_enabled)), half_mode, half_count, half_months, half_conversion,
+                 half_leave_quota_type_id, type_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Update leave type error: {e}")
+        return False
+
+
+def delete_leave_type(type_id: int) -> bool:
+    """Delete a leave type policy."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM leave_types WHERE id = ?", (type_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Delete leave type error: {e}")
+        return False
+
+
+def get_company_holidays(year: Optional[int] = None) -> List[Dict]:
+    """Get company holidays optionally filtered by year."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if year:
+                cursor.execute("SELECT * FROM company_holidays WHERE strftime('%Y', holiday_date) = ? ORDER BY holiday_date ASC", (str(year),))
+            else:
+                cursor.execute("SELECT * FROM company_holidays ORDER BY holiday_date ASC")
+            return [dict(r) for r in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Get company holidays error: {e}")
+        return []
+
+
+def get_company_holiday_in_range(start_date: str, end_date: str) -> Optional[Dict]:
+    """Return the first company holiday that overlaps a leave date range."""
+    try:
+        range_start = datetime.strptime(start_date, '%Y-%m-%d').date()
+        range_end = datetime.strptime(end_date, '%Y-%m-%d').date()
+        if range_end < range_start:
+            return None
+
+        holidays = get_company_holidays()
+        current_date = range_start
+        while current_date <= range_end:
+            current_iso = current_date.isoformat()
+            current_month_day = current_iso[5:]
+            for holiday in holidays:
+                holiday_start = str(holiday.get('holiday_date') or '')
+                holiday_end = str(holiday.get('end_date') or holiday_start)
+                if holiday.get('is_recurring'):
+                    start_month_day = holiday_start[5:]
+                    end_month_day = holiday_end[5:]
+                    matches = (
+                        start_month_day <= current_month_day <= end_month_day
+                        if start_month_day <= end_month_day
+                        else current_month_day >= start_month_day or current_month_day <= end_month_day
+                    )
+                else:
+                    matches = holiday_start <= current_iso <= holiday_end
+                if matches:
+                    return {**holiday, 'matched_date': current_iso}
+            current_date += timedelta(days=1)
+        return None
+    except (TypeError, ValueError) as e:
+        logger.error(f"Invalid leave date range for holiday check: {e}")
+        return None
+
+
+def add_company_holiday(name: str, holiday_date: str, end_date: str = None, description: str = '', is_recurring: int = 0) -> Optional[int]:
+    """Add a new company holiday."""
+    try:
+        if not end_date:
+            end_date = holiday_date
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO company_holidays (name, holiday_date, end_date, description, is_recurring) VALUES (?, ?, ?, ?, ?)",
+                (name, holiday_date, end_date, description, is_recurring)
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Add company holiday error: {e}")
+        return None
+
+
+def delete_company_holiday(holiday_id: int) -> bool:
+    """Delete a company holiday."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM company_holidays WHERE id = ?", (holiday_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Delete company holiday error: {e}")
+        return False
+
+
+def _leave_allowance_cycle_window(reference_date: datetime, allowance_period: str, allowance_months: Optional[int] = None) -> Tuple[str, str]:
+    """Return calendar-aligned allowance dates for a 1-12 month policy cycle."""
+    legacy_months = {'monthly': 1, 'half_yearly': 6, 'yearly': 12}
+    try:
+        duration_months = int(allowance_months or legacy_months.get(allowance_period, 12))
+    except (TypeError, ValueError):
+        duration_months = legacy_months.get(allowance_period, 12)
+    duration_months = max(1, min(12, duration_months))
+    start_month = ((reference_date.month - 1) // duration_months) * duration_months + 1
+    end_month = min(12, start_month + duration_months - 1)
+    start = datetime(reference_date.year, start_month, 1)
+    next_month = datetime(reference_date.year + 1, 1, 1) if end_month == 12 else datetime(reference_date.year, end_month + 1, 1)
+    end = next_month - timedelta(days=1)
+    return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
+
+
+def get_leave_balances(year: int = 2026, user_id: Optional[int] = None) -> List[Dict]:
+    """Get employee leave balances for a year, auto-initializing rows if needed."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Active users
+            user_query = "SELECT id, name, department FROM users WHERE active = 1"
+            params = []
+            if user_id:
+                user_query += " AND id = ?"
+                params.append(user_id)
+            cursor.execute(user_query, params)
+            users = [dict(u) for u in cursor.fetchall()]
+
+            # Leave types
+            cursor.execute("SELECT * FROM leave_types WHERE active = 1")
+            ltypes = [dict(lt) for lt in cursor.fetchall()]
+
+            result = []
+            for u in users:
+                u_balances = {'user_id': u['id'], 'user_name': u['name'], 'department': u['department'], 'year': year, 'balances': {}}
+                for lt in ltypes:
+                    allowance_period = lt.get('allowance_period', 'yearly')
+                    cursor.execute(
+                        "SELECT allocated_days, used_days FROM employee_leave_balances WHERE user_id = ? AND leave_type_id = ? AND year = ?",
+                        (u['id'], lt['id'], year)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        alloc = row['allocated_days']
+                    else:
+                        alloc = lt['yearly_allowance']
+                        if allowance_period == 'yearly':
+                            try:
+                                cursor.execute(
+                                    "INSERT OR IGNORE INTO employee_leave_balances (user_id, leave_type_id, year, allocated_days, used_days) VALUES (?, ?, ?, ?, ?)",
+                                    (u['id'], lt['id'], year, alloc, 0.0)
+                                )
+                                conn.commit()
+                            except Exception:
+                                pass
+                    
+                    reference_month = datetime.now().month if year == datetime.now().year else 12
+                    cycle_start, cycle_end = _leave_allowance_cycle_window(
+                        datetime(year, reference_month, 1),
+                        allowance_period,
+                        lt.get('allowance_months')
+                    )
+                    cursor.execute("""
+                        SELECT start_date, end_date, quota_days, quota_through_date, leave_duration,
+                               half_leave_quota_type_id, half_leave_quota_charge FROM leave_requests
+                        WHERE user_id = ? AND status = 'approved' AND (leave_type = ? OR leave_type = ?)
+                          AND end_date >= ? AND start_date <= ?
+                    """, (u['id'], lt['code'], lt['name'], cycle_start, cycle_end))
+                    actual_used = 0.0
+                    for request_row in cursor.fetchall():
+                        if request_row['leave_duration'] == 'half':
+                            if request_row['half_leave_quota_charge'] and request_row['half_leave_quota_type_id'] == lt['id']:
+                                actual_used += 1
+                            continue
+                        clipped_start = max(request_row['start_date'], cycle_start)
+                        clipped_end = min(request_row['end_date'], cycle_end)
+                        if request_row['quota_days'] is None:
+                            actual_used += _count_scheduled_leave_days(cursor, u['id'], clipped_start, clipped_end)
+                        else:
+                            quota_end = min(clipped_end, request_row['quota_through_date'] or request_row['end_date'])
+                            if quota_end >= clipped_start:
+                                actual_used += _count_scheduled_leave_days(cursor, u['id'], clipped_start, quota_end)
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM leave_requests
+                        WHERE user_id = ? AND status = 'approved' AND leave_duration = 'half'
+                          AND half_leave_quota_charge = 1 AND half_leave_quota_type_id = ?
+                          AND (leave_type != ? AND leave_type != ?)
+                          AND end_date >= ? AND start_date <= ?
+                    """, (u['id'], lt['id'], lt['code'], lt['name'], cycle_start, cycle_end))
+                    external_half_quota_charges = int(cursor.fetchone()[0] or 0)
+                    actual_used += external_half_quota_charges
+                    used_val = float(actual_used)
+
+                    half_cycle_start, half_cycle_end = _leave_allowance_cycle_window(
+                        datetime(year, reference_month, 1),
+                        'custom',
+                        lt.get('half_leave_allowance_months', 12),
+                    )
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM leave_requests
+                        WHERE user_id = ? AND status = 'approved' AND leave_type = ?
+                          AND leave_duration = 'half' AND end_date >= ? AND start_date <= ?
+                    """, (u['id'], lt['code'], half_cycle_start, half_cycle_end))
+                    half_leave_count = int(cursor.fetchone()[0] or 0)
+                    half_allowance = int(lt.get('half_leave_allowance_count') or 0)
+                    half_leave_remaining = max(0, half_allowance - half_leave_count) if lt.get('half_leave_mode') == 'separate' else None
+
+                    u_balances['balances'][lt['code']] = {
+                        'type_name': lt['name'],
+                        'allocated': alloc,
+                        'used': used_val,
+                        'remaining': max(0.0, alloc - used_val),
+                        'half_leave_count': half_leave_count,
+                        'half_leave_remaining': half_leave_remaining,
+                        'half_leave_enabled': bool(lt.get('half_leave_enabled')),
+                        'half_leave_mode': lt.get('half_leave_mode', 'separate'),
+                        'half_leave_allowance_count': half_allowance,
+                        'half_leave_allowance_months': int(lt.get('half_leave_allowance_months') or 12),
+                        'is_paid': lt['is_paid'],
+                        'allowance_period': lt.get('allowance_period', 'yearly'),
+                        'allowance_months': lt.get('allowance_months', 12)
+                    }
+                result.append(u_balances)
+            return result
+    except Exception as e:
+        logger.error(f"Get leave balances error: {e}")
+        return []
+
+
+def _count_scheduled_leave_days(cursor, user_id: int, start_date: str, end_date: str) -> int:
+    """Calculate the number of scheduled working days in a leave period."""
+    if not user_id:
+        try:
+            d1 = datetime.strptime(start_date, '%Y-%m-%d')
+            d2 = datetime.strptime(end_date, '%Y-%m-%d')
+            return max(0, (d2 - d1).days + 1)
+        except Exception:
+            return 0
+
+    cursor.execute('''SELECT working_days FROM shifts WHERE id = (
+        SELECT shift_id FROM users WHERE id = ?
+    )''', (user_id,))
+    row = cursor.fetchone()
+    working_days = set(_normalize_shift_working_days(row['working_days'])) if row and row['working_days'] else {0,1,2,3,4,5,6}
+
+    cursor.execute("SELECT holiday_date FROM company_holidays WHERE holiday_date >= ? AND holiday_date <= ?", (start_date, end_date))
+    holidays = {r['holiday_date'] for r in cursor.fetchall()}
+
+    cursor.execute("SELECT calendar_date, override_type FROM special_date_overrides WHERE calendar_date >= ? AND calendar_date <= ? AND (scope_type = 'all' OR (scope_type = 'employee' AND scope_id = ?))", (start_date, end_date, user_id))
+    overrides = {r['calendar_date']: r['override_type'] for r in cursor.fetchall()}
+
+    try:
+        d1 = datetime.strptime(start_date, '%Y-%m-%d')
+        d2 = datetime.strptime(end_date, '%Y-%m-%d')
+    except Exception:
+        return 0
+
+    days = 0
+    for i in range((d2 - d1).days + 1):
+        curr_date = d1 + timedelta(days=i)
+        curr_str = curr_date.strftime('%Y-%m-%d')
+        override = overrides.get(curr_str)
+        if override:
+            if override == 'working_day': days += 1
+        elif curr_str in holidays:
+            pass
+        elif curr_date.weekday() in working_days:
+            days += 1
+    return days
+
+def check_leave_quota(
+    user_id: Optional[int] = None,
+    leave_type_code: str = 'casual',
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    exclude_id: Optional[int] = None,
+    leave_duration: str = 'full',
+) -> Dict[str, Any]:
+    """
+    Check if a requested leave duration is within the employee's allowed paid quota.
+    Unpaid Leave (LWP) is exempt (unlimited days allowed).
+    When quota is exceeded, returns exact user-friendly warning message.
+    Always returns valid numeric remaining_days and requested_days.
+    """
+    try:
+        duration = str(leave_duration or 'full').strip().lower()
+        if duration not in ('full', 'half'):
+            raise ValueError('Leave duration must be full or half.')
+        requested_days = 0
+        reference_date = datetime.now()
+
+        if start_date and end_date:
+            s_str = start_date.strip()
+            e_str = end_date.strip()
+            if s_str and e_str:
+                d1 = datetime.strptime(s_str, '%Y-%m-%d')
+                d2 = datetime.strptime(e_str, '%Y-%m-%d')
+                if d2 < d1:
+                    return {
+                        'allowed': False,
+                        'message': 'End date cannot be earlier than start date.',
+                        'requested_days': 0,
+                        'remaining_days': 0.0,
+                        'allocated_days': 0.0,
+                        'used_days': 0.0,
+                        'leave_type_name': leave_type_code
+                    }
+                if duration == 'half' and d1.date() != d2.date():
+                    return {
+                        'allowed': False,
+                        'message': 'Half-day leave must be requested for a single date.',
+                        'requested_days': 1,
+                        'quota_days_requested': 0,
+                        'remaining_days': 0.0,
+                        'allocated_days': 0.0,
+                        'used_days': 0.0,
+                        'leave_type_name': leave_type_code,
+                    }
+                reference_date = d1
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Calculate requested days based on scheduled workdays only
+            if user_id and start_date and end_date:
+                requested_days = _count_scheduled_leave_days(cursor, user_id, start_date.strip(), end_date.strip())
+            elif start_date and end_date:
+                requested_days = max(0, (d2 - d1).days + 1)
+
+            if user_id and start_date and end_date:
+                conflict = _find_active_leave_overlap(
+                    cursor, user_id, start_date.strip(), end_date.strip(), exclude_id=exclude_id
+                )
+                if conflict:
+                    status_label = str(conflict['status']).replace('_', ' ').title()
+                    return {
+                        'allowed': False,
+                        'reason_code': 'overlapping_leave',
+                        'message': f"Looks like this employee already has a leave request from {conflict['start_date']} to {conflict['end_date']} ({status_label}). No need to submit another for those dates. Please choose different dates or review the existing request.",
+                        'requested_days': 1 if duration == 'half' else requested_days,
+                        'quota_days_requested': 0,
+                        'remaining_days': 9999.0,
+                        'allocated_days': 9999.0,
+                        'used_days': 0.0,
+                        'leave_type_name': leave_type_code,
+                    }
+
+            # Find leave type
+            cursor.execute(
+                "SELECT * FROM leave_types WHERE code = ? OR name = ? LIMIT 1",
+                (leave_type_code, leave_type_code)
+            )
+            lt = cursor.fetchone()
+            if not lt:
+                return {
+                    'allowed': True,
+                    'requested_days': 1 if duration == 'half' else requested_days,
+                    'quota_days_requested': 0 if duration == 'half' else requested_days,
+                    'remaining_days': 10.0,
+                    'allocated_days': 10.0,
+                    'used_days': 0.0,
+                    'leave_type_name': leave_type_code,
+                    'is_paid': 1
+                }
+
+            lt_dict = dict(lt)
+            leave_name = lt_dict['name']
+            is_paid = int(lt_dict.get('is_paid', 1))
+
+            if duration == 'half':
+                if not bool(lt_dict.get('half_leave_enabled')):
+                    return {
+                        'allowed': False,
+                        'message': f'Half-day leave is not enabled for {leave_name}.',
+                        'requested_days': 1,
+                        'quota_days_requested': 0,
+                        'remaining_days': 0,
+                        'leave_type_name': leave_name,
+                        'half_leave_enabled': False,
+                    }
+                org_policy = cursor.execute(
+                    "SELECT half_leave_quota_mode, half_leaves_per_quota_day FROM payroll_settings WHERE id = 1"
+                ).fetchone()
+                scoped_policy = _get_scoped_payroll_rule(cursor, 'half_leave_quota', user_id)
+                policy_mode = str(
+                    scoped_policy['half_leave_quota_mode'] if scoped_policy
+                    else org_policy['half_leave_quota_mode'] if org_policy
+                    else 'category'
+                ).lower()
+                monthly_threshold = max(1, int(
+                    scoped_policy['half_leaves_per_quota_day'] if scoped_policy
+                    else org_policy['half_leaves_per_quota_day'] if org_policy
+                    else 2
+                ))
+                if policy_mode in ('monthly_cap', 'monthly_convert'):
+                    month_start = reference_date.date().replace(day=1)
+                    if month_start.month == 12:
+                        next_month = month_start.replace(year=month_start.year + 1, month=1)
+                    else:
+                        next_month = month_start.replace(month=month_start.month + 1)
+                    month_start_str = month_start.isoformat()
+                    month_end_str = (next_month - timedelta(days=1)).isoformat()
+                    type_filter = "" if policy_mode == 'monthly_cap' else "AND (leave_type = ? OR leave_type = ?)"
+                    params = [user_id]
+                    if policy_mode == 'monthly_convert':
+                        params.extend([lt_dict['code'], leave_name])
+                    cursor.execute(f"""
+                        SELECT COUNT(*) FROM leave_requests
+                        WHERE user_id = ? {type_filter}
+                          AND leave_duration = 'half' AND LOWER(status) IN ('pending', 'approved')
+                          AND end_date >= ? AND start_date <= ?
+                    """, (*params, month_start_str, month_end_str))
+                    existing_half_count = int(cursor.fetchone()[0] or 0)
+                    if policy_mode == 'monthly_cap':
+                        if existing_half_count >= monthly_threshold:
+                            return {
+                                'allowed': False,
+                                'reason_code': 'half_leave_monthly_cap',
+                                'message': f'Monthly half-leave limit reached ({monthly_threshold} occurrence(s) per calendar month).',
+                                'requested_days': 1,
+                                'quota_days_requested': 0,
+                                'remaining_days': 0,
+                                'leave_type_name': leave_name,
+                                'half_leave_enabled': True,
+                                'half_leave_mode': policy_mode,
+                                'half_leave_count': existing_half_count,
+                            }
+                        return {
+                            'allowed': True,
+                            'message': 'OK',
+                            'requested_days': 1,
+                            'quota_days_requested': 0,
+                            'remaining_days': max(0, monthly_threshold - existing_half_count),
+                            'leave_type_name': leave_name,
+                            'is_paid': is_paid,
+                            'half_leave_enabled': True,
+                            'half_leave_mode': policy_mode,
+                            'half_leave_count': existing_half_count + 1,
+                            'half_leaves_per_month': monthly_threshold,
+                        }
+                    half_mode = 'convert'
+                    half_months = 1
+                    conversion_ratio = monthly_threshold
+                else:
+                    half_months = max(1, min(12, int(lt_dict.get('half_leave_allowance_months') or 12)))
+                    half_cycle_start, half_cycle_end = _leave_allowance_cycle_window(
+                        reference_date, 'custom', half_months
+                    )
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM leave_requests
+                        WHERE user_id = ? AND (leave_type = ? OR leave_type = ?)
+                          AND leave_duration = 'half' AND LOWER(status) IN ('pending', 'approved')
+                          AND end_date >= ? AND start_date <= ?
+                    """, (user_id, lt_dict['code'], leave_name, half_cycle_start, half_cycle_end))
+                    existing_half_count = int(cursor.fetchone()[0] or 0)
+                    half_mode = str(lt_dict.get('half_leave_mode') or 'separate').lower()
+                    conversion_ratio = max(1, int(lt_dict.get('half_leaves_per_quota_day') or 2))
+                half_allowance = int(lt_dict.get('half_leave_allowance_count') or 0)
+                if half_mode == 'separate':
+                    if existing_half_count >= half_allowance:
+                        return {
+                            'allowed': False,
+                            'message': f'{leave_name} half-leave allowance reached ({half_allowance} occurrence(s) per {half_months}-month cycle).',
+                            'requested_days': 1,
+                            'quota_days_requested': 0,
+                            'remaining_days': max(0, half_allowance - existing_half_count),
+                            'leave_type_name': leave_name,
+                            'half_leave_enabled': True,
+                            'half_leave_mode': half_mode,
+                            'half_leave_count': existing_half_count,
+                            'half_leave_allowance_count': half_allowance,
+                            'half_leave_allowance_months': half_months,
+                        }
+                    return {
+                        'allowed': True,
+                        'message': 'OK',
+                        'requested_days': 1,
+                        'quota_days_requested': 0,
+                        'remaining_days': max(0, half_allowance - existing_half_count),
+                        'leave_type_name': leave_name,
+                        'is_paid': is_paid,
+                        'half_leave_enabled': True,
+                        'half_leave_mode': half_mode,
+                        'half_leave_count': existing_half_count + 1,
+                        'half_leave_allowance_count': half_allowance,
+                        'half_leave_allowance_months': half_months,
+                    }
+
+                target_id = lt_dict.get('half_leave_quota_type_id')
+                if not target_id:
+                    return {
+                        'allowed': False,
+                        'message': f'Choose a quota category for converted {leave_name} half-leaves.',
+                        'requested_days': 1,
+                        'quota_days_requested': 0,
+                        'remaining_days': 0,
+                        'leave_type_name': leave_name,
+                        'half_leave_enabled': True,
+                        'half_leave_mode': 'convert',
+                    }
+                cursor.execute("SELECT code, name FROM leave_types WHERE id = ? AND active = 1", (target_id,))
+                target_type = cursor.fetchone()
+                if not target_type:
+                    return {
+                        'allowed': False,
+                        'message': 'The quota category selected for half-leave conversion is no longer active.',
+                        'requested_days': 1,
+                        'quota_days_requested': 0,
+                        'remaining_days': 0,
+                        'leave_type_name': leave_name,
+                    }
+                charge_next = (existing_half_count + 1) // conversion_ratio > existing_half_count // conversion_ratio
+                target_quota = {'allowed': True, 'remaining_days': 0, 'leave_type_name': target_type['name']}
+                if charge_next:
+                    target_quota = check_leave_quota(
+                        user_id=user_id,
+                        leave_type_code=target_type['code'],
+                        start_date=start_date,
+                        end_date=end_date,
+                        leave_duration='full',
+                    )
+                    if not target_quota.get('allowed'):
+                        return {
+                            'allowed': False,
+                            'message': f'Half-leave conversion would use one {target_type["name"]} quota day. {target_quota.get("message", "No quota day is available.")}',
+                            'requested_days': 1,
+                            'quota_days_requested': 1,
+                            'remaining_days': target_quota.get('remaining_days', 0),
+                            'leave_type_name': leave_name,
+                            'half_leave_enabled': True,
+                            'half_leave_mode': 'convert',
+                            'half_leave_count': existing_half_count + 1,
+                            'half_leaves_per_quota_day': conversion_ratio,
+                            'half_leave_quota_type_id': target_id,
+                            'half_leave_quota_type_name': target_type['name'],
+                        }
+                return {
+                    'allowed': True,
+                    'message': 'OK',
+                    'requested_days': 1,
+                    'quota_days_requested': int(charge_next),
+                    'remaining_days': target_quota.get('remaining_days', 0),
+                    'leave_type_name': leave_name,
+                    'is_paid': is_paid,
+                    'half_leave_enabled': True,
+                    'half_leave_mode': 'convert',
+                    'half_leave_count': existing_half_count + 1,
+                    'half_leaves_per_quota_day': conversion_ratio,
+                    'half_leave_quota_type_id': target_id,
+                    'half_leave_quota_type_name': target_type['name'],
+                }
+
+            # Unpaid Leave (LWP) and Excess Paid Leave have no upper limit
+            if is_paid == 0 or lt_dict.get('code') in ('unpaid', 'excess_paid'):
+                return {
+                    'allowed': True,
+                    'is_paid': is_paid,
+                    'requested_days': 1 if duration == 'half' else requested_days,
+                    'quota_days_requested': 0 if duration == 'half' else requested_days,
+                    'remaining_days': 9999.0,
+                    'allocated_days': 9999.0,
+                    'used_days': 0.0,
+                    'leave_type_name': leave_name
+                }
+
+            # Check allocated quota
+            allocated = float(lt_dict.get('yearly_allowance', 10.0))
+            if user_id:
+                cursor.execute(
+                    "SELECT allocated_days FROM employee_leave_balances WHERE user_id = ? AND leave_type_id = ? AND year = ?",
+                    (user_id, lt_dict['id'], reference_date.year)
+                )
+                bal_row = cursor.fetchone()
+                if bal_row:
+                    allocated = float(bal_row['allocated_days'])
+
+            # Sum already approved days in this year/month
+            already_used = 0.0
+            if user_id:
+                allowance_period = lt_dict.get('allowance_period', 'yearly')
+                cycle_start, cycle_end = _leave_allowance_cycle_window(
+                    reference_date,
+                    allowance_period,
+                    lt_dict.get('allowance_months')
+                )
+                cursor.execute("""
+                                             SELECT id, start_date, end_date, quota_days, quota_through_date, leave_duration,
+                                                 half_leave_quota_type_id, half_leave_quota_charge FROM leave_requests
+                    WHERE user_id = ? AND status = 'approved' AND (leave_type = ? OR leave_type = ?)
+                      AND end_date >= ? AND start_date <= ?
+                """, (user_id, lt_dict['code'], lt_dict['name'], cycle_start, cycle_end))
+                approved_requests = cursor.fetchall()
+
+                for req in approved_requests:
+                    if exclude_id and req['id'] == exclude_id:
+                        continue
+                    if req['leave_duration'] == 'half':
+                        if req['half_leave_quota_charge'] and req['half_leave_quota_type_id'] == lt_dict['id']:
+                            already_used += 1
+                        continue
+                    try:
+                        clipped_start = max(req['start_date'], cycle_start)
+                        clipped_end = min(req['end_date'], cycle_end)
+                        if req['quota_days'] is None:
+                            already_used += _count_scheduled_leave_days(cursor, user_id, clipped_start, clipped_end)
+                        else:
+                            quota_end = min(clipped_end, req['quota_through_date'] or req['end_date'])
+                            if quota_end >= clipped_start:
+                                already_used += _count_scheduled_leave_days(cursor, user_id, clipped_start, quota_end)
+                    except Exception:
+                        already_used += 1.0
+                cursor.execute("""
+                    SELECT COUNT(*) FROM leave_requests
+                    WHERE user_id = ? AND status = 'approved' AND leave_duration = 'half'
+                      AND half_leave_quota_charge = 1 AND half_leave_quota_type_id = ?
+                      AND leave_type != ? AND leave_type != ?
+                      AND end_date >= ? AND start_date <= ?
+                """, (user_id, lt_dict['id'], lt_dict['code'], lt_dict['name'], cycle_start, cycle_end))
+                already_used += int(cursor.fetchone()[0] or 0)
+            quota_days_requested = requested_days
+
+            remaining = max(0.0, allocated - already_used)
+
+            if quota_days_requested > remaining:
+                rem_str = int(remaining) if remaining.is_integer() else remaining
+                req_str = int(quota_days_requested) if float(quota_days_requested).is_integer() else quota_days_requested
+                msg = (f"This half-leave would use {req_str} {leave_name} quota day(s), but only {rem_str} remain."
+                       if duration == 'half' else
+                       f"{leave_name} only has {rem_str} allowed paid days for this employee. You cannot request {req_str} days. Please adjust the dates or file the excess days under Unpaid Leave (LWP).")
+                return {
+                    'allowed': False,
+                    'reason_code': 'quota_exceeded',
+                    'message': msg,
+                    'requested_days': requested_days,
+                    'quota_days_requested': quota_days_requested,
+                    'remaining_days': remaining,
+                    'allocated_days': allocated,
+                    'used_days': already_used,
+                    'leave_type_name': leave_name,
+                    'is_paid': 1
+                }
+
+            return {
+                'allowed': True,
+                'message': 'OK',
+                'requested_days': requested_days,
+                'quota_days_requested': quota_days_requested,
+                'remaining_days': remaining,
+                'allocated_days': allocated,
+                'used_days': already_used,
+                'leave_type_name': leave_name,
+                'is_paid': 1
+            }
+    except Exception as e:
+        logger.error(f"check_leave_quota error: {e}")
+        return {
+            'allowed': False,
+            'message': f"Error validating leave quota: {str(e)}",
+            'requested_days': 0,
+            'remaining_days': 10.0,
+            'allocated_days': 10.0,
+            'used_days': 0.0,
+            'leave_type_name': leave_type_code,
+            'is_paid': 1
+        }
+
+
+
+def add_overtime(user_id: int, user_name: str = '', ot_date: str = '', hours: float = 0.0, reason: str = '') -> Optional[int]:
+    """Record an overtime log."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            if not user_name:
+                cursor.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+                user_row = cursor.fetchone()
+                if user_row:
+                    user_name = user_row[0]
+            cursor.execute(
+                '''INSERT INTO overtime (user_id, user_name, ot_date, hours, reason)
+                   VALUES (?, ?, ?, ?, ?)''',
+                (user_id, user_name, ot_date, hours, reason)
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Add overtime error: {e}")
+        return None
+
+
+def get_overtime_rate_preview(user_id: int, overtime_date: str) -> Optional[Dict[str, Any]]:
+    try:
+        datetime.strptime(overtime_date, '%Y-%m-%d')
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT u.salary, sc.basic_salary, sc.ot_rate
+                FROM users u LEFT JOIN salary_configs sc ON sc.user_id = u.id
+                WHERE u.id = ?
+            ''', (user_id,))
+            employee = cursor.fetchone()
+            if not employee:
+                return None
+            configured_rate = float(employee['ot_rate'] or 0.0)
+            salary = float(employee['basic_salary'] or employee['salary'] or 0.0)
+            base_rate = round(configured_rate if configured_rate > 0 else salary / 208.0, 2)
+            day_type = _get_overtime_day_type(cursor, user_id, overtime_date)
+            settings = cursor.execute('''
+                SELECT holiday_ot_premium_percent, non_working_day_ot_premium_percent,
+                       holiday_ot_premium_active, non_working_day_ot_premium_active
+                FROM payroll_settings WHERE id = 1
+            ''').fetchone()
+            holiday = _get_company_holiday_for_date(cursor, overtime_date) if day_type == 'holiday' else None
+            premium_percent = _get_overtime_premium_percent(cursor, overtime_date, day_type, settings, holiday)
+            return {
+                'user_id': user_id,
+                'ot_date': overtime_date,
+                'day_type': day_type,
+                'holiday_id': holiday.get('id') if holiday else None,
+                'holiday_name': holiday.get('name') if holiday else None,
+                'base_rate': base_rate,
+                'premium_percent': premium_percent,
+                'effective_rate': round(base_rate * (1 + premium_percent / 100), 2),
+                'premium_active': premium_percent > 0,
+            }
+    except (TypeError, ValueError):
+        return None
+    except Exception as e:
+        logger.error(f"Failed to preview overtime rate for user {user_id} on {overtime_date}: {e}")
+        return None
+
+
+def get_overtime(user_id: Optional[int] = None, status: Optional[str] = None,
+                 department: Optional[str] = None, ot_date: Optional[str] = None,
+                 start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict]:
+    """Get overtime records optionally filtered by user_id, status, department, and date range."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            query = """
+                SELECT o.*,
+                       COALESCE(u.department, '') as department,
+                       COALESCE(u.position, '') as designation,
+                       COALESCE(sc.ot_rate, CASE WHEN COALESCE(u.salary, sc.basic_salary, 0) > 0 THEN ROUND(COALESCE(u.salary, sc.basic_salary) / 208.0, 2) ELSE 0.0 END) as ot_rate
+                FROM overtime o
+                LEFT JOIN users u ON o.user_id = u.id
+                LEFT JOIN salary_configs sc ON o.user_id = sc.user_id
+                WHERE 1=1
+            """
+            params = []
+            if user_id:
+                query += " AND o.user_id = ?"
+                params.append(user_id)
+            if status and status.strip() and status.strip().lower() != 'all':
+                query += " AND LOWER(o.status) = LOWER(?)"
+                params.append(status.strip())
+            if department and department.strip() and department.strip().lower() != 'all':
+                query += " AND LOWER(TRIM(u.department)) = LOWER(TRIM(?))"
+                params.append(department.strip())
+            if ot_date:
+                query += " AND o.ot_date = ?"
+                params.append(ot_date)
+            if start_date:
+                query += " AND o.ot_date >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND o.ot_date <= ?"
+                params.append(end_date)
+            query += " ORDER BY o.ot_date DESC, o.created_at DESC"
+            cursor.execute(query, params)
+            overtime_rows = cursor.fetchall()
+            settings_row = cursor.execute(
+                "SELECT holiday_ot_premium_percent, non_working_day_ot_premium_percent, holiday_ot_premium_active, non_working_day_ot_premium_active FROM payroll_settings WHERE id = 1"
+            ).fetchone()
+            records = []
+            for r in overtime_rows:
+                d = dict(r)
+                hours = float(d.get('hours') or 0.0)
+                base_rate = float(d.get('ot_rate') or 0.0)
+                day_type = _get_overtime_day_type(cursor, int(d['user_id']), str(d['ot_date']))
+                holiday = _get_company_holiday_for_date(cursor, str(d['ot_date'])) if day_type == 'holiday' else None
+                premium = _get_overtime_premium_percent(cursor, str(d['ot_date']), day_type, settings_row, holiday)
+                effective_rate = round(base_rate * (1 + premium / 100), 2)
+                d['base_ot_rate'] = base_rate
+                d['ot_day_type'] = day_type
+                d['holiday_id'] = holiday.get('id') if holiday else None
+                d['holiday_name'] = holiday.get('name') if holiday else None
+                d['ot_premium_percent'] = premium
+                d['ot_rate'] = effective_rate
+                d['ot_amount'] = round(hours * effective_rate, 2)
+                records.append(d)
+            return records
+    except Exception as e:
+        logger.error(f"Get overtime error: {e}")
+        return []
+
+
+def get_overtime_by_id(ot_id: int) -> Optional[Dict]:
+    """Retrieve an overtime record by ID."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM overtime WHERE id = ?", (ot_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Error fetching overtime record {ot_id}: {e}")
+        return None
+
+
+def get_user_attendance_status(user_id: int, target_date: str) -> Optional[str]:
+    """Get an employee's resolved attendance status for one date."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM manual_absent WHERE user_id = ? AND date = ? LIMIT 1",
+                (user_id, target_date)
+            )
+            if cursor.fetchone():
+                return 'absent'
+
+        report = get_detailed_attendance_report(target_date=target_date, user_id=user_id)
+        record = next(
+            (row for row in report.get('records', []) if int(row.get('user_id', 0)) == int(user_id)),
+            None
+        )
+        return record.get('status') if record else None
+    except Exception as e:
+        logger.error(f"Error resolving attendance status for user {user_id} on {target_date}: {e}")
+        return None
+
+
+def update_overtime_status(ot_id: int, status: str = 'approved', approved_by: str = 'Admin') -> bool:
+    """Finalize a pending overtime record without allowing later status changes."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE overtime SET status = ?, approved_by = ? WHERE id = ? AND LOWER(COALESCE(status, 'pending')) = 'pending'",
+                (status, approved_by, ot_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Update overtime status error: {e}")
+        return False
+
+
+def delete_overtime(ot_id: int) -> bool:
+    """Delete an overtime record by ID."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM overtime WHERE id = ?", (ot_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Delete overtime error: {e}")
+        return False
+
+
+def get_all_salary_configs(active_only: bool = True, department: Optional[str] = None, search: Optional[str] = None) -> List[Dict]:
+    """Get salary configuration entries for all employees (joined with user details)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            conditions = []
+            params = []
+            if active_only:
+                conditions.append("u.active = 1")
+            if department and department.strip() and department.strip().lower() != 'all':
+                conditions.append("u.department = ?")
+                params.append(department.strip())
+            if search and search.strip():
+                s = f"%{search.strip()}%"
+                conditions.append("(u.name LIKE ? OR u.email LIKE ? OR u.department LIKE ? OR u.position LIKE ? OR CAST(u.id AS TEXT) LIKE ?)")
+                params.extend([s, s, s, s, s])
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            query = f"""
+                SELECT 
+                    u.id as user_id, 
+                    u.name as user_name, 
+                    u.email,
+                    COALESCE(u.department, '') as department, 
+                    COALESCE(u.position, 'Staff Member') as designation,
+                    u.active,
+                    COALESCE(s.basic_salary, u.salary, 0.0) as basic_salary,
+                    COALESCE(s.allowances, 0.0) as allowances,
+                    COALESCE(s.deductions, 0.0) as deductions,
+                    COALESCE(s.ot_rate, 0.0) as ot_rate,
+                    ROUND(COALESCE(s.basic_salary, u.salary, 0.0) + COALESCE(s.allowances, 0.0) - COALESCE(s.deductions, 0.0), 2) as net_estimated,
+                    CASE WHEN s.user_id IS NOT NULL THEN 1 ELSE 0 END as is_configured,
+                    s.updated_at
+                FROM users u
+                LEFT JOIN salary_configs s ON u.id = s.user_id
+                {where_clause}
+                ORDER BY u.department COLLATE NOCASE, u.name COLLATE NOCASE
+            """
+            cursor.execute(query, params)
+            return [dict(r) for r in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Get all salary configs error: {e}")
+        return []
+
+
+def get_salary_config(user_id: int) -> Optional[Dict]:
+    """Get salary configuration for a single user with user profile details."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    u.id as user_id, 
+                    u.name as user_name, 
+                    u.email,
+                    COALESCE(u.department, '') as department, 
+                    COALESCE(u.position, 'Staff Member') as designation,
+                    u.active,
+                    COALESCE(s.basic_salary, u.salary, 0.0) as basic_salary,
+                    COALESCE(s.allowances, 0.0) as allowances,
+                    COALESCE(s.deductions, 0.0) as deductions,
+                    COALESCE(s.ot_rate, 0.0) as ot_rate,
+                    ROUND(COALESCE(s.basic_salary, u.salary, 0.0) + COALESCE(s.allowances, 0.0) - COALESCE(s.deductions, 0.0), 2) as net_estimated,
+                    CASE WHEN s.user_id IS NOT NULL THEN 1 ELSE 0 END as is_configured,
+                    s.updated_at
+                FROM users u
+                LEFT JOIN salary_configs s ON u.id = s.user_id
+                WHERE u.id = ?
+            """, (user_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Get salary config error for user {user_id}: {e}")
+        return None
+
+
+def set_salary_config(user_id: int, basic_salary: float = 0.0, allowances: float = 0.0, deductions: float = 0.0, ot_rate: float = 0.0) -> bool:
+    """Insert or update salary configuration for a user and synchronize users.salary."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            # Verify user exists
+            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+            if not cursor.fetchone():
+                logger.error(f"Cannot set salary config: user {user_id} not found")
+                return False
+
+            b_sal = max(0.0, float(basic_salary or 0.0))
+            allow = max(0.0, float(allowances or 0.0))
+            deduct = max(0.0, float(deductions or 0.0))
+            ot = max(0.0, float(ot_rate or 0.0))
+
+            cursor.execute(
+                '''INSERT INTO salary_configs (user_id, basic_salary, allowances, deductions, ot_rate, updated_at)
+                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                   basic_salary=excluded.basic_salary,
+                   allowances=excluded.allowances,
+                   deductions=excluded.deductions,
+                   ot_rate=excluded.ot_rate,
+                   updated_at=CURRENT_TIMESTAMP''',
+                (user_id, b_sal, allow, deduct, ot)
+            )
+            # Synchronize with users.salary to protect Payroll V1 baseline
+            cursor.execute("UPDATE users SET salary = ? WHERE id = ?", (b_sal, user_id))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Set salary config error for user {user_id}: {e}")
+        return False
+
+
+def reset_salary_config(user_id: int) -> bool:
+    """Reset salary configuration to defaults for a user."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM salary_configs WHERE user_id = ?", (user_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Reset salary config error for user {user_id}: {e}")
+        return False
+
+
+def get_salary_summary() -> Dict[str, Any]:
+    """Return summary KPI metrics across active employee salary structures."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    COUNT(u.id) as total_employees,
+                    SUM(CASE WHEN s.user_id IS NOT NULL THEN 1 ELSE 0 END) as configured_count,
+                    SUM(COALESCE(s.basic_salary, u.salary, 0.0)) as total_basic,
+                    SUM(COALESCE(s.allowances, 0.0)) as total_allowances,
+                    SUM(COALESCE(s.deductions, 0.0)) as total_deductions,
+                    SUM(COALESCE(s.basic_salary, u.salary, 0.0) + COALESCE(s.allowances, 0.0) - COALESCE(s.deductions, 0.0)) as total_net_payroll,
+                    AVG(COALESCE(s.basic_salary, u.salary, 0.0)) as avg_basic
+                FROM users u
+                LEFT JOIN salary_configs s ON u.id = s.user_id
+                WHERE u.active = 1
+            """)
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'total_employees': row['total_employees'] or 0,
+                    'configured_count': row['configured_count'] or 0,
+                    'unconfigured_count': (row['total_employees'] or 0) - (row['configured_count'] or 0),
+                    'total_basic': round(row['total_basic'] or 0.0, 2),
+                    'total_allowances': round(row['total_allowances'] or 0.0, 2),
+                    'total_deductions': round(row['total_deductions'] or 0.0, 2),
+                    'total_net_payroll': round(row['total_net_payroll'] or 0.0, 2),
+                    'avg_basic': round(row['avg_basic'] or 0.0, 2)
+                }
+            return {
+                'total_employees': 0, 'configured_count': 0, 'unconfigured_count': 0,
+                'total_basic': 0.0, 'total_allowances': 0.0, 'total_deductions': 0.0,
+                'total_net_payroll': 0.0, 'avg_basic': 0.0
+            }
+    except Exception as e:
+        logger.error(f"Get salary summary error: {e}")
+        return {
+            'total_employees': 0, 'configured_count': 0, 'unconfigured_count': 0,
+            'total_basic': 0.0, 'total_allowances': 0.0, 'total_deductions': 0.0,
+            'total_net_payroll': 0.0, 'avg_basic': 0.0
+        }
+
+
+def auto_calculate_ot_rates(rate_divisor: float = 208.0) -> int:
+    """Auto-calculate hourly overtime rate (basic / 208) for active employees."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT u.id, COALESCE(s.basic_salary, u.salary, 0.0) as basic_salary,
+                       COALESCE(s.allowances, 0.0) as allowances,
+                       COALESCE(s.deductions, 0.0) as deductions
+                FROM users u
+                LEFT JOIN salary_configs s ON u.id = s.user_id
+                WHERE u.active = 1
+            """)
+            employees = cursor.fetchall()
+            updated_count = 0
+            for emp in employees:
+                b_sal = float(emp['basic_salary'] or 0.0)
+                ot_rate = round(b_sal / rate_divisor, 2) if (b_sal > 0 and rate_divisor > 0) else 0.0
+                cursor.execute("""
+                    INSERT INTO salary_configs (user_id, basic_salary, allowances, deductions, ot_rate, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                    ot_rate = excluded.ot_rate,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (emp['id'], b_sal, float(emp['allowances'] or 0.0), float(emp['deductions'] or 0.0), ot_rate))
+                updated_count += 1
+            conn.commit()
+            return updated_count
+    except Exception as e:
+        logger.error(f"Auto calculate OT rates error: {e}")
+        return 0
+
+
+def get_payroll_rules(active_only: bool = False) -> List[Dict[str, Any]]:
+    """Return configured absence-based deduction rules."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        where = "WHERE active = 1" if active_only else ""
+        cursor.execute(
+            f"SELECT * FROM payroll_rules {where} ORDER BY min_absent_days, max_absent_days, id"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_payroll_settings() -> Dict[str, Any]:
+    """Return the organization-wide payroll options."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM payroll_settings WHERE id = 1").fetchone()
+        return dict(row) if row else {
+            'id': 1,
+            'deduct_unpaid_leave': 0,
+            'half_leave_quota_mode': 'category',
+            'half_leaves_per_quota_day': 2,
+            'holiday_ot_premium_percent': 0.0,
+            'non_working_day_ot_premium_percent': 0.0,
+            'holiday_ot_premium_active': 0,
+            'non_working_day_ot_premium_active': 0,
+            'overtime_max_hours': 0.0,
+            'overtime_max_period': 'day',
+        }
+
+
+def get_payroll_scope_options() -> Dict[str, List[Dict[str, Any]]]:
+    """Return active departments and employees for scoped payroll rules."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            departments = [dict(row) for row in conn.execute(
+                "SELECT id, name FROM departments WHERE active = 1 ORDER BY name COLLATE NOCASE"
+            ).fetchall()]
+            employees = [dict(row) for row in conn.execute(
+                "SELECT id, name, COALESCE(department, '') AS department FROM users WHERE active = 1 ORDER BY name COLLATE NOCASE"
+            ).fetchall()]
+            return {'departments': departments, 'employees': employees}
+    except Exception as e:
+        logger.error(f"Failed to load payroll rule scope options: {e}")
+        return {'departments': [], 'employees': []}
+
+
+def get_payroll_scoped_rules() -> List[Dict[str, Any]]:
+    """Return scoped payroll rules with readable department/employee names."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute('''
+                SELECT r.*,
+                       d.name AS department_name,
+                       u.name AS employee_name
+                FROM payroll_scoped_rules r
+                LEFT JOIN departments d ON r.scope_type = 'department' AND d.id = r.scope_id
+                LEFT JOIN users u ON r.scope_type = 'employee' AND u.id = r.scope_id
+                WHERE r.active = 1
+                ORDER BY r.policy_type, r.scope_type, department_name COLLATE NOCASE, employee_name COLLATE NOCASE, r.day_type
+            ''').fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to load scoped payroll rules: {e}")
+        return []
+
+
+def save_scoped_half_leave_rule(scope_type: str, scope_id: int, quota_mode: str, monthly_count: int) -> bool:
+    scope = str(scope_type or '').strip().lower()
+    mode = str(quota_mode or '').strip().lower()
+    if scope not in ('department', 'employee') or mode not in ('category', 'monthly_cap', 'monthly_convert'):
+        return False
+    try:
+        target_id = int(scope_id)
+        count = int(monthly_count)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if target_id <= 0 or count < 1:
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute('''
+                INSERT INTO payroll_scoped_rules (
+                    policy_type, scope_type, scope_id, day_type, half_leave_quota_mode,
+                    half_leaves_per_quota_day, active, updated_at
+                ) VALUES ('half_leave_quota', ?, ?, '', ?, ?, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(policy_type, scope_type, scope_id, day_type) DO UPDATE SET
+                    half_leave_quota_mode = excluded.half_leave_quota_mode,
+                    half_leaves_per_quota_day = excluded.half_leaves_per_quota_day,
+                    active = 1,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (scope, target_id, mode, count))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save scoped half-leave rule: {e}")
+        return False
+
+def save_scoped_overtime_limit_rule(scope_type: str, scope_id: int, max_hours: float, period: str) -> bool:
+    scope = str(scope_type or '').strip().lower()
+    p = str(period or '').strip().lower()
+    if scope not in ('department', 'employee') or p not in ('day', 'week', 'month', 'per_entry'):
+        return False
+    try:
+        target_id = int(scope_id)
+        max_h = float(max_hours)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if target_id <= 0 or max_h <= 0:
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute('''
+                INSERT INTO payroll_scoped_rules (
+                    policy_type, scope_type, scope_id, day_type, overtime_max_hours,
+                    overtime_max_period, active, updated_at
+                ) VALUES ('overtime_limit', ?, ?, '', ?, ?, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(policy_type, scope_type, scope_id, day_type) DO UPDATE SET
+                    overtime_max_hours = excluded.overtime_max_hours,
+                    overtime_max_period = excluded.overtime_max_period,
+                    active = 1,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (scope, target_id, max_h, p))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Failed to save scoped overtime limit rule: {e}")
+        return False
+
+
+def save_scoped_overtime_premium_rule(scope_type: str, scope_id: int, day_type: str, premium_percent: float) -> bool:
+    scope = str(scope_type or '').strip().lower()
+    kind = str(day_type or '').strip().lower()
+    if scope not in ('department', 'employee') or kind not in ('holiday', 'non_working_day'):
+        return False
+    try:
+        target_id = int(scope_id)
+        premium = float(premium_percent)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if target_id <= 0 or not 0 <= premium <= 1000:
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute('''
+                INSERT INTO payroll_scoped_rules (
+                    policy_type, scope_type, scope_id, day_type,
+                    overtime_premium_percent, active, updated_at
+                ) VALUES ('overtime_premium', ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(policy_type, scope_type, scope_id, day_type) DO UPDATE SET
+                    overtime_premium_percent = excluded.overtime_premium_percent,
+                    active = 1,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (scope, target_id, kind, premium))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save scoped overtime premium rule: {e}")
+        return False
+
+
+def delete_payroll_scoped_rule(rule_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute('DELETE FROM payroll_scoped_rules WHERE id = ?', (int(rule_id),))
+            conn.commit()
+            return cursor.rowcount > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+    except Exception as e:
+        logger.error(f"Failed to delete scoped payroll rule: {e}")
+        return False
+
+
+def _get_scoped_payroll_rule(
+    cursor: sqlite3.Cursor,
+    policy_type: str,
+    user_id: Optional[int],
+    day_type: str = '',
+) -> Optional[Dict[str, Any]]:
+    if not user_id:
+        return None
+    cursor.execute("SELECT department FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    department_name = ''
+    if user:
+        dept_val = user['department'] if hasattr(user, 'keys') else user[0]
+        department_name = str(dept_val or '').strip()
+    department_id = None
+    if department_name:
+        cursor.execute("SELECT id FROM departments WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1", (department_name,))
+        department = cursor.fetchone()
+        if department:
+            department_id = int(department['id'] if hasattr(department, 'keys') else department[0])
+    conditions = ["(scope_type = 'employee' AND scope_id = ?)"]
+    rule_day_type = day_type if policy_type == 'overtime_premium' else ''
+    params: List[Any] = [policy_type, rule_day_type, int(user_id)]
+    if department_id is not None:
+        conditions.append("(scope_type = 'department' AND scope_id = ?)")
+        params.append(department_id)
+    query = f'''
+        SELECT * FROM payroll_scoped_rules
+        WHERE policy_type = ? AND day_type = ? AND active = 1
+          AND ({' OR '.join(conditions)})
+        ORDER BY CASE scope_type WHEN 'employee' THEN 0 ELSE 1 END
+        LIMIT 1
+    '''
+    cursor.execute(query, params)
+    row = cursor.fetchone()
+    if not row:
+        return None
+    if hasattr(row, 'keys'):
+        return dict(row)
+    columns = [desc[0] for desc in cursor.description]
+    return dict(zip(columns, row))
+
+
+def update_overtime_limit_settings(max_hours: float, period: str) -> bool:
+    """Save the organization-wide overtime review limit."""
+    try:
+        hours = float(max_hours)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    scope = str(period or '').strip().lower()
+    if not 0 <= hours <= 744 or scope not in ('per_entry', 'day', 'week', 'month'):
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE payroll_settings SET overtime_max_hours = ?, overtime_max_period = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+                (hours, scope),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update overtime limit settings: {e}")
+        return False
+
+
+def _get_overtime_limit_status_for_cursor(
+    cursor: sqlite3.Cursor,
+    user_id: int,
+    ot_date: str,
+    requested_hours: float,
+    exclude_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    rule = _get_scoped_payroll_rule(cursor, 'overtime_limit', user_id)
+    if rule and rule.get('overtime_max_hours') is not None and rule.get('overtime_max_period') is not None:
+        maximum = float(rule['overtime_max_hours'])
+        period = str(rule['overtime_max_period']).lower()
+    else:
+        settings = cursor.execute(
+            "SELECT overtime_max_hours, overtime_max_period FROM payroll_settings WHERE id = 1"
+        ).fetchone()
+        maximum = float(settings[0] or 0) if settings else 0.0
+        period = str(settings[1] or 'day').lower() if settings else 'day'
+    if maximum <= 0:
+        return {'enabled': False, 'exceeded': False, 'maximum_hours': 0.0, 'period': period, 'current_hours': 0.0}
+
+    if period == 'per_entry':
+        current_hours = 0.0
+    else:
+        overtime_day = datetime.strptime(ot_date, '%Y-%m-%d').date()
+        if period == 'week':
+            period_start = overtime_day - timedelta(days=overtime_day.weekday())
+            period_end = period_start + timedelta(days=6)
+        elif period == 'month':
+            period_start = overtime_day.replace(day=1)
+            if overtime_day.month == 12:
+                period_end = overtime_day.replace(year=overtime_day.year + 1, month=1, day=1) - timedelta(days=1)
+            else:
+                period_end = overtime_day.replace(month=overtime_day.month + 1, day=1) - timedelta(days=1)
+        else:
+            period_start = overtime_day
+            period_end = overtime_day
+        query = '''
+            SELECT COALESCE(SUM(hours), 0)
+            FROM overtime
+            WHERE user_id = ? AND ot_date >= ? AND ot_date <= ?
+              AND LOWER(COALESCE(status, 'pending')) != 'rejected'
+        '''
+        params: List[Any] = [user_id, period_start.isoformat(), period_end.isoformat()]
+        if exclude_id is not None:
+            query += ' AND id != ?'
+            params.append(exclude_id)
+        current_hours = float(cursor.execute(query, params).fetchone()[0] or 0)
+
+    total_hours = current_hours + float(requested_hours)
+    period_label = {
+        'per_entry': 'per OT entry',
+        'day': 'per day',
+        'week': 'per week',
+        'month': 'per calendar month',
+    }.get(period, f'per {period}')
+    review_note = (
+        f" [OT limit exceeded: {total_hours:.2f}/{maximum:g} hours {period_label}; admin review required]"
+        if total_hours > maximum + 1e-9 else ''
+    )
+    return {
+        'enabled': True,
+        'exceeded': total_hours > maximum + 1e-9,
+        'maximum_hours': maximum,
+        'period': period,
+        'period_label': period_label,
+        'current_hours': current_hours,
+        'requested_total_hours': total_hours,
+        'review_note': review_note,
+    }
+
+
+def get_overtime_limit_status(user_id: int, ot_date: str, requested_hours: float) -> Dict[str, Any]:
+    """Check whether adding OT exceeds the configured period limit for an employee."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        return _get_overtime_limit_status_for_cursor(cursor, user_id, ot_date, requested_hours)
+
+
+def update_payroll_settings(
+    deduct_unpaid_leave: bool,
+    half_leave_quota_mode: str = 'category',
+    half_leaves_per_quota_day: int = 2,
+    holiday_ot_premium_percent: float = 0.0,
+    non_working_day_ot_premium_percent: float = 0.0,
+) -> bool:
+    """Save organization-wide payroll and half-leave quota policies."""
+    mode = str(half_leave_quota_mode or 'category').strip().lower()
+    mode = {'separate': 'category', 'convert': 'monthly_convert'}.get(mode, mode)
+    if mode not in ('category', 'monthly_cap', 'monthly_convert'):
+        return False
+    try:
+        conversion_count = int(half_leaves_per_quota_day)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if conversion_count < 1:
+        return False
+    try:
+        holiday_premium = float(holiday_ot_premium_percent)
+        non_working_premium = float(non_working_day_ot_premium_percent)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (0 <= holiday_premium <= 1000 and 0 <= non_working_premium <= 1000):
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute('''
+                INSERT INTO payroll_settings (
+                    id, deduct_unpaid_leave, half_leave_quota_mode,
+                    half_leaves_per_quota_day, holiday_ot_premium_percent,
+                    non_working_day_ot_premium_percent, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    deduct_unpaid_leave = excluded.deduct_unpaid_leave,
+                    half_leave_quota_mode = excluded.half_leave_quota_mode,
+                    half_leaves_per_quota_day = excluded.half_leaves_per_quota_day,
+                    holiday_ot_premium_percent = excluded.holiday_ot_premium_percent,
+                    non_working_day_ot_premium_percent = excluded.non_working_day_ot_premium_percent,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (int(bool(deduct_unpaid_leave)), mode, conversion_count, holiday_premium, non_working_premium))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update payroll settings: {e}")
+        return False
+
+
+def get_overtime_premium_rules() -> List[Dict[str, Any]]:
+    settings = get_payroll_settings()
+    return [
+        {
+            'day_type': 'holiday',
+            'label': 'Public holiday',
+            'premium_percent': float(settings.get('holiday_ot_premium_percent') or 0),
+            'active': bool(settings.get('holiday_ot_premium_active')),
+        },
+        {
+            'day_type': 'non_working_day',
+            'label': 'Scheduled day off',
+            'premium_percent': float(settings.get('non_working_day_ot_premium_percent') or 0),
+            'active': bool(settings.get('non_working_day_ot_premium_active')),
+        },
+    ]
+
+
+def get_overtime_holiday_premium_rules() -> List[Dict[str, Any]]:
+    """Return company holidays with an explicitly configured OT premium."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute('''
+                SELECT id, name, holiday_date, end_date, is_recurring, overtime_premium_percent
+                FROM company_holidays
+                WHERE overtime_premium_percent IS NOT NULL
+                ORDER BY holiday_date, name
+            ''').fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to load holiday overtime premium rules: {e}")
+        return []
+
+
+def set_company_holiday_overtime_premium(holiday_id: int, premium_percent: Optional[float]) -> bool:
+    """Set a holiday-specific OT premium, or clear it to use the global fallback."""
+    if premium_percent is not None:
+        try:
+            premium = float(premium_percent)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not 0 <= premium <= 1000:
+            return False
+    else:
+        premium = None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute(
+                'UPDATE company_holidays SET overtime_premium_percent = ? WHERE id = ?',
+                (premium, int(holiday_id)),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Failed to update holiday overtime premium: {e}")
+        return False
+
+
+def save_overtime_premium_rule(day_type: str, premium_percent: float) -> bool:
+    fields = {
+        'holiday': ('holiday_ot_premium_percent', 'holiday_ot_premium_active'),
+        'non_working_day': ('non_working_day_ot_premium_percent', 'non_working_day_ot_premium_active'),
+    }
+    if day_type not in fields:
+        return False
+    try:
+        value = float(premium_percent)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not 0 <= value <= 1000:
+        return False
+    percent_column, active_column = fields[day_type]
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                f"UPDATE payroll_settings SET {percent_column} = ?, {active_column} = 1, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+                (value,),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save overtime premium rule {day_type}: {e}")
+        return False
+
+
+def set_overtime_premium_rule_active(day_type: str, active: bool) -> bool:
+    active_columns = {
+        'holiday': 'holiday_ot_premium_active',
+        'non_working_day': 'non_working_day_ot_premium_active',
+    }
+    active_column = active_columns.get(day_type)
+    if not active_column:
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                f"UPDATE payroll_settings SET {active_column} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+                (int(bool(active)),),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update overtime premium rule {day_type}: {e}")
+        return False
+
+
+def remove_overtime_premium_rule(day_type: str) -> bool:
+    fields = {
+        'holiday': ('holiday_ot_premium_percent', 'holiday_ot_premium_active'),
+        'non_working_day': ('non_working_day_ot_premium_percent', 'non_working_day_ot_premium_active'),
+    }
+    columns = fields.get(day_type)
+    if not columns:
+        return False
+    percent_column, active_column = columns
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                f"UPDATE payroll_settings SET {percent_column} = 0, {active_column} = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1"
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to remove overtime premium rule {day_type}: {e}")
+        return False
+
+
+def get_special_date_overrides(start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return configured payroll calendar overrides, optionally bounded by date."""
+    clauses = []
+    params: List[Any] = []
+    if start_date:
+        clauses.append("calendar_date >= ?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("calendar_date <= ?")
+        params.append(end_date)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT * FROM special_date_overrides {where} ORDER BY calendar_date, id",
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def save_special_date_override(
+    calendar_date: Any,
+    override_type: Any,
+    note: Any = '',
+    override_id: Optional[int] = None,
+    scope_type: Any = 'all',
+    scope_id: Any = None,
+) -> Dict[str, Any]:
+    """Create or update a unique payroll calendar override date."""
+    date_text = str(calendar_date or '').strip()
+    try:
+        normalized_date = datetime.strptime(date_text, "%Y-%m-%d").date().isoformat()
+    except (TypeError, ValueError) as e:
+        raise ValueError("Enter a date using YYYY-MM-DD format") from e
+    if normalized_date != date_text:
+        raise ValueError("Enter a date using YYYY-MM-DD format")
+    mode = str(override_type or '').strip().lower()
+    if mode not in ('working_day', 'off_day', 'holiday'):
+        raise ValueError("Override type must be Working Day, Off Day, or Holiday")
+    target_scope = str(scope_type or 'all').strip().lower()
+    if target_scope not in ('all', 'shift', 'employee'):
+        raise ValueError("Calendar scope must be all, shift, or employee")
+    if target_scope == 'all':
+        target_scope_id = 0
+    else:
+        try:
+            target_scope_id = int(scope_id)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise ValueError("Choose a valid shift or employee for this override") from e
+        if target_scope_id < 1:
+            raise ValueError("Choose a valid shift or employee for this override")
+    note_text = str(note or '').strip()
+    try:
+        target_id = int(override_id) if override_id is not None else None
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ValueError("Invalid special date identifier") from e
+
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            cursor = conn.cursor()
+            if target_scope != 'all':
+                table = 'shifts' if target_scope == 'shift' else 'users'
+                cursor.execute(f"SELECT 1 FROM {table} WHERE id = ?", (target_scope_id,))
+                if not cursor.fetchone():
+                    raise ValueError(f"{target_scope.title()} not found")
+            if target_id is None:
+                cursor.execute(
+                    "INSERT INTO special_date_overrides (calendar_date, override_type, note, scope_type, scope_id) VALUES (?, ?, ?, ?, ?)",
+                    (normalized_date, mode, note_text, target_scope, target_scope_id),
+                )
+                target_id = cursor.lastrowid
+            else:
+                cursor.execute("SELECT 1 FROM special_date_overrides WHERE id = ?", (target_id,))
+                if not cursor.fetchone():
+                    raise ValueError("Special date not found")
+                cursor.execute(
+                    "UPDATE special_date_overrides SET calendar_date = ?, override_type = ?, note = ?, scope_type = ?, scope_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (normalized_date, mode, note_text, target_scope, target_scope_id, target_id),
+                )
+            conn.commit()
+    except sqlite3.IntegrityError as e:
+        raise ValueError("A special date is already configured for this date") from e
+    return next(item for item in get_special_date_overrides() if item['id'] == target_id)
+
+
+def delete_special_date_override(override_id: int) -> bool:
+    """Remove a payroll calendar override."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM special_date_overrides WHERE id = ?", (override_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def _validate_payroll_rule_range(
+    cursor: sqlite3.Cursor,
+    min_absent_days: int,
+    max_absent_days: Optional[int],
+    deduction_type: str,
+    deduction_percent: float,
+    fixed_amount: float,
+    active: bool,
+    exclude_rule_id: Optional[int] = None,
+    rule_basis: str = 'absence',
+) -> None:
+    if rule_basis not in ('absence', 'half_leave'):
+        raise ValueError("Rule basis must be absence or half leave")
+    if min_absent_days < 1:
+        raise ValueError("Minimum count must be at least 1")
+    if max_absent_days is not None and max_absent_days < min_absent_days:
+        raise ValueError("Maximum absent days must be greater than or equal to minimum absent days")
+    if deduction_type not in ("percentage", "fixed"):
+        raise ValueError("Deduction type must be percentage or fixed amount")
+    if deduction_type == "percentage" and not 0 <= deduction_percent <= 100:
+        raise ValueError("Deduction percentage must be between 0 and 100")
+    if deduction_type == "fixed" and fixed_amount < 0:
+        raise ValueError("Fixed deduction amount cannot be negative")
+    query = "SELECT id, min_absent_days, max_absent_days FROM payroll_rules WHERE rule_basis = ?"
+    params: Tuple[Any, ...] = (rule_basis,)
+    if exclude_rule_id is not None:
+        query += " AND id != ?"
+        params = (exclude_rule_id,)
+    cursor.execute(query, params)
+    for existing_id, existing_min, existing_max in cursor.fetchall():
+        overlaps = (
+            (max_absent_days is None or existing_min <= max_absent_days)
+            and (existing_max is None or min_absent_days <= existing_max)
+        )
+        if overlaps:
+            raise ValueError(f"This range overlaps active payroll rule #{existing_id}")
+
+
+def save_payroll_rule(
+    min_absent_days: Any,
+    max_absent_days: Any,
+    deduction_percent: Any = None,
+    active: Any = True,
+    rule_id: Optional[int] = None,
+    deduction_type: Any = "percentage",
+    fixed_amount: Any = 0,
+    rule_basis: Any = 'absence',
+) -> Dict[str, Any]:
+    """Create or update a rule, rejecting ambiguous active ranges."""
+    try:
+        min_days = int(min_absent_days)
+        max_days = None if max_absent_days in (None, "") else int(max_absent_days)
+        mode = str(deduction_type or "percentage").strip().lower()
+        percent = float(deduction_percent or 0)
+        amount = float(fixed_amount or 0)
+        is_active = bool(int(active)) if isinstance(active, (str, int, bool)) else bool(active)
+        target_id = int(rule_id) if rule_id is not None else None
+        basis = str(rule_basis or 'absence').strip().lower()
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ValueError("Enter valid whole-number ranges and a numeric deduction value") from e
+
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            if target_id is not None:
+                cursor.execute("SELECT id FROM payroll_rules WHERE id = ?", (target_id,))
+                if not cursor.fetchone():
+                    raise ValueError("Payroll rule not found")
+            _validate_payroll_rule_range(
+                cursor, min_days, max_days, mode, percent, amount, is_active,
+                target_id, basis,
+            )
+
+            if target_id is None:
+                cursor.execute('''
+                    INSERT INTO payroll_rules (
+                        rule_basis, min_absent_days, max_absent_days, deduction_type,
+                        deduction_percent, fixed_amount, active
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (basis, min_days, max_days, mode, percent, amount, int(is_active)))
+                target_id = cursor.lastrowid
+            else:
+                cursor.execute('''
+                    UPDATE payroll_rules
+                    SET rule_basis = ?, min_absent_days = ?, max_absent_days = ?, deduction_type = ?,
+                        deduction_percent = ?, fixed_amount = ?, active = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (basis, min_days, max_days, mode, percent, amount, int(is_active), target_id))
+            conn.commit()
+        return next(rule for rule in get_payroll_rules() if rule['id'] == target_id)
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save payroll rule: {e}")
+        raise
+
+
+def set_payroll_rule_active(rule_id: int, active: bool) -> Optional[Dict[str, Any]]:
+    """Activate/deactivate a rule; activation must not overlap another active range."""
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM payroll_rules WHERE id = ?", (rule_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        if active:
+            _validate_payroll_rule_range(
+                cursor, row['min_absent_days'], row['max_absent_days'],
+                row['deduction_type'], row['deduction_percent'], row['fixed_amount'], True,
+                rule_id, row['rule_basis'],
+            )
+        cursor.execute(
+            "UPDATE payroll_rules SET active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (int(bool(active)), rule_id)
+        )
+        conn.commit()
+    return next(rule for rule in get_payroll_rules() if rule['id'] == rule_id)
+
+
+def _sanitize_orphan_payroll_records() -> int:
+    """Remove stale payroll rows that reference deleted payroll runs so database integrity stays valid."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM payroll_records WHERE payroll_run_id IS NULL OR payroll_run_id NOT IN (SELECT id FROM payroll_runs)")
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+    except Exception as exc:
+        logger.error(f"Failed to sanitize orphan payroll records: {exc}")
+        return 0
+
+
+def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Optional[int] = None) -> Dict[str, Any] | list:
+    """Build an attendance-based monthly payroll preview without saving it.
+
+    Supports the modern single-string contract (YYYY-MM) and a legacy compatibility
+    pattern that accepts year and month separately, returning the flattened employee
+    records list for those callers.
+    """
+    _sanitize_orphan_payroll_records()
+    if month is not None:
+        if payroll_month is None:
+            raise ValueError("Payroll year is required when month is provided")
+        payroll_month = f"{int(payroll_month):04d}-{int(month):02d}"
+    elif isinstance(payroll_month, (tuple, list)) and len(payroll_month) == 2:
+        year, month = payroll_month
+        payroll_month = f"{int(year):04d}-{int(month):02d}"
+
+    try:
+        month_start = datetime.strptime(str(payroll_month), "%Y-%m").date().replace(day=1)
+    except (TypeError, ValueError) as e:
+        raise ValueError("Payroll month must use YYYY-MM format") from e
+    if month_start.strftime("%Y-%m") != str(payroll_month):
+        raise ValueError("Payroll month must use YYYY-MM format")
+    finalized_run = get_monthly_payroll(payroll_month)
+    if finalized_run:
+        return finalized_run
+
+    today = datetime.now().date()
+    current_month = today.replace(day=1)
+    if month_start > current_month:
+        raise ValueError("Payroll cannot be calculated for a future month")
+
+    if month_start.month == 12:
+        next_month = month_start.replace(year=month_start.year + 1, month=1)
+    else:
+        next_month = month_start.replace(month=month_start.month + 1)
+    month_end = next_month - timedelta(days=1)
+    period_end = min(month_end, today)
+    payroll_settings = get_payroll_settings()
+    deduct_unpaid_leave = bool(payroll_settings.get('deduct_unpaid_leave', 0))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.id AS employee_id, u.name AS employee_name,
+                   COALESCE(u.department, '') AS department,
+                   COALESCE(u.position, '') AS designation,
+                   CASE WHEN COALESCE(sc.basic_salary, 0) > 0 THEN sc.basic_salary
+                        WHEN COALESCE(u.salary, 0) > 0 THEN u.salary
+                        ELSE 0 END AS basic_salary,
+                   COALESCE(sc.allowances, 0.0) AS allowances,
+                   COALESCE(sc.deductions, 0.0) AS custom_deductions,
+                   COALESCE(sc.ot_rate, 0.0) AS ot_rate,
+                   COALESCE(NULLIF(TRIM(u.join_date), ''), date(u.enrollment_date), date(u.created_at)) AS employed_from,
+                   u.exit_date,
+                   u.active
+            FROM users u
+            LEFT JOIN salary_configs sc ON sc.user_id = u.id
+            WHERE u.active = 1 OR (u.exit_date IS NOT NULL AND u.exit_date >= ?)
+            ORDER BY u.department COLLATE NOCASE, u.name COLLATE NOCASE
+        ''', (month_start.isoformat(),))
+        employees = [dict(row) for row in cursor.fetchall()]
+
+        # Query approved overtime for this payroll month
+        cursor.execute('''
+            SELECT user_id, ot_date, SUM(hours) as total_ot_hours
+            FROM overtime
+            WHERE LOWER(status) = 'approved'
+              AND ot_date >= ? AND ot_date <= ?
+            GROUP BY user_id, ot_date
+        ''', (month_start.isoformat(), month_end.isoformat()))
+        approved_ot_rows = [dict(row) for row in cursor.fetchall()]
+        approved_ot_by_user: Dict[int, List[Dict[str, Any]]] = {}
+        for overtime_row in approved_ot_rows:
+            overtime_user_id = int(overtime_row['user_id'])
+            overtime_date = str(overtime_row['ot_date'])
+            day_type = _get_overtime_day_type(cursor, overtime_user_id, overtime_date)
+            holiday = _get_company_holiday_for_date(cursor, overtime_date) if day_type == 'holiday' else None
+            approved_ot_by_user.setdefault(overtime_user_id, []).append({
+                'ot_date': overtime_date,
+                'day_type': day_type,
+                'holiday_id': holiday.get('id') if holiday else None,
+                'holiday_name': holiday.get('name') if holiday else None,
+                'hours': float(overtime_row['total_ot_hours'] or 0.0),
+                'premium_percent': _get_overtime_premium_percent(cursor, overtime_date, day_type, payroll_settings, holiday),
+            })
+
+        cursor.execute('''
+            SELECT id, rule_basis, min_absent_days, max_absent_days, deduction_type, deduction_percent, fixed_amount
+            FROM payroll_rules WHERE active = 1
+            ORDER BY min_absent_days, max_absent_days, id
+        ''')
+        active_rules = [dict(row) for row in cursor.fetchall()]
+
+    report = get_detailed_attendance_report(
+        start_date=month_start.isoformat(),
+        end_date=month_end.isoformat(),
+    )
+    report_records = {record['user_id']: record for record in report.get('records', [])}
+    missing_reports = [employee['employee_id'] for employee in employees
+                       if employee['employee_id'] not in report_records]
+    if missing_reports:
+        raise RuntimeError(f"Attendance report is missing active employees: {missing_reports}")
+
+    rows = []
+    for employee in employees:
+        employee_id = employee['employee_id']
+        try:
+            employed_from = datetime.strptime(str(employee['employed_from'])[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            employed_from = month_start
+            
+        try:
+            exited_on = datetime.strptime(str(employee.get('exit_date') or '')[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            exited_on = None
+
+        eligible_start = max(month_start, employed_from)
+        eligible_end = min(period_end, exited_on) if exited_on else period_end
+
+        if eligible_start > month_end or (exited_on and exited_on < month_start):
+            continue
+
+        daily_records = report_records[employee_id].get('daily_records', [])
+        eligible_records = [day for day in daily_records
+                            if eligible_start.isoformat() <= str(day.get('date', '')) <= eligible_end.isoformat()]
+        
+        # Schedule is calculated over the full eligible period within the month, ending at exited_on or month_end
+        schedule_end = min(month_end, exited_on) if exited_on else month_end
+        schedule_records = [day for day in daily_records
+                            if eligible_start.isoformat() <= str(day.get('date', '')) <= schedule_end.isoformat()]
+        scheduled_workdays = sum(bool(day.get('scheduled_workday')) for day in schedule_records)
+        shift_history_missing = any(day.get('shift_history_missing') for day in eligible_records)
+        shift_details = list({
+            (day['shift_id'], day['shift_effective_from']): {
+                'shift_id': day['shift_id'],
+                'shift_name': day['shift_name'],
+                'effective_from': day['shift_effective_from'],
+                'working_days': day['shift_working_days'],
+            }
+            for day in schedule_records if day.get('shift_id') is not None
+        }.values())
+        calendar_details = [
+            {'date': day['date'], 'override_type': day['calendar_override']}
+            for day in schedule_records if day.get('calendar_override')
+        ]
+        present_days = sum(day.get('scheduled_workday', True) and day.get('status') in ('present', 'checked_out') for day in eligible_records)
+        late_days = sum(day.get('scheduled_workday', True) and day.get('status') == 'late' for day in eligible_records)
+        half_leave_count = sum(int(day.get('half_leave_count') or 0) for day in eligible_records)
+        unpaid_leave_days = sum(1 for day in schedule_records if day.get('scheduled_workday', True) and day.get('status') == 'on_leave_unpaid')
+        unexcused_absent_days = sum(day.get('status') == 'absent' for day in eligible_records)
+        absent_days = unexcused_absent_days + unpaid_leave_days
+        
+        # TICKET-BUGFIX: Calculate approved leave over the full month schedule (schedule_records) 
+        # so mid-month previews correctly reflect future approved leaves within the month.
+        approved_leave_days = sum(day.get('scheduled_workday', True) and day.get('status') == 'on_leave' for day in schedule_records)
+        
+        payable_days = min(scheduled_workdays, present_days + late_days + approved_leave_days)
+        
+        # TICKET-18 & 19: Mid-Month Joiner & Mid-Month Exit Pro-Rata Calculation
+        import calendar
+        _, total_days_in_month = calendar.monthrange(month_start.year, month_start.month)
+        active_days_in_month = max(0, (schedule_end - eligible_start).days + 1)
+        proration_factor = 1.0 if active_days_in_month >= total_days_in_month else (active_days_in_month / total_days_in_month)
+        
+        basic_salary = round(max(0.0, float(employee['basic_salary'] or 0)) * proration_factor, 2)
+
+        # Apply calendar-based premiums to approved overtime hours.
+        overtime_entries = approved_ot_by_user.get(employee_id, [])
+        ot_hours = round(sum(entry['hours'] for entry in overtime_entries), 2)
+        configured_ot_rate = float(employee.get('ot_rate') or 0.0)
+        if configured_ot_rate > 0.0:
+            ot_rate = round(configured_ot_rate, 2)
+        elif basic_salary > 0.0:
+            ot_rate = round(basic_salary / 208.0, 2)
+        else:
+            ot_rate = 0.0
+        overtime_breakdown = []
+        overtime_amount = 0.0
+        for overtime_entry in overtime_entries:
+            entry_hours = float(overtime_entry['hours'] or 0.0)
+            if entry_hours <= 0:
+                continue
+            day_type = overtime_entry['day_type']
+            premium_percent = float(overtime_entry['premium_percent'] or 0.0)
+            effective_rate = round(ot_rate * (1 + premium_percent / 100), 2)
+            category_amount = round(entry_hours * effective_rate, 2)
+            overtime_amount += category_amount
+            breakdown_entry = {
+                'day_type': day_type,
+                'date': overtime_entry['ot_date'],
+                'hours': round(entry_hours, 2),
+                'premium_percent': premium_percent,
+                'hourly_rate': effective_rate,
+                'amount': category_amount,
+            }
+            if overtime_entry.get('holiday_id') is not None:
+                breakdown_entry['holiday_id'] = overtime_entry['holiday_id']
+                breakdown_entry['holiday_name'] = overtime_entry['holiday_name']
+            overtime_breakdown.append(breakdown_entry)
+        overtime_amount = round(overtime_amount, 2)
+
+        # Allowances and Custom Fixed Deductions from salary_configs
+        allowances = round(max(0.0, float(employee.get('allowances') or 0.0)) * proration_factor, 2)
+        custom_deductions = round(max(0.0, float(employee.get('custom_deductions') or 0.0)) * proration_factor, 2)
+
+        # Absence rule deduction
+        matching_rules = [rule for rule in active_rules
+                  if rule.get('rule_basis', 'absence') == 'absence'
+                          if unexcused_absent_days >= rule['min_absent_days']
+                          and (rule['max_absent_days'] is None or unexcused_absent_days <= rule['max_absent_days'])]
+        if len(matching_rules) > 1:
+            raise RuntimeError(f"Multiple active payroll rules match {unexcused_absent_days} absences for employee #{employee_id}")
+        matched_rule = matching_rules[0] if matching_rules else None
+        rule_missing = unexcused_absent_days > 0 and matched_rule is None
+        deduction_type = matched_rule['deduction_type'] if matched_rule else 'percentage'
+        deduction_percent = float(matched_rule['deduction_percent']) if matched_rule and deduction_type == 'percentage' else None
+        fixed_amount = float(matched_rule['fixed_amount']) if matched_rule and deduction_type == 'fixed' else 0.0
+        absence_rule_deduction = 0.0 if unexcused_absent_days == 0 else round(
+            basic_salary * deduction_percent / 100 if deduction_type == 'percentage' and deduction_percent is not None else fixed_amount,
+            2,
+        )
+        matching_half_leave_rules = [rule for rule in active_rules
+                                     if rule.get('rule_basis', 'absence') == 'half_leave'
+                                     and half_leave_count >= rule['min_absent_days']
+                                     and (rule['max_absent_days'] is None or half_leave_count <= rule['max_absent_days'])]
+        if len(matching_half_leave_rules) > 1:
+            raise RuntimeError(f"Multiple active payroll rules match {half_leave_count} half-leave occurrences for employee #{employee_id}")
+        matched_half_leave_rule = matching_half_leave_rules[0] if matching_half_leave_rules else None
+        half_leave_deduction = 0.0
+        if matched_half_leave_rule:
+            half_leave_deduction = round(
+                basic_salary * float(matched_half_leave_rule['deduction_percent']) / 100
+                if matched_half_leave_rule['deduction_type'] == 'percentage'
+                else float(matched_half_leave_rule['fixed_amount']),
+                2,
+            )
+        unpaid_leave_deduction = round(basic_salary * unpaid_leave_days / scheduled_workdays, 2) if deduct_unpaid_leave and scheduled_workdays else 0.0
+        deduction_amount = round(absence_rule_deduction + unpaid_leave_deduction + half_leave_deduction, 2)
+
+        # Final payroll calculation:
+        # Gross = Basic + Allowances + Approved Overtime
+        # Deductions = Absence Deduction + Custom Fixed Deductions
+        # Net = max(0.0, Gross - Deductions)
+        gross_salary = round(basic_salary + allowances + overtime_amount, 2)
+        total_emp_deductions = round(deduction_amount + custom_deductions, 2)
+        net_salary = round(max(0.0, gross_salary - total_emp_deductions), 2)
+
+        if matched_rule:
+            max_absent = matched_rule['max_absent_days']
+            matched_rule_label = (
+                f"{matched_rule['min_absent_days']}+ absent days" if max_absent is None
+                else f"{matched_rule['min_absent_days']} absent days" if max_absent == matched_rule['min_absent_days']
+                else f"{matched_rule['min_absent_days']}-{max_absent} absent days"
+            )
+        else:
+            matched_rule_label = 'No absence deduction' if unexcused_absent_days == 0 else 'No matching rule'
+        paid_leave_days = approved_leave_days
+        total_leave_days = paid_leave_days + unpaid_leave_days
+        rows.append({
+            'employee_id': employee_id,
+            'user_id': employee_id,
+            'employee_name': employee['employee_name'],
+            'department': employee['department'],
+            'designation': employee['designation'] or 'Staff Member',
+            'basic_salary': basic_salary,
+            'allowances': allowances,
+            'custom_deductions': custom_deductions,
+            'overtime_hours': ot_hours,
+            'overtime_rate': ot_rate,
+            'overtime_amount': overtime_amount,
+            'overtime_breakdown': overtime_breakdown,
+            'gross_salary': gross_salary,
+            'scheduled_workdays': scheduled_workdays,
+            'shift_details': shift_details,
+            'calendar_details': calendar_details,
+            'present_days': present_days,
+            'half_leave_count': half_leave_count,
+            'half_leave_deduction': half_leave_deduction,
+            'matched_half_leave_rule': (
+                f"{matched_half_leave_rule['min_absent_days']}+ half-leave occurrences"
+                if matched_half_leave_rule and matched_half_leave_rule['max_absent_days'] is None
+                else f"{matched_half_leave_rule['min_absent_days']}-{matched_half_leave_rule['max_absent_days']} half-leave occurrences"
+                if matched_half_leave_rule else 'No half-leave deduction'
+            ),
+            'absent_days': absent_days,
+            'late_days': late_days,
+            'approved_leave_days': approved_leave_days,
+            'paid_leave_days': paid_leave_days,
+            'unpaid_leave_days': unpaid_leave_days,
+            'unpaid_leave_deduction': unpaid_leave_deduction,
+            'deduct_unpaid_leave': deduct_unpaid_leave,
+            'total_leave_days': total_leave_days,
+            'leave_days': total_leave_days,
+            'payable_days': payable_days,
+            'shift_history_missing': shift_history_missing,
+            'applied_rule_id': matched_rule['id'] if matched_rule else None,
+            'matched_rule': matched_rule_label,
+            'deduction_type': deduction_type,
+            'deduction_percent': deduction_percent,
+            'fixed_amount': fixed_amount,
+            'absence_deduction': absence_rule_deduction,
+            'deduction_amount': deduction_amount,
+            'rule_missing': rule_missing,
+            'net_salary': net_salary,
+            'status': 'Missing shift history' if shift_history_missing else (
+                'Missing salary' if basic_salary <= 0 else ('Missing payroll rule' if rule_missing else 'Draft')
+            ),
+        })
+
+    preview = {
+        'payroll_month': payroll_month,
+        'period_start': month_start.isoformat(),
+        'period_end': period_end.isoformat(),
+        'status': 'Draft',
+        'is_finalized': False,
+        'employee_count': len(rows),
+        'total_basic_salary': round(sum(row['basic_salary'] for row in rows), 2),
+        'total_allowances': round(sum(row['allowances'] for row in rows), 2),
+        'total_overtime': round(sum(row['overtime_amount'] for row in rows), 2),
+        'total_deduction': round(sum(row['deduction_amount'] + row['custom_deductions'] for row in rows), 2),
+        'total_net_salary': round(sum(row['net_salary'] for row in rows), 2),
+        'records': rows,
+    }
+    preview['payroll_run_id'] = _persist_draft_monthly_payroll(preview)
+    finalized_run = get_monthly_payroll(payroll_month)
+    if finalized_run:
+        return finalized_run
+    if month is not None and payroll_month.endswith(f"-{int(month):02d}"):
+        return rows
+    return preview
+
+
+def _insert_payroll_records(cursor: sqlite3.Cursor, run_id: int, rows: List[Dict[str, Any]], finalized: bool) -> None:
+    record_status = 'Finalized' if finalized else None
+    cursor.executemany('''
+        INSERT INTO payroll_records (
+            payroll_run_id, employee_id, employee_name, department, designation,
+            basic_salary, allowances, custom_deductions, overtime_hours, overtime_rate,
+            overtime_amount, overtime_breakdown, gross_salary, scheduled_workdays, present_days, absent_days,
+            late_days, approved_leave_days, paid_leave_days, unpaid_leave_days, total_leave_days,
+            unpaid_leave_deduction,
+            payable_days, applied_rule_id, matched_rule,
+            shift_details, calendar_details, deduction_type, deduction_percent,
+            fixed_amount, deduction_amount, net_salary, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [(
+        run_id, row['employee_id'], row['employee_name'], row['department'], row['designation'],
+        row.get('basic_salary', 0.0), row.get('allowances', 0.0), row.get('custom_deductions', 0.0),
+        row.get('overtime_hours', 0.0), row.get('overtime_rate', 0.0), row.get('overtime_amount', 0.0),
+        json.dumps(row.get('overtime_breakdown', [])),
+        row.get('gross_salary', row.get('basic_salary', 0.0)),
+        row['scheduled_workdays'], row['present_days'], row['absent_days'],
+        row['late_days'], row['approved_leave_days'], row.get('paid_leave_days', row['approved_leave_days']),
+        row.get('unpaid_leave_days', 0), row.get('total_leave_days', row['approved_leave_days'] + row.get('unpaid_leave_days', 0)),
+        row.get('unpaid_leave_deduction', 0.0),
+        row['payable_days'], row.get('applied_rule_id'),
+        row.get('matched_rule', ''), json.dumps(row.get('shift_details', [])),
+        json.dumps(row.get('calendar_details', [])), row.get('deduction_type', 'percentage'),
+        row.get('deduction_percent'), row.get('fixed_amount', 0), row.get('deduction_amount', 0),
+        row['net_salary'], record_status or row.get('status', 'Draft')
+    ) for row in rows])
+
+
+def _persist_draft_monthly_payroll(preview: Dict[str, Any]) -> int:
+    _sanitize_orphan_payroll_records()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ?", (preview['payroll_month'],))
+        existing = cursor.fetchone()
+        if existing and existing[1] == 'Finalized':
+            return existing[0]
+        if existing:
+            run_id = existing[0]
+            cursor.execute('''
+                UPDATE payroll_runs
+                SET period_start = ?, period_end = ?, employee_count = ?, total_basic_salary = ?,
+                    total_allowances = ?, total_overtime = ?, total_deduction = ?, total_net_salary = ?,
+                    status = 'Draft', finalized_at = NULL
+                WHERE id = ?
+            ''', (
+                preview['period_start'], preview['period_end'], preview['employee_count'],
+                preview['total_basic_salary'], preview.get('total_allowances', 0.0), preview.get('total_overtime', 0.0),
+                preview['total_deduction'], preview['total_net_salary'], run_id
+            ))
+            cursor.execute("DELETE FROM payroll_records WHERE payroll_run_id = ?", (run_id,))
+        else:
+            cursor.execute('''
+                INSERT INTO payroll_runs (
+                    payroll_month, period_start, period_end, employee_count,
+                    total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary,
+                    status, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL)
+            ''', (
+                preview['payroll_month'], preview['period_start'], preview['period_end'],
+                preview['employee_count'], preview['total_basic_salary'], preview.get('total_allowances', 0.0),
+                preview.get('total_overtime', 0.0), preview['total_deduction'],
+                preview['total_net_salary']
+            ))
+            run_id = cursor.lastrowid
+        if run_id is None:
+            raise RuntimeError("Failed to create payroll draft")
+        _insert_payroll_records(cursor, run_id, preview.get('records', []), finalized=False)
+        conn.commit()
+        return run_id
+
+
+def get_payroll_history(limit: int = 24) -> List[Dict[str, Any]]:
+    """List persisted monthly payroll runs without recalculating them."""
+    safe_limit = max(1, min(int(limit), 120))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, payroll_month, period_start, period_end, employee_count,
+                   total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
+                   created_at, finalized_at
+            FROM payroll_runs
+            ORDER BY payroll_month DESC, id DESC
+            LIMIT ?
+        ''', (safe_limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_monthly_payroll(payroll_month: str) -> Optional[Dict[str, Any]]:
+    """Load a finalized payroll snapshot for a month, if one exists."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized'", (payroll_month,))
+        run = cursor.fetchone()
+        if not run:
+            return None
+        result = dict(run)
+        cursor.execute("SELECT * FROM payroll_records WHERE payroll_run_id = ? ORDER BY department COLLATE NOCASE, employee_name COLLATE NOCASE", (run['id'],))
+        result['records'] = []
+        for row in cursor.fetchall():
+            record = dict(row)
+            try:
+                record['overtime_breakdown'] = json.loads(record.get('overtime_breakdown') or '[]')
+            except (TypeError, ValueError):
+                record['overtime_breakdown'] = []
+            record['paid_leave_days'] = int(record.get('paid_leave_days') or record.get('approved_leave_days') or 0)
+            record['unpaid_leave_days'] = int(record.get('unpaid_leave_days') or 0)
+            record['total_leave_days'] = int(record.get('total_leave_days') or (record['paid_leave_days'] + record['unpaid_leave_days']))
+            result['records'].append(record)
+    result['is_finalized'] = True
+    result['total_allowances'] = round(sum(float(row.get('allowances') or 0) for row in result['records']), 2)
+    result['total_overtime'] = round(sum(float(row.get('overtime_amount') or 0) for row in result['records']), 2)
+    result['total_deduction'] = round(sum(float(row.get('deduction_amount') or 0) + float(row.get('custom_deductions') or 0) for row in result['records']), 2)
+    result['total_net_salary'] = round(sum(float(row.get('net_salary') or 0) for row in result['records']), 2)
+    return result
+
+
+def finalize_monthly_payroll(preview: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Persist a reviewed payroll preview as an immutable monthly snapshot."""
+    _sanitize_orphan_payroll_records()
+    if any(row.get('shift_history_missing') for row in preview.get('records', [])):
+        raise ValueError("Configure shift assignment history for every employee before finalizing payroll")
+    if any(row['basic_salary'] <= 0 for row in preview.get('records', [])):
+        raise ValueError("Set a basic salary for every active employee before finalizing payroll")
+    if any(row.get('rule_missing') for row in preview.get('records', [])):
+        missing_names = [row['employee_name'] for row in preview.get('records', []) if row.get('rule_missing')]
+        raise ValueError("Configure active payroll rules for: " + ', '.join(missing_names))
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ?", (preview['payroll_month'],))
+            existing = cursor.fetchone()
+            if existing and existing[1] == 'Finalized':
+                return None
+            if existing:
+                run_id = existing[0]
+                cursor.execute('''
+                    UPDATE payroll_runs
+                    SET period_start = ?, period_end = ?, employee_count = ?, total_basic_salary = ?,
+                        total_allowances = ?, total_overtime = ?, total_deduction = ?, total_net_salary = ?,
+                        status = 'Draft', finalized_at = NULL
+                    WHERE id = ?
+                ''', (
+                    preview['period_start'], preview['period_end'], preview['employee_count'],
+                    preview['total_basic_salary'], preview.get('total_allowances', 0.0), preview.get('total_overtime', 0.0),
+                    preview['total_deduction'], preview['total_net_salary'], run_id
+                ))
+                cursor.execute("DELETE FROM payroll_records WHERE payroll_run_id = ?", (run_id,))
+            else:
+                cursor.execute('''
+                    INSERT INTO payroll_runs (
+                        payroll_month, period_start, period_end, employee_count,
+                        total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary,
+                        status, finalized_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL)
+                ''', (
+                    preview['payroll_month'], preview['period_start'], preview['period_end'],
+                    preview['employee_count'], preview['total_basic_salary'], preview.get('total_allowances', 0.0),
+                    preview.get('total_overtime', 0.0), preview['total_deduction'],
+                    preview['total_net_salary']
+                ))
+                run_id = cursor.lastrowid
+            if run_id is None:
+                raise RuntimeError("Failed to create payroll run")
+            _insert_payroll_records(cursor, run_id, preview.get('records', []), finalized=False)
+            cursor.execute("UPDATE payroll_records SET status = 'Finalized' WHERE payroll_run_id = ?", (run_id,))
+            cursor.execute('''
+                UPDATE payroll_runs SET status = 'Finalized', finalized_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (run_id,))
+            conn.commit()
+        return get_monthly_payroll(preview['payroll_month'])
+    except Exception as e:
+        logger.error(f"Failed to finalize payroll for {preview.get('payroll_month')}: {e}")
+        raise
+
+
+# ============================================
+# BRANCH SETTINGS & SYSTEM CONFIGURATION
+# ============================================
+
+def get_branch_settings() -> Dict:
+    """Retrieve system branch, company, admin display name, and location settings."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM branch_settings WHERE id = 1")
+            row = cursor.fetchone()
+            if row:
+                res = dict(row)
+                if not res.get('admin_name'):
+                    res['admin_name'] = 'Mr. Junaid'
+                return res
+    except Exception as e:
+        logger.error(f"Failed to fetch branch settings: {e}")
+    return {
+        'id': 1,
+        'branch_name': '',
+        'city': '',
+        'company_name': '',
+        'admin_name': 'Mr. Junaid',
+        'address': '',
+        'phone': '',
+        'email': ''
+    }
+
+def update_branch_settings(branch_name: str, city: str, company_name: str = '', address: str = '', phone: str = '', email: str = '', admin_name: str = 'Mr. Junaid') -> bool:
+    """Update branch and organization settings."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO branch_settings (id, branch_name, city, company_name, address, phone, email, admin_name, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                branch_name=excluded.branch_name,
+                city=excluded.city,
+                company_name=excluded.company_name,
+                address=excluded.address,
+                phone=excluded.phone,
+                email=excluded.email,
+                admin_name=excluded.admin_name,
+                updated_at=CURRENT_TIMESTAMP
+            ''', (branch_name.strip(), city.strip(), company_name.strip(), address.strip(), phone.strip(), email.strip(), admin_name.strip() or 'Mr. Junaid'))
+            conn.commit()
+            logger.info(f"✓ Branch settings updated: {branch_name} ({city}) | Admin: {admin_name}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to update branch settings: {e}")
+        return False
+
+
+# ============================================
+# DEPARTMENT MANAGEMENT
+# ============================================
+
+def get_all_departments_list(active_only: bool = False) -> List[Dict]:
+    """Retrieve all departments with registered employee counts and designation counts."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            where_clause = "WHERE d.active = 1" if active_only else ""
+            cursor.execute(f'''
+                SELECT d.id, d.name, d.code, d.description, d.active, d.created_at,
+                       COUNT(DISTINCT u.id) as staff_count,
+                       COUNT(DISTINCT des.id) as designation_count
+                FROM departments d
+                LEFT JOIN users u ON u.department = d.name AND u.active = 1
+                LEFT JOIN designations des ON des.department_id = d.id AND des.active = 1
+                {where_clause}
+                GROUP BY d.id
+                ORDER BY d.name ASC
+            ''')
+            return [dict(r) for r in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Failed to fetch departments list: {e}")
+        raise
+
+def add_department(name: str, code: str = '', description: str = '') -> Optional[int]:
+    """Add a new department."""
+    if not name or not name.strip():
+        return None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO departments (name, code, description) VALUES (?, ?, ?)",
+                (name.strip(), code.strip(), description.strip())
+            )
+            conn.commit()
+            dept_id = cursor.lastrowid
+            logger.info(f"✓ Department '{name}' created (ID: {dept_id})")
+            return dept_id
+    except sqlite3.IntegrityError:
+        logger.warning(f"Department '{name}' already exists")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to add department: {e}")
+        raise
+
+def update_department(dept_id: int, name: str, code: str = '', description: str = '', active: int = 1) -> bool:
+    """Update department information and sync assigned user records if department name changes."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM departments WHERE id = ?", (dept_id,))
+            row = cursor.fetchone()
+            old_name = row[0] if row else None
+            
+            cursor.execute('''
+                UPDATE departments
+                SET name = ?, code = ?, description = ?, active = ?
+                WHERE id = ?
+            ''', (name.strip(), code.strip(), description.strip(), active, dept_id))
+            
+            if old_name and old_name != name.strip():
+                cursor.execute("UPDATE users SET department = ? WHERE department = ?", (name.strip(), old_name))
+                
+            conn.commit()
+            logger.info(f"✓ Department ID {dept_id} updated: {name}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to update department ID {dept_id}: {e}")
+        return False
+
+def delete_department(dept_id: int) -> bool:
+    """Soft delete / disable department."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE departments SET active = 0 WHERE id = ?", (dept_id,))
+            conn.commit()
+            logger.info(f"✓ Department ID {dept_id} disabled.")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to delete department ID {dept_id}: {e}")
+        return False
+
+
+def get_department(dept_id: int) -> Optional[Dict]:
+    """Retrieve single department by id."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, code, description, active FROM departments WHERE id = ?", (dept_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Failed to fetch department ID {dept_id}: {e}")
+        return None
+
+
+# ============================================
+# DESIGNATION MANAGEMENT
+# ============================================
+
+def get_designations(department_id: Optional[int] = None, department_name: Optional[str] = None, active_only: bool = False) -> List[Dict]:
+    """Retrieve designations filtered by department_id or department_name."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            query = '''
+                SELECT des.id, des.department_id, des.title, des.description, des.active, des.created_at,
+                       d.name as department_name
+                FROM designations des
+                JOIN departments d ON des.department_id = d.id
+                WHERE 1=1
+            '''
+            params = []
+            if department_id:
+                query += " AND des.department_id = ?"
+                params.append(department_id)
+            if department_name:
+                query += " AND d.name = ?"
+                params.append(department_name.strip())
+            if active_only:
+                query += " AND des.active = 1 AND d.active = 1"
+            query += " ORDER BY des.title ASC"
+            cursor.execute(query, params)
+            return [dict(r) for r in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Failed to fetch designations: {e}")
+        return []
+
+def add_designation(department_id: int, title: str, description: str = '') -> Optional[int]:
+    """Add a new designation under a specific department."""
+    if not title or not title.strip() or not department_id:
+        return None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO designations (department_id, title, description) VALUES (?, ?, ?)",
+                (department_id, title.strip(), description.strip())
+            )
+            conn.commit()
+            desig_id = cursor.lastrowid
+            logger.info(f"✓ Designation '{title}' created under Department ID {department_id} (ID: {desig_id})")
+            return desig_id
+    except sqlite3.IntegrityError as e:
+        logger.warning(f"Integrity error adding designation '{title}' under dept {department_id}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to add designation: {e}")
+        return None
+
+def update_designation(desig_id: int, title: str, description: str = '', active: int = 1) -> bool:
+    """Update designation title or active status."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE designations SET title = ?, description = ?, active = ? WHERE id = ?",
+                (title.strip(), description.strip(), active, desig_id)
+            )
+            conn.commit()
+            logger.info(f"✓ Designation ID {desig_id} updated: {title}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to update designation ID {desig_id}: {e}")
+        return False
+
+def delete_designation(desig_id: int) -> bool:
+    """Soft delete / disable designation."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE designations SET active = 0 WHERE id = ?", (desig_id,))
+            conn.commit()
+            logger.info(f"✓ Designation ID {desig_id} disabled.")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to delete designation ID {desig_id}: {e}")
+        return False
+
+
+# ============================================
+# DYNAMIC CAMERA MANAGEMENT
+# ============================================
+
+def get_all_cameras(active_only: bool = False) -> List[Dict]:
+    """Retrieve all configured camera streams."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            where = "WHERE active = 1" if active_only else ""
+            cursor.execute(f"SELECT * FROM cameras {where} ORDER BY id ASC")
+            return [dict(r) for r in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Failed to fetch cameras: {e}")
+        return []
+
+def get_camera_by_id(camera_id: str) -> Optional[Dict]:
+    """Get single camera by camera_id string or integer DB id."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM cameras WHERE camera_id = ? OR id = ?", (str(camera_id), str(camera_id)))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Failed to fetch camera {camera_id}: {e}")
+        return None
+
+def add_camera(camera_id: str, name: str, room_name: str, camera_type: str = 'ip_camera', rtsp_url: str = '') -> Optional[int]:
+    """Add a new camera configuration."""
+    if not name or not camera_id or not room_name:
+        return None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''INSERT INTO cameras (camera_id, name, room_name, camera_type, rtsp_url, active)
+                   VALUES (?, ?, ?, ?, ?, 1)''',
+                (camera_id.strip(), name.strip(), room_name.strip(), camera_type.strip(), rtsp_url.strip())
+            )
+            conn.commit()
+            cam_db_id = cursor.lastrowid
+            logger.info(f"✓ Camera '{name}' ({camera_id}) added for room '{room_name}' (ID: {cam_db_id})")
+            return cam_db_id
+    except sqlite3.IntegrityError:
+        logger.warning(f"Camera ID '{camera_id}' already exists")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to add camera: {e}")
+        return None
+
+def update_camera(cam_db_id: int, camera_id: str, name: str, room_name: str, camera_type: str = 'ip_camera', rtsp_url: str = '', active: int = 1) -> bool:
+    """Update camera configuration."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''UPDATE cameras
+                   SET camera_id = ?, name = ?, room_name = ?, camera_type = ?, rtsp_url = ?, active = ?
+                   WHERE id = ?''',
+                (camera_id.strip(), name.strip(), room_name.strip(), camera_type.strip(), rtsp_url.strip(), active, cam_db_id)
+            )
+            conn.commit()
+            logger.info(f"✓ Camera DB ID {cam_db_id} updated: {name}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to update camera DB ID {cam_db_id}: {e}")
+        return False
+
+def delete_camera(cam_db_id: int) -> bool:
+    """Delete camera configuration."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM cameras WHERE id = ?", (cam_db_id,))
+            conn.commit()
+            logger.info(f"✓ Camera DB ID {cam_db_id} deleted.")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to delete camera DB ID {cam_db_id}: {e}")
+        return False
+
+
+def get_camera_room_mappings(active_only: bool = True) -> Dict[str, Dict]:
+    """Return {camera_id: {camera_name, room_name, camera_type, description}} built from the cameras table."""
+    mappings = {}
+    for cam in get_all_cameras(active_only=active_only):
+        mappings[cam['camera_id']] = {
+            'camera_name': cam['name'],
+            'room_name': cam['room_name'],
+            'camera_type': cam['camera_type'],
+            'description': f"{cam['camera_type'].upper().replace('_', ' ')} - {cam['room_name']}",
+        }
+    return mappings
+
+
+# Automatically ensure schema and migrations are up-to-date on load
+try:
+    init_db()
+except Exception as _e:
+    logger.warning(f"Database auto-migration on import failed: {_e}")
+
+if __name__ == '__main__':
+    init_db()

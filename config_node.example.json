@@ -1,0 +1,36 @@
+{
+  "linked": true,
+  "organization_id": "ORG-EXAMPLE",
+  "organization_name": "Example Organization",
+  "branch_id": "BR-EXAMPLE-01",
+  "branch_name": "Main Branch",
+  "branch_status": "active",
+  "main_dashboard_url": "http://127.0.0.1:5100",
+  "license_id": "LIC-EXAMPLE",
+  "license_status": "active",
+  "license_start": "2026-01-01",
+  "license_expiry": "2027-01-01",
+  "licensed_modules": [
+    "attendance",
+    "payroll",
+    "leave",
+    "overtime",
+    "shifts"
+  ],
+  "last_sync_timestamp": "2026-10-11T20:00:00",
+  "local_instance_id": "LOC-INST-001",
+  "cloud_url": "http://127.0.0.1:5100",
+  "node_port": 5005,
+  "face_match_threshold": 0.45,
+  "cameras": [
+    {
+      "active": 1,
+      "camera_type": "webcam",
+      "channel_number": 1,
+      "id": "cam_01",
+      "name": "Entrance Web Cam",
+      "room_name": "Reception",
+      "rtsp_url": "0"
+    }
+  ]
+}

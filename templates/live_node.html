@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QuantEye Live AI Attendance Node</title>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    :root {
+      --bg: #090e17;
+      --card-bg: #111927;
+      --border: #1e293b;
+      --teal: #3aafa9;
+      --teal-glow: rgba(58, 175, 169, 0.35);
+      --green: #10b981;
+      --red: #ef4444;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Outfit', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* TOP BAR */
+    .header {
+      height: 60px;
+      background: rgba(17, 25, 39, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 1.25rem;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+    }
+    .brand-badge {
+      background: linear-gradient(135deg, var(--teal), #2b7a78);
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 15px var(--teal-glow);
+    }
+    .brand span { color: var(--teal); }
+
+    .node-info {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      font-size: 0.9rem;
+    }
+    .branch-pill {
+      background: rgba(30, 41, 59, 0.7);
+      padding: 6px 14px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+    }
+    .cloud-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-weight: 600;
+      font-size: 0.85rem;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: #34d399;
+    }
+    .cloud-status.offline {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.3);
+      color: #f87171;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 8px currentColor;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+
+    /* MAIN CONTAINER */
+    .main-content {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      gap: 16px;
+      padding: 16px;
+      overflow: hidden;
+    }
+
+    /* CAMERA GRID */
+    .camera-stage {
+      background: #060a10;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      display: grid;
+      gap: 8px;
+      padding: 8px;
+    }
+    .grid-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+    .grid-2 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
+    .grid-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+    .grid-6 { grid-template-columns: repeat(3, 1fr); grid-template-rows: 1fr 1fr; }
+
+    .camera-cell {
+      position: relative;
+      background: #020408;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid #1e293b;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .camera-cell img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .cam-tag {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid var(--border);
+      padding: 4px 10px;
+      border-radius: 8px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      backdrop-filter: blur(8px);
+    }
+    .cam-live-indicator {
+      width: 6px;
+      height: 6px;
+      background: var(--red);
+      border-radius: 50%;
+      box-shadow: 0 0 6px var(--red);
+      animation: pulse 1.5s infinite;
+    }
+
+    /* LIVE ATTENDANCE TICKER (RIGHT PANEL) */
+    .ticker-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .ticker-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .ticker-title {
+      font-size: 1rem;
+      font-weight: 800;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .ticker-count {
+      font-size: 0.8rem;
+      background: rgba(58, 175, 169, 0.15);
+      color: var(--teal);
+      border: 1px solid var(--teal);
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-weight: 700;
+    }
+    .ticker-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .ticker-item {
+      background: rgba(30, 41, 59, 0.4);
+      border: 1px solid rgba(51, 65, 85, 0.4);
+      border-radius: 12px;
+      padding: 12px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      animation: slideIn 0.3s ease-out;
+    }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(-10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .ticker-photo {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      object-fit: cover;
+      background: #1e293b;
+      border: 1px solid var(--teal);
+    }
+    .ticker-details {
+      flex: 1;
+      min-width: 0;
+    }
+    .ticker-name {
+      font-weight: 700;
+      font-size: 0.95rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #fff;
+    }
+    .ticker-meta {
+      font-size: 0.78rem;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 2px;
+    }
+    .ticker-time {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--teal);
+      font-weight: 600;
+    }
+    .ticker-pill {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- TOP HEADER -->
+  <header class="header">
+    <div class="brand">
+      <div class="brand-badge"><i class="fa-solid fa-eye"></i></div>
+      <div>QuantEye <span>AI Node</span></div>
+    </div>
+
+    <div class="node-info">
+      <div class="branch-pill" id="branchDisplayPill" style="cursor:pointer;" onclick="openActivationModal()" title="Click to Switch / Activate Branch Key">
+        <i class="fa-solid fa-key" style="color:var(--teal)"></i>
+        <span id="headerBranchName">{{ config.organization_name }} &bull; {{ config.branch_name }}</span>
+      </div>
+      <div id="cloudStatusBadge" class="cloud-status">
+        <div class="status-dot"></div>
+        <span id="cloudStatusText">Cloud Connected</span>
+      </div>
+      <button id="btnOpenKeySetup" type="button" onclick="openActivationModal()" style="background:rgba(58,175,169,0.25); border:1px solid var(--teal); color:var(--teal); border-radius:10px; padding:6px 14px; font-weight:700; font-size:0.85rem; cursor:pointer; z-index:999;">
+        <i class="fa-solid fa-sliders me-1"></i> Key Setup
+      </button>
+    </div>
+  </header>
+
+  <!-- ACTIVATION / KEY SETUP MODAL -->
+  <div id="activationModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); z-index:99999; backdrop-filter:blur(8px); align-items:center; justify-content:center;">
+    <div style="background:#111927; border:1px solid #1e293b; border-radius:20px; width:min(480px, calc(100% - 32px)); padding:32px; box-shadow:0 20px 50px rgba(0,0,0,0.5); text-align:left;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <div style="background:var(--teal); width:36px; height:36px; border-radius:10px; display:flex; align-items:center; justify-content:center; color:#090e17; font-size:1.1rem; font-weight:800;">
+            <i class="fa-solid fa-building-circle-check"></i>
+          </div>
+          <div>
+            <h3 style="font-size:1.15rem; font-weight:800; color:#fff; margin:0;">Client Branch Activation</h3>
+            <span style="font-size:0.8rem; color:var(--muted);">Connect this AI Node to your Organization</span>
+          </div>
+        </div>
+        <button onclick="closeActivationModal()" style="background:none; border:none; color:var(--muted); font-size:1.2rem; cursor:pointer;">&times;</button>
+      </div>
+
+      <div id="activationAlert" style="display:none; padding:12px; border-radius:10px; margin-bottom:16px; font-size:0.85rem; font-weight:600;"></div>
+
+      <form onsubmit="handleActivationSubmit(event)">
+        <div style="margin-bottom:14px;">
+          <label style="display:block; font-size:0.82rem; font-weight:700; color:var(--muted); margin-bottom:6px;">Branch Key (from Dashboard)</label>
+          <input type="text" id="inputBranchKey" required placeholder="e.g. QE-A03FEAD2A7AA433A9742" value="{{ config.branch_key or '' }}" style="width:100%; padding:12px 14px; background:#090e17; border:1px solid #1e293b; border-radius:10px; color:#fff; font-family:'JetBrains Mono',monospace; font-size:0.9rem; outline:none;">
+          <small style="color:var(--muted); font-size:0.75rem; margin-top:4px; display:block;">Found in your Main Dashboard under Organization &gt; Branch Key</small>
+        </div>
+
+        <div style="margin-bottom:22px;">
+          <label style="display:block; font-size:0.82rem; font-weight:700; color:var(--muted); margin-bottom:6px;">Server Address</label>
+          <input type="url" id="inputCloudUrl" required value="{{ config.cloud_url or 'http://127.0.0.1:5100' }}" style="width:100%; padding:12px 14px; background:#090e17; border:1px solid #1e293b; border-radius:10px; color:#fff; font-size:0.88rem; outline:none;">
+        </div>
+
+        <div style="display:flex; gap:10px;">
+          <button type="button" onclick="closeActivationModal()" style="flex:1; padding:12px; background:#1e293b; border:none; border-radius:10px; color:#fff; font-weight:700; cursor:pointer;">Cancel</button>
+          <button type="submit" id="btnActivateSubmit" style="flex:2; padding:12px; background:linear-gradient(135deg, var(--teal), #2b7a78); border:none; border-radius:10px; color:#090e17; font-weight:800; cursor:pointer; font-size:0.95rem;">
+            <i class="fa-solid fa-link me-1"></i> Activate Branch
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MAIN LIVE STAGE -->
+  <main class="main-content">
+    
+    <!-- DYNAMIC CAMERA GRID -->
+    <div id="cameraGrid" class="camera-stage grid-1">
+      <div class="camera-cell">
+        <div class="cam-tag">
+          <div class="cam-live-indicator"></div>
+          <span>Connecting Cameras...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- REAL-TIME DETECTION FEED -->
+    <aside class="ticker-panel">
+      <div class="ticker-header">
+        <div class="ticker-title">
+          <i class="fa-solid fa-bolt" style="color: var(--teal);"></i>
+          <span>Live AI Detections</span>
+        </div>
+        <span id="detectionCounter" class="ticker-count">0 Synced</span>
+      </div>
+      <div id="tickerFeed" class="ticker-list">
+        <div style="text-align: center; color: var(--muted); padding: 40px 0; font-size: 0.85rem;">
+          <i class="fa-solid fa-camera" style="font-size: 2rem; margin-bottom: 12px; display: block; opacity: 0.5;"></i>
+          Waiting for face detections...
+        </div>
+      </div>
+    </aside>
+
+  </main>
+
+  <script>
+    let activeCameras = [];
+
+    async function loadCameras() {
+      try {
+        const res = await fetch('/api/node/cameras');
+        const data = await res.json();
+        if (data.success && data.cameras) {
+          activeCameras = data.cameras;
+          renderCameraGrid();
+        }
+      } catch (e) {
+        console.error("Error loading cameras:", e);
+      }
+    }
+
+    function renderCameraGrid() {
+      const grid = document.getElementById('cameraGrid');
+      if (!activeCameras || activeCameras.length === 0) return;
+
+      grid.className = 'camera-stage';
+      const count = activeCameras.length;
+      if (count === 1) grid.classList.add('grid-1');
+      else if (count === 2) grid.classList.add('grid-2');
+      else if (count <= 4) grid.classList.add('grid-4');
+      else grid.classList.add('grid-6');
+
+      grid.innerHTML = activeCameras.map(cam => `
+        <div class="camera-cell">
+          <div class="cam-tag">
+            <div class="cam-live-indicator"></div>
+            <span>${cam.name}</span>
+          </div>
+          <img src="${cam.stream_url}" alt="${cam.name}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'640\\' height=\\'360\\'><rect width=\\'100%\\' height=\\'100%\\' fill=\\'%23080d14\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%2364748b\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\' font-size=\\'18\\'>Camera Offline</text></svg>'">
+        </div>
+      `).join('');
+    }
+
+    async function pollDetections() {
+      try {
+        const res = await fetch('/api/node/detections');
+        const data = await res.json();
+        if (data.success && data.detections && data.detections.length > 0) {
+          document.getElementById('detectionCounter').textContent = `${data.detections.length} Synced`;
+          const ticker = document.getElementById('tickerFeed');
+          ticker.innerHTML = data.detections.map(item => `
+            <div class="ticker-item">
+              <img class="ticker-photo" src="${item.face_crop || 'data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'80\\' height=\\'80\\'><rect width=\\'100%\\' height=\\'100%\\' fill=\\'%231e293b\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%2394a3b8\\' font-size=\\'24\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>👤</text></svg>'}" alt="${item.name}">
+              <div class="ticker-details">
+                <div class="ticker-name">${item.name}</div>
+                <div class="ticker-meta">
+                  <span>${item.camera_name}</span>
+                  <span class="ticker-pill">${item.confidence}% Match</span>
+                </div>
+              </div>
+              <div class="ticker-time">${item.timestamp}</div>
+            </div>
+          `).join('');
+        }
+      } catch (e) {
+        console.error("Error polling detections:", e);
+      }
+    }
+
+    async function checkCloudStatus() {
+      try {
+        const res = await fetch('/api/node/cloud-status');
+        const data = await res.json();
+        const badge = document.getElementById('cloudStatusBadge');
+        const text = document.getElementById('cloudStatusText');
+        if (data.cloud_connected) {
+          badge.className = 'cloud-status';
+          text.textContent = 'Cloud Connected';
+        } else {
+          badge.className = 'cloud-status offline';
+          text.textContent = 'Offline (Buffered)';
+        }
+      } catch (e) {
+        const badge = document.getElementById('cloudStatusBadge');
+        const text = document.getElementById('cloudStatusText');
+        badge.className = 'cloud-status offline';
+        text.textContent = 'Offline (Buffered)';
+      }
+    }
+
+    function openActivationModal() {
+      document.getElementById('activationModal').style.display = 'flex';
+      document.getElementById('activationAlert').style.display = 'none';
+    }
+
+    function closeActivationModal() {
+      document.getElementById('activationModal').style.display = 'none';
+    }
+
+    async function handleActivationSubmit(e) {
+      e.preventDefault();
+      const btn = document.getElementById('btnActivateSubmit');
+      const alertBox = document.getElementById('activationAlert');
+      const branchKey = document.getElementById('inputBranchKey').value.trim();
+      const cloudUrl = document.getElementById('inputCloudUrl').value.trim();
+
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Activating...';
+      alertBox.style.display = 'none';
+
+      try {
+        const res = await fetch('/api/node/activate-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ branch_key: branchKey, cloud_url: cloudUrl })
+        });
+        const data = await res.json();
+        if (data.success) {
+          alertBox.style.display = 'block';
+          alertBox.style.background = 'rgba(16, 185, 129, 0.15)';
+          alertBox.style.border = '1px solid #10b981';
+          alertBox.style.color = '#34d399';
+          alertBox.textContent = `✓ ${data.message} (${data.camera_count} cameras connected)`;
+          document.getElementById('headerBranchName').textContent = `${data.organization_name} • ${data.branch_name}`;
+
+          setTimeout(() => {
+            closeActivationModal();
+            loadCameras();
+            checkCloudStatus();
+          }, 1200);
+        } else {
+          alertBox.style.display = 'block';
+          alertBox.style.background = 'rgba(239, 68, 68, 0.15)';
+          alertBox.style.border = '1px solid #ef4444';
+          alertBox.style.color = '#f87171';
+          alertBox.textContent = `✗ ${data.error || 'Activation failed'}`;
+        }
+      } catch (err) {
+        alertBox.style.display = 'block';
+        alertBox.style.background = 'rgba(239, 68, 68, 0.15)';
+        alertBox.style.border = '1px solid #ef4444';
+        alertBox.style.color = '#f87171';
+        alertBox.textContent = `✗ Network error: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-link me-1"></i> Activate Branch';
+      }
+    }
+
+    // Startup
+    window.addEventListener('load', () => {
+      loadCameras();
+      setInterval(pollDetections, 1500);
+      setInterval(checkCloudStatus, 5000);
+      checkCloudStatus();
+    });
+  </script>
+</body>
+</html>

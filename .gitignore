@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C extensions
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+ENV310/
+
+# Environment and sensitive keys
+.env
+.env.*
+!.env.example
+.edge_credentials.json
+config_node.json
+!config_node.example.json
+
+# Local runtime data & SQLite databases
+*.db
+*.db-journal
+*.sqlite
+attendance.db*
+database.db*
+
+# Runtime logs
+logs/
+*.log
+
+# Heavy AI model binaries (downloaded dynamically or deployed separately)
+models/
+*.onnx
+*.zip
+*.pt
+*.engine
+*.bin
+
+# Runtime media uploads & local photo caches
+uploads/
+profile_photos/
+static/profile_photos/
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# IDEs & System files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
