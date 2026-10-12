@@ -539,13 +539,25 @@
   <main class="main-content">
     
     <!-- DYNAMIC CAMERA GRID -->
-    <div id="cameraGrid" class="camera-stage grid-1">
-      <div class="camera-cell">
-        <div class="cam-tag">
-          <div class="cam-live-indicator"></div>
-          <span>Connecting Cameras...</span>
+    <div id="cameraGrid" class="camera-stage {% if config.cameras and config.cameras|length == 1 %}grid-1{% elif config.cameras and config.cameras|length == 2 %}grid-2{% elif config.cameras and config.cameras|length <= 4 %}grid-3-4{% else %}grid-multi{% endif %}">
+      {% if config.cameras and config.cameras|length > 0 %}
+        {% for cam in config.cameras %}
+        <div class="camera-cell">
+          <div class="cam-tag">
+            <div class="cam-live-indicator"></div>
+            <span>{{ cam.name or cam.camera_name or 'Live Camera' }}</span>
+          </div>
+          <img src="/stream/{{ cam.id or cam.camera_id }}" alt="{{ cam.name }}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'640\' height=\'360\'><rect width=\'100%\' height=\'100%\' fill=\'%23080d14\'/><text x=\'50%\' y=\'50%\' fill=\'%2364748b\' dominant-baseline=\'middle\' text-anchor=\'middle\' font-size=\'18\'>Connecting Stream...</text></svg>'">
         </div>
-      </div>
+        {% endfor %}
+      {% else %}
+        <div class="camera-cell">
+          <div class="cam-tag">
+            <div class="cam-live-indicator"></div>
+            <span>Connecting Cameras...</span>
+          </div>
+        </div>
+      {% endif %}
     </div>
 
     <!-- REAL-TIME DETECTION FEED -->
@@ -937,13 +949,20 @@
     }
 
     // Startup
-    document.addEventListener('DOMContentLoaded', () => {
+    function initLiveNode() {
       loadCameras();
       loadEmployeesList();
+      checkCloudStatus();
       setInterval(pollDetections, 1500);
       setInterval(checkCloudStatus, 5000);
-      checkCloudStatus();
-    });
+      setInterval(loadCameras, 5000);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initLiveNode);
+    } else {
+      initLiveNode();
+    }
   </script>
 </body>
 </html>

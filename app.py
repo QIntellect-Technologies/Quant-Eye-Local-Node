@@ -465,23 +465,8 @@ class NodeCameraReader:
         with self.lock:
             if self.latest_frame is None:
                 return False, None
-            frame = self.latest_frame.copy()
-            detections = list(self.latest_detections)
-
-        # Draw smooth bounding boxes and name labels
-        for d in detections:
-            x1, y1, x2, y2 = d['bbox']
-            name = d['name']
-            conf = d['confidence']
-            is_match = name != "Unknown"
-            color = (0, 230, 115) if is_match else (0, 140, 255)
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            label = f"{name} ({int(conf * 100)}%)" if is_match else "Verifying..."
-            cv2.rectangle(frame, (x1, y1 - 24), (x1 + len(label) * 9, y1), color, -1)
-            cv2.putText(frame, label, (x1 + 4, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-
-        return True, frame
+            # Return pure, pristine video stream without any bounding box overlays
+            return True, self.latest_frame.copy()
 
     def release(self):
         self.running = False
@@ -500,31 +485,30 @@ def init_camera_streams():
     branch_id = CONFIG.get("branch_id")
     cloud_url = CONFIG.get('cloud_url', 'http://127.0.0.1:5100').rstrip('/')
 
-    # Only fetch branch cameras from Cloud if node has been activated with a valid branch
+    # Fetch branch cameras from Cloud or Portal
     if org_id and branch_id:
+        synced = False
         try:
             cloud_cams_url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={org_id}"
             req = urllib.request.Request(cloud_cams_url, method="GET")
             with urllib.request.urlopen(req, timeout=3.5) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
-                    if "cameras" in data and len(data.get("cameras", [])) > 0:
-                        fetched = data.get("cameras", [])
-                        # Prefer real stream if present
-                        if any(c.get("rtsp_url") and str(c.get("rtsp_url")) != "0" for c in fetched) or not cameras_to_use:
-                            cameras_to_use = fetched
-                            CONFIG["cameras"] = cameras_to_use
-                            try:
-                                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                                    json.dump(CONFIG, f, indent=2)
-                            except Exception:
-                                pass
-                            logger.info(f"[CLOUD CONNECTED] Loaded {len(cameras_to_use)} camera streams configured in Cloud for {org_id} / {branch_id}.")
+                    if "cameras" in data:
+                        cameras_to_use = data.get("cameras", [])
+                        CONFIG["cameras"] = cameras_to_use
+                        try:
+                            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                                json.dump(CONFIG, f, indent=2)
+                        except Exception:
+                            pass
+                        logger.info(f"[CLOUD SYNC] Synchronized {len(cameras_to_use)} cameras from Cloud for {org_id} / {branch_id}.")
+                        synced = True
         except Exception as ce:
-            logger.info(f"[STANDALONE] Cloud camera sync attempt ({ce}).")
+            logger.debug(f"[CLOUD SYNC] Cloud camera query note: {ce}")
 
-        # Secondary direct check: If no cameras or only default webcam, query Client Portal directly
-        if not cameras_to_use or all(str(c.get("rtsp_url", "0")) == "0" for c in cameras_to_use):
+        # Secondary direct check with Client Portal if main cloud query was not reachable
+        if not synced:
             try:
                 portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
                 portal_req = urllib.request.Request(f"{portal_url}/api/cameras?active_only=true", headers={"User-Agent": "QuantEye-Node"})
@@ -532,15 +516,14 @@ def init_camera_streams():
                     if p_resp.status == 200:
                         p_cams = json.loads(p_resp.read().decode('utf-8'))
                         matching = [c for c in p_cams if (not c.get("organization_id") or c.get("organization_id") in (org_id, 'DEFAULT_ORG')) and (not c.get("branch_id") or c.get("branch_id") in (branch_id, 'DEFAULT_BRANCH'))]
-                        if matching:
-                            cameras_to_use = matching
-                            CONFIG["cameras"] = cameras_to_use
-                            try:
-                                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                                    json.dump(CONFIG, f, indent=2)
-                            except Exception:
-                                pass
-                            logger.info(f"[PORTAL SYNC] Loaded {len(matching)} camera streams from Client Portal.")
+                        cameras_to_use = matching
+                        CONFIG["cameras"] = cameras_to_use
+                        try:
+                            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                                json.dump(CONFIG, f, indent=2)
+                        except Exception:
+                            pass
+                        logger.info(f"[PORTAL SYNC] Synchronized {len(matching)} cameras from Client Portal.")
             except Exception as pe:
                 logger.debug(f"Direct portal check: {pe}")
 
