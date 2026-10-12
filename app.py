@@ -70,24 +70,17 @@ CONFIG_PATH = os.path.join(EXE_DIR, 'config_node.json')
 
 def load_config() -> Dict[str, Any]:
     default_cfg = {
-        "organization_id": "ORG-001",
-        "organization_name": "Fork n Knives",
-        "branch_id": "BR-FORK-01",
-        "branch_name": "Global HQ",
+        "linked": False,
+        "organization_id": "",
+        "organization_name": "Unconfigured Node",
+        "branch_id": "",
+        "branch_name": "Setup Required",
+        "branch_key": "",
+        "username": "",
         "cloud_url": "http://127.0.0.1:5100",
         "node_port": 5005,
         "face_match_threshold": 0.45,
-        "cameras": [
-            {
-                "id": "cam_webcam_0",
-                "name": "Live Entrance Camera",
-                "camera_type": "webcam",
-                "rtsp_url": 0,
-                "room_name": "Main Entrance",
-                "channel_number": 1,
-                "active": 1
-            }
-        ]
+        "cameras": []
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -176,42 +169,78 @@ def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: floa
 
 def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str) -> int:
     """
-    Sync client employees and embeddings from local database or cloud for this specific organization & branch.
+    Sync client employees from Cloud for this specific organization & branch.
     Strict tenant isolation: ensures profiles strictly belong to org_id and branch_id.
     """
-    try:
-        # Check if local database already has users scoped to this branch
-        with sqlite3.connect(db.DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM users WHERE organization_id = ? AND branch_id = ?", (org_id, branch_id))
-            scoped_count = cur.fetchone()[0]
+    if not org_id or not branch_id:
+        return 0
 
-            # If node DB doesn't have them yet, check if master Local-Dashboard has them
-            if scoped_count == 0:
-                master_db = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Local-Dashboard", "attendance.db"))
-                if os.path.exists(master_db):
-                    with sqlite3.connect(master_db) as mconn:
-                        mcur = mconn.cursor()
-                        mcur.execute("SELECT id, name, email, department, active, organization_id, branch_id FROM users WHERE organization_id = ? AND branch_id = ?", (org_id, branch_id))
-                        musers = mcur.fetchall()
-                        for u in musers:
+    cloud_clean = cloud_url.rstrip('/')
+    imported_count = 0
+
+    # 1. Fetch branch employees directly from Cloud API
+    try:
+        req_url = f"{cloud_clean}/api/branches/{branch_id}/employees?organization_id={org_id}"
+        req = urllib.request.Request(req_url, method="GET")
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                employees = data.get("employees", [])
+                with sqlite3.connect(db.DB_PATH) as conn:
+                    cur = conn.cursor()
+                    try: cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
+                    except Exception: pass
+                    try: cur.execute("ALTER TABLE users ADD COLUMN branch_id TEXT")
+                    except Exception: pass
+
+                    for emp in employees:
+                        emp_name = emp.get("name") or "Employee"
+                        emp_code = emp.get("employee_code") or f"EMP-{emp.get('id')}"
+                        dept = emp.get("department") or "General"
+                        pos = emp.get("position") or ""
+
+                        cur.execute("""
+                            SELECT id FROM users 
+                            WHERE (notes = ? OR name = ?) AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')
+                        """, (emp_code, emp_name, org_id))
+                        row = cur.fetchone()
+                        if row:
                             cur.execute("""
-                                INSERT OR REPLACE INTO users (id, name, email, department, active, organization_id, branch_id)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """, u)
-                            # Copy embeddings
-                            mcur.execute("SELECT id, user_id, embedding, source_video, created_at FROM embeddings WHERE user_id = ?", (u[0],))
-                            membs = mcur.fetchall()
-                            for emb in membs:
-                                cur.execute("""
-                                    INSERT OR REPLACE INTO embeddings (id, user_id, embedding, source_video, created_at)
-                                    VALUES (?, ?, ?, ?, ?)
-                                """, emb)
-                        conn.commit()
-                        logger.info(f"[TENANT SYNC] Imported {len(musers)} employees and embeddings for {org_id} / {branch_id}")
-    except Exception as e:
-        logger.warning(f"Could not synchronize employee profiles: {e}")
-    return 0
+                                UPDATE users SET name = ?, department = ?, position = ?, organization_id = ?, branch_id = ?, active = 1
+                                WHERE id = ?
+                            """, (emp_name, dept, pos, org_id, branch_id, row[0]))
+                        else:
+                            cur.execute("""
+                                INSERT INTO users (name, department, position, notes, active, organization_id, branch_id)
+                                VALUES (?, ?, ?, ?, 1, ?, ?)
+                            """, (emp_name, dept, pos, emp_code, org_id, branch_id))
+                        imported_count += 1
+                    conn.commit()
+                logger.info(f"[CLOUD SYNC] Synced {imported_count} employees from Cloud for {org_id} / {branch_id}")
+                return imported_count
+    except Exception as ce:
+        logger.warning(f"[CLOUD SYNC OFFLINE] Could not fetch employees from Cloud ({ce}). Falling back to local.")
+
+    # 2. Fallback to local DB if available
+    try:
+        master_db = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Local-Dashboard", "attendance.db"))
+        if os.path.exists(master_db):
+            with sqlite3.connect(master_db) as mconn, sqlite3.connect(db.DB_PATH) as conn:
+                mcur = mconn.cursor()
+                cur = conn.cursor()
+                mcur.execute("SELECT id, name, email, department, active, organization_id, branch_id FROM users WHERE organization_id = ? AND branch_id = ?", (org_id, branch_id))
+                musers = mcur.fetchall()
+                for u in musers:
+                    cur.execute("""
+                        INSERT OR REPLACE INTO users (id, name, email, department, active, organization_id, branch_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, u)
+                conn.commit()
+                imported_count = len(musers)
+    except Exception as le:
+        logger.warning(f"Could not sync from local database: {le}")
+
+    return imported_count
 
 
 def reload_face_cache():
@@ -293,7 +322,12 @@ class NodeCameraReader:
         
         if self.is_webcam:
             self.rtsp_url = int(rtsp_source)
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
+            try:
+                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
+                if not self.cap.isOpened():
+                    self.cap = cv2.VideoCapture(self.rtsp_url)
+            except Exception:
+                self.cap = cv2.VideoCapture()
         else:
             self.rtsp_url = str(rtsp_source)
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
@@ -314,12 +348,19 @@ class NodeCameraReader:
         threading.Thread(target=self._ai_loop, daemon=True).start()
 
     def _grabber_loop(self):
+        last_reconnect_attempt = 0
         while self.running:
             if not self.cap.isOpened():
-                if self.is_webcam:
-                    self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
-                else:
-                    self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                now = time.time()
+                if now - last_reconnect_attempt > 5.0:
+                    last_reconnect_attempt = now
+                    try:
+                        if self.is_webcam:
+                            self.cap = cv2.VideoCapture(self.rtsp_url)
+                        else:
+                            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                    except Exception:
+                        pass
                 time.sleep(1.0)
                 continue
             ret, frame = self.cap.read()
@@ -455,18 +496,30 @@ def init_camera_streams():
     global ACTIVE_CAMERA_READERS
     cameras_to_use = CONFIG.get("cameras", [])
 
-    # Try fetching active cameras from Cloud
-    try:
-        cloud_cams_url = f"{CONFIG.get('cloud_url', 'http://127.0.0.1:5100').rstrip('/')}/api/branches/{CONFIG.get('branch_id', 'BR-FORK-01')}/cameras?organization_id={CONFIG.get('organization_id', 'ORG-001')}"
-        req = urllib.request.Request(cloud_cams_url, method="GET")
-        with urllib.request.urlopen(req, timeout=2.5) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode('utf-8'))
-                if data.get("cameras"):
-                    cameras_to_use = data["cameras"]
-                    logger.info(f"[CLOUD CONNECTED] Loaded {len(cameras_to_use)} camera streams configured in Cloud.")
-    except Exception as ce:
-        logger.info(f"[STANDALONE] Cloud unreachable ({ce}). Starting with local camera config.")
+    org_id = CONFIG.get("organization_id")
+    branch_id = CONFIG.get("branch_id")
+    cloud_url = CONFIG.get('cloud_url', 'http://127.0.0.1:5100').rstrip('/')
+
+    # Only fetch branch cameras from Cloud if node has been activated with a valid branch
+    if org_id and branch_id:
+        try:
+            cloud_cams_url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={org_id}"
+            req = urllib.request.Request(cloud_cams_url, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    if "cameras" in data:
+                        cameras_to_use = data.get("cameras", [])
+                        CONFIG["cameras"] = cameras_to_use
+                        # Persist fetched cameras
+                        try:
+                            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                                json.dump(CONFIG, f, indent=2)
+                        except Exception:
+                            pass
+                        logger.info(f"[CLOUD CONNECTED] Loaded {len(cameras_to_use)} camera streams configured in Cloud for {org_id} / {branch_id}.")
+        except Exception as ce:
+            logger.info(f"[STANDALONE] Cloud unreachable or offline ({ce}). Operating with local camera config.")
 
     with readers_lock:
         for reader in ACTIVE_CAMERA_READERS.values():
@@ -474,12 +527,12 @@ def init_camera_streams():
         ACTIVE_CAMERA_READERS.clear()
 
         for cam in cameras_to_use:
-            cid = str(cam.get("id"))
-            cname = cam.get("name", f"Camera {cid}")
+            cid = str(cam.get("id") or cam.get("camera_id"))
+            cname = cam.get("name") or cam.get("camera_name", f"Camera {cid}")
             source = cam.get("rtsp_url", 0)
             try:
                 ACTIVE_CAMERA_READERS[cid] = NodeCameraReader(cid, cname, source)
-                logger.info(f"Started camera stream reader: {cname} ({cid})")
+                logger.info(f"Started camera stream reader: {cname} ({cid}) -> {source}")
             except Exception as e:
                 logger.error(f"Failed to start camera {cid}: {e}")
 
@@ -702,6 +755,344 @@ def api_node_activate_key():
     Delegates to full api_node_login_auth flow.
     """
     return api_node_login_auth()
+
+
+@app.route('/api/node/cameras/refresh', methods=['POST', 'GET'])
+def api_node_cameras_refresh():
+    """Dynamically re-pull cloud camera settings and reload local streams."""
+    try:
+        init_camera_streams()
+        with readers_lock:
+            cams = [
+                {"id": cid, "name": r.camera_name, "stream_url": f"/stream/{cid}"}
+                for cid, r in ACTIVE_CAMERA_READERS.items()
+            ]
+        return jsonify({
+            "success": True,
+            "message": f"Successfully re-synced {len(cams)} cameras from Cloud",
+            "camera_count": len(cams),
+            "cameras": cams
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/node/employees', methods=['GET'])
+def api_node_list_employees():
+    """
+    List enrolled employees strictly for this configured branch/node with embedding status.
+    """
+    org_id = CONFIG.get("organization_id", "")
+    branch_id = CONFIG.get("branch_id", "")
+    try:
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            # Auto-ensure columns
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
+            except Exception: pass
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN branch_id TEXT")
+            except Exception: pass
+
+            if org_id and branch_id:
+                cur.execute("""
+                    SELECT u.id, u.name, COALESCE(u.department, ''), COALESCE(u.position, ''), 
+                           COALESCE(u.notes, ''), COUNT(e.id) as emb_count
+                    FROM users u
+                    LEFT JOIN embeddings e ON u.id = e.user_id
+                    WHERE (u.organization_id = ? AND u.branch_id = ?) 
+                       OR (u.organization_id IS NULL OR u.organization_id = '')
+                    GROUP BY u.id
+                    ORDER BY u.id DESC
+                """, (org_id, branch_id))
+            else:
+                cur.execute("""
+                    SELECT u.id, u.name, COALESCE(u.department, ''), COALESCE(u.position, ''), 
+                           COALESCE(u.notes, ''), COUNT(e.id) as emb_count
+                    FROM users u
+                    LEFT JOIN embeddings e ON u.id = e.user_id
+                    GROUP BY u.id
+                    ORDER BY u.id DESC
+                """)
+            rows = cur.fetchall()
+            employees = [{
+                "id": r[0],
+                "name": r[1],
+                "department": r[2],
+                "position": r[3],
+                "employee_code": r[4] or f"EMP-{r[0]}",
+                "embedding_count": r[5],
+                "has_embedding": (r[5] > 0)
+            } for r in rows]
+            return jsonify({"success": True, "employees": employees, "count": len(employees)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/node/employees/enroll', methods=['POST'])
+def api_node_enroll_employee():
+    """
+    Manually enroll an employee with face image:
+    1. Extracts 512-dim InsightFace embedding
+    2. Saves to local SQLite database scoped strictly to this branch
+    3. Reloads in-memory face recognition cache
+    """
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    emp_code = (data.get("employee_code") or "").strip()
+    dept = (data.get("department") or "General").strip()
+    photo_b64 = data.get("image_base64") or data.get("photo")
+
+    if not name:
+        return jsonify({"success": False, "error": "Employee name is required"}), 400
+    if not photo_b64:
+        return jsonify({"success": False, "error": "Face photo is required for embedding generation"}), 400
+
+    try:
+        # Decode base64 image
+        if ',' in photo_b64:
+            photo_b64 = photo_b64.split(',', 1)[1]
+        img_bytes = base64.b64decode(photo_b64)
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            return jsonify({"success": False, "error": "Could not decode image file"}), 400
+
+        # Extract InsightFace embedding
+        extracted = fp.detect_and_extract_insightface(img)
+        if not extracted or extracted[0].get('embedding') is None:
+            return jsonify({"success": False, "error": "No clear face detected in the uploaded photo. Please ensure face is centered and well-lit."}), 400
+
+        embedding_vec = extracted[0]['embedding'].tolist()
+
+        org_id = CONFIG.get("organization_id", "")
+        branch_id = CONFIG.get("branch_id", "")
+
+        # Save to database
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            # Ensure columns
+            try: cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
+            except Exception: pass
+            try: cur.execute("ALTER TABLE users ADD COLUMN branch_id TEXT")
+            except Exception: pass
+
+            # Insert or update user
+            cur.execute("""
+                INSERT INTO users (name, department, notes, active, organization_id, branch_id)
+                VALUES (?, ?, ?, 1, ?, ?)
+            """, (name, dept, emp_code, org_id, branch_id))
+            user_id = cur.lastrowid
+
+            # Save embedding
+            cur.execute(
+                "INSERT INTO embeddings (user_id, embedding, source_video) VALUES (?, ?, ?)",
+                (user_id, json.dumps(embedding_vec).encode(), "manual_enrollment")
+            )
+            conn.commit()
+
+        # Instantly refresh memory cache
+        reload_face_cache()
+        logger.info(f"[ENROLL SUCCESS] Enrolled employee '{name}' (ID {user_id}) for {org_id} / {branch_id}")
+
+        return jsonify({
+            "success": True,
+            "message": f"Successfully enrolled '{name}'! Face embedding generated and cached for live attendance.",
+            "user_id": user_id,
+            "name": name,
+            "department": dept
+        }), 201
+
+    except Exception as e:
+        logger.error(f"Error enrolling employee: {e}")
+        return jsonify({"success": False, "error": f"Enrollment error: {str(e)}"}), 500
+
+
+@app.route('/api/node/embeddings/import', methods=['POST'])
+def api_node_import_embeddings():
+    """
+    Import embeddings file (JSON) to activate face recognition for specific employees.
+    Supports formats:
+    [
+      { "name": "John Doe", "employee_code": "EMP-01", "embedding": [...] }, ...
+    ]
+    or dict mapping:
+    {
+      "EMP-01": [...], or "John Doe": [...]
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    items = data.get("embeddings") or data.get("profiles") or data
+    if not items:
+        return jsonify({"success": False, "error": "No embeddings data found in payload"}), 400
+
+    org_id = CONFIG.get("organization_id", "")
+    branch_id = CONFIG.get("branch_id", "")
+    imported = 0
+    errors = []
+
+    try:
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            try: cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
+            except Exception: pass
+            try: cur.execute("ALTER TABLE users ADD COLUMN branch_id TEXT")
+            except Exception: pass
+
+            # Handle list of employee embedding records
+            if isinstance(items, list):
+                for item in items:
+                    name = (item.get("name") or "").strip()
+                    emp_code = (item.get("employee_code") or item.get("id") or "").strip()
+                    emb = item.get("embedding")
+                    dept = item.get("department") or "General"
+
+                    if not emb or not (name or emp_code):
+                        continue
+
+                    # Match existing cloud-synced user by code or name
+                    cur.execute("""
+                        SELECT id, name FROM users 
+                        WHERE (notes = ? OR name = ?) 
+                          AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')
+                    """, (emp_code, name, org_id))
+                    row = cur.fetchone()
+
+                    if row:
+                        u_id = row[0]
+                    else:
+                        cur.execute("""
+                            INSERT INTO users (name, department, notes, active, organization_id, branch_id)
+                            VALUES (?, ?, ?, 1, ?, ?)
+                        """, (name or emp_code, dept, emp_code, org_id, branch_id))
+                        u_id = cur.lastrowid
+
+                    # Replace old embeddings for this employee and insert new
+                    cur.execute("DELETE FROM embeddings WHERE user_id = ?", (u_id,))
+                    cur.execute(
+                        "INSERT INTO embeddings (user_id, embedding, source_video) VALUES (?, ?, ?)",
+                        (u_id, json.dumps(emb).encode(), "imported_embedding")
+                    )
+                    imported += 1
+
+            # Handle dict format: {"EMP-01": [512 floats]}
+            elif isinstance(items, dict):
+                for key, emb in items.items():
+                    if not isinstance(emb, list): continue
+                    # Find user by code or name
+                    cur.execute("""
+                        SELECT id, name FROM users 
+                        WHERE (notes = ? OR name = ?) 
+                          AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')
+                    """, (key, key, org_id))
+                    row = cur.fetchone()
+                    if row:
+                        u_id = row[0]
+                    else:
+                        cur.execute("""
+                            INSERT INTO users (name, department, notes, active, organization_id, branch_id)
+                            VALUES (?, 'General', ?, 1, ?, ?)
+                        """, (key, key, org_id, branch_id))
+                        u_id = cur.lastrowid
+
+                    cur.execute("DELETE FROM embeddings WHERE user_id = ?", (u_id,))
+                    cur.execute(
+                        "INSERT INTO embeddings (user_id, embedding, source_video) VALUES (?, ?, ?)",
+                        (u_id, json.dumps(emb).encode(), "imported_embedding")
+                    )
+                    imported += 1
+
+            conn.commit()
+
+        reload_face_cache()
+        logger.info(f"[IMPORT SUCCESS] Imported and activated {imported} employee embeddings.")
+
+        return jsonify({
+            "success": True,
+            "message": f"Successfully imported {imported} employee embeddings! AI will now recognize these staff members.",
+            "imported_count": imported
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error importing embeddings: {e}")
+        return jsonify({"success": False, "error": f"Import error: {str(e)}"}), 500
+
+
+@app.route('/api/node/embeddings/export', methods=['GET'])
+def api_node_export_embeddings():
+    """Export all currently enrolled embeddings for this branch to JSON."""
+    org_id = CONFIG.get("organization_id", "")
+    branch_id = CONFIG.get("branch_id", "")
+    try:
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT u.id, u.name, COALESCE(u.notes, ''), COALESCE(u.department, ''), e.embedding
+                FROM users u
+                JOIN embeddings e ON u.id = e.user_id
+                WHERE (u.organization_id = ? AND u.branch_id = ?)
+                   OR (u.organization_id IS NULL OR u.organization_id = '')
+            """, (org_id, branch_id))
+            rows = cur.fetchall()
+            export_list = []
+            for r in rows:
+                try:
+                    emb = json.loads(r[4].decode()) if isinstance(r[4], bytes) else json.loads(r[4])
+                    export_list.append({
+                        "id": r[0],
+                        "name": r[1],
+                        "employee_code": r[2] or f"EMP-{r[0]}",
+                        "department": r[3],
+                        "embedding": emb
+                    })
+                except Exception:
+                    pass
+        return jsonify({
+            "success": True,
+            "branch_id": branch_id,
+            "organization_id": org_id,
+            "count": len(export_list),
+            "embeddings": export_list
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/node/employees/delete', methods=['POST'])
+def api_node_delete_employee():
+    """Remove employee and their embeddings."""
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id required"}), 400
+    try:
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM embeddings WHERE user_id = ?", (user_id,))
+            cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+        reload_face_cache()
+        return jsonify({"success": True, "message": "Employee removed successfully"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/node/employees/sync', methods=['POST'])
+def api_node_sync_employees():
+    """Sync profiles from Cloud or local master."""
+    org_id = CONFIG.get("organization_id", "")
+    branch_id = CONFIG.get("branch_id", "")
+    cloud_url = CONFIG.get("cloud_url", "http://127.0.0.1:5100")
+    if not org_id or not branch_id:
+        return jsonify({"success": False, "error": "Node must be activated with branch key first"}), 400
+    try:
+        sync_client_profiles_from_cloud(org_id, branch_id, cloud_url)
+        reload_face_cache()
+        return jsonify({"success": True, "message": "Profiles synchronized successfully"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 def start_client_node(port: int = 5005):

@@ -20,7 +20,7 @@
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: 'Outfit', sans-serif;
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: var(--bg);
       color: var(--text);
       height: 100vh;
@@ -31,16 +31,16 @@
 
     /* TOP BAR */
     .header {
-      height: 60px;
-      background: rgba(17, 25, 39, 0.85);
+      height: 62px;
+      background: rgba(17, 25, 39, 0.95);
       backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 24px;
+      padding: 0 20px;
       flex-shrink: 0;
-      z-index: 10;
+      z-index: 100;
     }
     .brand {
       display: flex;
@@ -52,24 +52,25 @@
     }
     .brand-badge {
       background: linear-gradient(135deg, var(--teal), #2b7a78);
-      width: 36px;
-      height: 36px;
+      width: 38px;
+      height: 38px;
       border-radius: 10px;
       display: flex;
       align-items: center;
       justify-content: center;
       box-shadow: 0 0 15px var(--teal-glow);
+      font-size: 1.1rem;
     }
     .brand span { color: var(--teal); }
 
     .node-info {
       display: flex;
       align-items: center;
-      gap: 20px;
+      gap: 12px;
       font-size: 0.9rem;
     }
     .branch-pill {
-      background: rgba(30, 41, 59, 0.7);
+      background: rgba(30, 41, 59, 0.75);
       padding: 6px 14px;
       border-radius: 20px;
       border: 1px solid var(--border);
@@ -77,6 +78,13 @@
       align-items: center;
       gap: 8px;
       font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.2s;
+    }
+    .branch-pill:hover {
+      border-color: var(--teal);
+      background: rgba(58, 175, 169, 0.15);
     }
     .cloud-status {
       display: flex;
@@ -89,6 +97,7 @@
       background: rgba(16, 185, 129, 0.1);
       border: 1px solid rgba(16, 185, 129, 0.3);
       color: #34d399;
+      user-select: none;
     }
     .cloud-status.offline {
       background: rgba(239, 68, 68, 0.1);
@@ -108,6 +117,36 @@
       50% { opacity: 0.4; transform: scale(0.85); }
     }
 
+    .btn-top {
+      background: rgba(58,175,169,0.2);
+      border: 1px solid var(--teal);
+      color: var(--teal);
+      border-radius: 10px;
+      padding: 8px 14px;
+      font-weight: 700;
+      font-size: 0.88rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      transition: all 0.2s;
+      user-select: none;
+    }
+    .btn-top:hover {
+      background: var(--teal);
+      color: #090e17;
+      box-shadow: 0 0 12px var(--teal-glow);
+    }
+    .btn-top-secondary {
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .btn-top-secondary:hover {
+      background: #1e293b;
+      color: #fff;
+    }
+
     /* MAIN CONTAINER */
     .main-content {
       flex: 1;
@@ -118,7 +157,7 @@
       overflow: hidden;
     }
 
-    /* CAMERA GRID - RESPONSIVE ARBITRARY CAMERA COUNT */
+    /* CAMERA GRID */
     .camera-stage {
       background: #060a10;
       border: 1px solid var(--border);
@@ -145,6 +184,7 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      min-height: 200px;
     }
     .camera-cell img {
       width: 100%;
@@ -166,6 +206,7 @@
       align-items: center;
       gap: 6px;
       backdrop-filter: blur(8px);
+      z-index: 2;
     }
     .cam-live-indicator {
       width: 6px;
@@ -273,6 +314,53 @@
       border-radius: 8px;
       border: 1px solid rgba(16, 185, 129, 0.3);
     }
+
+    /* MODAL BASE */
+    .modal-backdrop {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0, 0, 0, 0.85);
+      z-index: 99999;
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-box {
+      background: #111927;
+      border: 1px solid #1e293b;
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: 0 25px 60px rgba(0,0,0,0.6);
+      text-align: left;
+      position: relative;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    .form-label {
+      display: block;
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .form-input {
+      width: 100%;
+      padding: 10px 14px;
+      background: #090e17;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 0.88rem;
+      outline: none;
+      box-sizing: border-box;
+    }
+    .form-input:focus {
+      border-color: var(--teal);
+    }
   </style>
 </head>
 <body>
@@ -280,63 +368,86 @@
   <!-- TOP HEADER -->
   <header class="header">
     <div class="brand">
-      <div class="brand-badge"><i class="fa-solid fa-eye"></i></div>
+      <div class="brand-badge">⚡</div>
       <div>QuantEye <span>AI Node</span></div>
     </div>
 
     <div class="node-info">
-      <div class="branch-pill" id="branchDisplayPill" style="cursor:pointer;" title="Click to Switch / Activate Branch Key">
-        <i class="fa-solid fa-key" style="color:var(--teal)"></i>
-        <span id="headerBranchName">{{ config.organization_name }} &bull; {{ config.branch_name }}</span>
+      <!-- Clickable Branch Switch Pill -->
+      <div class="branch-pill" id="branchDisplayPill" onclick="openActivationModal()" title="Click to Connect or Switch Branch Key">
+        <span style="color:var(--teal)">🔑</span>
+        <span id="headerBranchName">
+          {% if config.linked %}
+            {{ config.organization_name }} &bull; {{ config.branch_name }}
+          {% else %}
+            Unconfigured Node &bull; Setup Required
+          {% endif %}
+        </span>
       </div>
+
+      <!-- Cloud Status Badge -->
       <div id="cloudStatusBadge" class="cloud-status">
         <div class="status-dot"></div>
-        <span id="cloudStatusText">Cloud Connected</span>
+        <span id="cloudStatusText">Connecting...</span>
       </div>
-      <button id="btnOpenKeySetup" type="button" style="background:rgba(58,175,169,0.25); border:1px solid var(--teal); color:var(--teal); border-radius:10px; padding:8px 16px; font-weight:700; font-size:0.9rem; cursor:pointer; display:inline-flex; align-items:center; gap:8px;">
-        <i class="fa-solid fa-sliders"></i> Key Setup
+
+      <!-- Button: Fetch Cameras from Cloud -->
+      <button type="button" class="btn-top btn-top-secondary" onclick="refreshCamerasFromCloud()" title="Re-fetch cameras configured in Cloud Dashboard">
+        🔄 Fetch Cameras
+      </button>
+
+      <!-- Button: Import Embeddings & Manage Staff -->
+      <button type="button" class="btn-top" onclick="openEmployeesModal()" title="Import Embeddings & Sync Cloud Staff">
+        📥 Import Embeddings (<span id="topEmbCount">0</span>)
+      </button>
+
+      <!-- Button: Activation / Key Setup -->
+      <button type="button" class="btn-top" onclick="openActivationModal()" title="Branch Key &amp; Cloud Connection">
+        ⚙️ Key Setup
       </button>
     </div>
   </header>
 
-  <!-- ACTIVATION / KEY SETUP MODAL -->
-  <div id="activationModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.85); z-index:999999; backdrop-filter:blur(8px); align-items:center; justify-content:center;">
-    <div style="background:#111927; border:1px solid #1e293b; border-radius:20px; width:min(480px, calc(100% - 32px)); padding:32px; box-shadow:0 20px 50px rgba(0,0,0,0.5); text-align:left; position:relative; z-index:1000000;">
+  <!-- ============================================================== -->
+  <!-- MODAL 1: ACTIVATION & BRANCH KEY SETUP                         -->
+  <!-- ============================================================== -->
+  <div id="activationModal" class="modal-backdrop" style="{% if config.linked %}display:none;{% else %}display:flex;{% endif %}">
+    <div class="modal-box" style="width:min(500px, calc(100% - 32px));">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-        <div style="display:flex; align-items:center; gap:10px;">
-          <div style="background:var(--teal); width:36px; height:36px; border-radius:10px; display:flex; align-items:center; justify-content:center; color:#090e17; font-size:1.1rem; font-weight:800;">
-            <i class="fa-solid fa-building-circle-check"></i>
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div style="background:var(--teal); width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center; color:#090e17; font-size:1.2rem; font-weight:800;">
+            🏢
           </div>
           <div>
-            <h3 style="font-size:1.15rem; font-weight:800; color:#fff; margin:0;">Client Branch Activation</h3>
+            <h3 style="font-size:1.18rem; font-weight:800; color:#fff; margin:0;">Client Branch Activation</h3>
             <span style="font-size:0.8rem; color:var(--muted);">Connect this AI Node to your Organization</span>
           </div>
         </div>
-        <button id="btnCloseModalX" type="button" style="background:none; border:none; color:var(--muted); font-size:1.5rem; cursor:pointer; line-height:1;">&times;</button>
+        <button type="button" onclick="closeActivationModal()" style="background:none; border:none; color:var(--muted); font-size:1.6rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
 
       <div id="activationAlert" style="display:none; padding:12px; border-radius:10px; margin-bottom:16px; font-size:0.85rem; font-weight:600;"></div>
 
       <form onsubmit="handleActivationSubmit(event)">
         <div style="margin-bottom:14px;">
-          <label style="display:block; font-size:0.82rem; font-weight:700; color:var(--muted); margin-bottom:6px;">Username / Client Email</label>
-          <input type="text" id="inputUsername" placeholder="e.g. admin@organization.com" value="{{ config.username or '' }}" style="width:100%; padding:10px 14px; background:#090e17; border:1px solid #1e293b; border-radius:10px; color:#fff; font-size:0.88rem; outline:none;">
+          <label class="form-label">Username / Client Email</label>
+          <input type="text" id="inputUsername" placeholder="e.g. admin@organization.com" value="{{ config.username or '' }}" class="form-input">
         </div>
 
         <div style="margin-bottom:14px;">
-          <label style="display:block; font-size:0.82rem; font-weight:700; color:var(--muted); margin-bottom:6px;">Client Password</label>
-          <input type="password" id="inputPassword" placeholder="••••••••" style="width:100%; padding:10px 14px; background:#090e17; border:1px solid #1e293b; border-radius:10px; color:#fff; font-size:0.88rem; outline:none;">
+          <label class="form-label">Client Password</label>
+          <input type="password" id="inputPassword" placeholder="••••••••" class="form-input">
         </div>
 
         <div style="margin-bottom:14px;">
-          <label style="display:block; font-size:0.82rem; font-weight:700; color:var(--muted); margin-bottom:6px;">Branch Key (from Cloud Dashboard)</label>
-          <input type="text" id="inputBranchKey" required placeholder="e.g. QE-A03FEAD2A7AA433A9742" value="{{ config.branch_key or '' }}" style="width:100%; padding:10px 14px; background:#090e17; border:1px solid #1e293b; border-radius:10px; color:#fff; font-family:'JetBrains Mono',monospace; font-size:0.88rem; outline:none;">
-          <small style="color:var(--muted); font-size:0.75rem; margin-top:4px; display:block;">Found in your Dashboard under Organization &gt; Branch Key</small>
+          <label class="form-label">Branch Key (from Cloud Dashboard)</label>
+          <input type="text" id="inputBranchKey" required placeholder="e.g. QE-A03FEAD2A7AA433A9742" value="{{ config.branch_key or '' }}" class="form-input" style="font-family:'JetBrains Mono',monospace;">
+          <small style="color:var(--muted); font-size:0.75rem; margin-top:4px; display:block;">Found in Cloud Dashboard under Organization &gt; Branch Key</small>
         </div>
 
         <div style="margin-bottom:20px;">
-          <label style="display:block; font-size:0.82rem; font-weight:700; color:var(--muted); margin-bottom:6px;">Cloud Server URL</label>
-          <input type="url" id="inputCloudUrl" required value="{{ config.cloud_url or 'http://127.0.0.1:5100' }}" style="width:100%; padding:10px 14px; background:#090e17; border:1px solid #1e293b; border-radius:10px; color:#fff; font-size:0.88rem; outline:none;">
+          <label class="form-label">Cloud Server URL</label>
+          <input type="url" id="inputCloudUrl" required value="{{ config.cloud_url or 'http://127.0.0.1:5100' }}" class="form-input">
         </div>
 
         <div style="display:flex; gap:10px;">
@@ -344,12 +455,84 @@
           <button type="button" onclick="closeActivationModal()" style="flex:1; padding:12px; background:#1e293b; border:none; border-radius:10px; color:#fff; font-weight:700; cursor:pointer;">Cancel</button>
           {% endif %}
           <button type="submit" id="btnActivateSubmit" style="flex:2; padding:12px; background:linear-gradient(135deg, var(--teal), #2b7a78); border:none; border-radius:10px; color:#090e17; font-weight:800; cursor:pointer; font-size:0.95rem;">
-            <i class="fa-solid fa-link me-1"></i> Connect &amp; Authenticate
+            🔗 Connect &amp; Authenticate
           </button>
         </div>
       </form>
     </div>
   </div>
+
+
+  <!-- ============================================================== -->
+  <!-- MODAL 2: EMBEDDINGS IMPORT & CLOUD EMPLOYEES                   -->
+  <!-- ============================================================== -->
+  <div id="employeesModal" class="modal-backdrop" style="display:none;">
+    <div class="modal-box" style="width:min(700px, calc(100% - 32px));">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px;">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div style="background:var(--teal); width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center; color:#090e17; font-size:1.2rem; font-weight:800;">
+            📥
+          </div>
+          <div>
+            <h3 style="font-size:1.18rem; font-weight:800; color:#fff; margin:0;">Import Embeddings &amp; Branch Staff</h3>
+            <span style="font-size:0.8rem; color:var(--muted);">Cloud employees auto-sync; import embeddings to activate AI recognition for specific employees</span>
+          </div>
+        </div>
+        <button type="button" onclick="closeEmployeesModal()" style="background:none; border:none; color:var(--muted); font-size:1.6rem; cursor:pointer; line-height:1;">&times;</button>
+      </div>
+
+      <div id="enrollAlert" style="display:none; padding:12px; border-radius:10px; margin-bottom:14px; font-size:0.85rem; font-weight:600;"></div>
+
+      <!-- Action Tabs: Quick Import Embeddings / View Staff & Active Embeddings -->
+      <div style="display:flex; gap:10px; border-bottom:1px solid #1e293b; padding-bottom:12px; margin-bottom:18px; align-items:center;">
+        <button type="button" id="tabBtnImport" onclick="switchEnrollTab('import')" style="padding:8px 16px; background:var(--teal); color:#090e17; border:none; border-radius:8px; font-weight:700; font-size:0.88rem; cursor:pointer;">
+          📥 Import Embeddings File
+        </button>
+        <button type="button" id="tabBtnList" onclick="switchEnrollTab('list')" style="padding:8px 16px; background:#1e293b; color:var(--text); border:none; border-radius:8px; font-weight:700; font-size:0.88rem; cursor:pointer;">
+          👥 Branch Staff (<span id="staffCountBadge">0</span>)
+        </button>
+        <button type="button" onclick="syncProfilesFromCloud()" style="margin-left:auto; padding:8px 14px; background:rgba(58,175,169,0.15); border:1px solid var(--teal); color:var(--teal); border-radius:8px; font-weight:700; font-size:0.85rem; cursor:pointer;">
+          ☁️ Sync Cloud Staff
+        </button>
+      </div>
+
+      <!-- TAB 1: IMPORT EMBEDDINGS (JSON / FILE) -->
+      <div id="tabContentImport">
+        <div style="background:#090e17; border:1px solid #1e293b; border-radius:14px; padding:20px; margin-bottom:18px;">
+          <h4 style="font-size:1rem; color:#fff; margin-bottom:6px;">Select Exported Embeddings File</h4>
+          <p style="font-size:0.82rem; color:var(--muted); margin-bottom:14px;">
+            Upload your exported embeddings JSON file. The node will automatically map embeddings to your Cloud employees by Name or Employee ID and activate AI recognition <b>strictly for only those employees</b>.
+          </p>
+
+          <div style="border:2px dashed #334155; border-radius:12px; padding:24px; text-align:center; background:rgba(17,25,39,0.5); cursor:pointer;" onclick="document.getElementById('fileEmbeddingsInput').click()">
+            <div style="font-size:2rem; margin-bottom:8px;">📁</div>
+            <div style="font-weight:700; color:#fff; font-size:0.95rem; margin-bottom:4px;">Click to select Embeddings File (.json)</div>
+            <div id="selectedFileName" style="font-size:0.8rem; color:var(--teal);">Supports JSON list of profiles or key-value embeddings</div>
+            <input type="file" id="fileEmbeddingsInput" accept=".json,application/json" style="display:none;" onchange="handleEmbeddingsFileSelect(event)">
+          </div>
+        </div>
+
+        <button type="button" id="btnSubmitImport" onclick="submitEmbeddingsImport()" style="width:100%; padding:13px; background:linear-gradient(135deg, var(--teal), #2b7a78); border:none; border-radius:10px; color:#090e17; font-weight:800; cursor:pointer; font-size:0.95rem;">
+          ⚡ Import &amp; Activate Embeddings for Recognition
+        </button>
+      </div>
+
+      <!-- TAB 2: STAFF LIST & STATUS -->
+      <div id="tabContentList" style="display:none;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <span style="font-size:0.82rem; color:var(--muted);">Employees fetched from Cloud for this Branch:</span>
+          <button type="button" onclick="exportCurrentEmbeddings()" style="padding:4px 10px; background:#1e293b; border:1px solid #334155; color:var(--teal); border-radius:6px; font-size:0.78rem; font-weight:700; cursor:pointer;">
+            📤 Export Current Embeddings (.json)
+          </button>
+        </div>
+        <div id="enrolledStaffList" style="max-height:360px; overflow-y:auto; display:flex; flex-direction:column; gap:8px;">
+          <div style="text-align:center; padding:30px 0; color:var(--muted);">Loading staff...</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
 
   <!-- MAIN LIVE STAGE -->
   <main class="main-content">
@@ -368,14 +551,14 @@
     <aside class="ticker-panel">
       <div class="ticker-header">
         <div class="ticker-title">
-          <i class="fa-solid fa-bolt" style="color: var(--teal);"></i>
+          <span style="color:var(--teal)">⚡</span>
           <span>Live AI Detections</span>
         </div>
         <span id="detectionCounter" class="ticker-count">0 Synced</span>
       </div>
       <div id="tickerFeed" class="ticker-list">
         <div style="text-align: center; color: var(--muted); padding: 40px 0; font-size: 0.85rem;">
-          <i class="fa-solid fa-camera" style="font-size: 2rem; margin-bottom: 12px; display: block; opacity: 0.5;"></i>
+          <div style="font-size: 2rem; margin-bottom: 12px; opacity: 0.5;">📷</div>
           Waiting for face detections...
         </div>
       </div>
@@ -385,7 +568,9 @@
 
   <script>
     let activeCameras = [];
+    let parsedEmbeddingsData = null;
 
+    // Load active cameras from node
     async function loadCameras() {
       try {
         const res = await fetch('/api/node/cameras');
@@ -401,7 +586,22 @@
 
     function renderCameraGrid() {
       const grid = document.getElementById('cameraGrid');
-      if (!activeCameras || activeCameras.length === 0) return;
+      if (!activeCameras || activeCameras.length === 0) {
+        grid.className = 'camera-stage grid-1';
+        grid.innerHTML = `
+          <div class="camera-cell">
+            <div class="cam-tag">
+              <div class="cam-live-indicator" style="background:var(--teal); box-shadow:none;"></div>
+              <span>No Active Cameras Configured</span>
+            </div>
+            <div style="text-align:center; color:var(--muted); padding:20px;">
+              <p style="font-size:1.1rem; font-weight:700; color:#fff; margin-bottom:8px;">Camera Management from Cloud</p>
+              <p style="font-size:0.85rem; max-width:380px;">Configure cameras in your Cloud Dashboard or click <b>Fetch Cameras</b> above to pull active RTSP/DVR streams.</p>
+            </div>
+          </div>
+        `;
+        return;
+      }
 
       grid.className = 'camera-stage';
       const count = activeCameras.length;
@@ -418,7 +618,7 @@
             <div class="cam-live-indicator"></div>
             <span>${cam.name}</span>
           </div>
-          <img src="${cam.stream_url}" alt="${cam.name}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'640\\' height=\\'360\\'><rect width=\\'100%\\' height=\\'100%\\' fill=\\'%23080d14\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%2364748b\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\' font-size=\\'18\\'>Camera Offline</text></svg>'">
+          <img src="${cam.stream_url}" alt="${cam.name}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'640\\' height=\\'360\\'><rect width=\\'100%\\' height=\\'100%\\' fill=\\'%23080d14\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%2364748b\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\' font-size=\\'18\\'>Connecting Stream...</text></svg>'">
         </div>
       `).join('');
     }
@@ -470,6 +670,23 @@
       }
     }
 
+    // Refresh cameras from cloud
+    async function refreshCamerasFromCloud() {
+      try {
+        const res = await fetch('/api/node/cameras/refresh', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          await loadCameras();
+          alert(`✓ Cameras Synchronized: ${data.camera_count} camera streams active`);
+        } else {
+          alert(`✗ Camera refresh error: ${data.error || 'Failed'}`);
+        }
+      } catch (err) {
+        alert(`✗ Connection error: ${err.message}`);
+      }
+    }
+
+    // Modal toggles
     function openActivationModal() {
       document.getElementById('activationModal').style.display = 'flex';
       document.getElementById('activationAlert').style.display = 'none';
@@ -479,6 +696,185 @@
       document.getElementById('activationModal').style.display = 'none';
     }
 
+    function openEmployeesModal() {
+      document.getElementById('employeesModal').style.display = 'flex';
+      document.getElementById('enrollAlert').style.display = 'none';
+      loadEmployeesList();
+    }
+
+    function closeEmployeesModal() {
+      document.getElementById('employeesModal').style.display = 'none';
+    }
+
+    function switchEnrollTab(tab) {
+      const isImport = (tab === 'import');
+      document.getElementById('tabContentImport').style.display = isImport ? 'block' : 'none';
+      document.getElementById('tabContentList').style.display = isImport ? 'none' : 'block';
+      document.getElementById('tabBtnImport').style.background = isImport ? 'var(--teal)' : '#1e293b';
+      document.getElementById('tabBtnImport').style.color = isImport ? '#090e17' : 'var(--text)';
+      document.getElementById('tabBtnList').style.background = isImport ? '#1e293b' : 'var(--teal)';
+      document.getElementById('tabBtnList').style.color = isImport ? 'var(--text)' : '#090e17';
+      if (!isImport) loadEmployeesList();
+    }
+
+    // File selection for embeddings
+    function handleEmbeddingsFileSelect(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      document.getElementById('selectedFileName').textContent = `Selected: ${file.name} (${Math.round(file.size / 1024)} KB)`;
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+        try {
+          parsedEmbeddingsData = JSON.parse(evt.target.result);
+          const count = Array.isArray(parsedEmbeddingsData) ? parsedEmbeddingsData.length : Object.keys(parsedEmbeddingsData).length;
+          document.getElementById('selectedFileName').textContent = `✓ Ready: ${file.name} (${count} embeddings found)`;
+        } catch (err) {
+          alert("Invalid JSON format in selected embeddings file: " + err.message);
+          parsedEmbeddingsData = null;
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    // Submit embeddings import
+    async function submitEmbeddingsImport() {
+      const alertBox = document.getElementById('enrollAlert');
+      const btn = document.getElementById('btnSubmitImport');
+      if (!parsedEmbeddingsData) {
+        alertBox.style.display = 'block';
+        alertBox.style.background = 'rgba(239,68,68,0.15)';
+        alertBox.style.border = '1px solid #ef4444';
+        alertBox.style.color = '#f87171';
+        alertBox.textContent = 'Please choose a valid .json embeddings file first.';
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerHTML = '⚡ Importing &amp; Loading Embeddings...';
+      alertBox.style.display = 'none';
+
+      try {
+        const res = await fetch('/api/node/embeddings/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(parsedEmbeddingsData)
+        });
+        const data = await res.json();
+        if (data.success) {
+          alertBox.style.display = 'block';
+          alertBox.style.background = 'rgba(16,185,129,0.15)';
+          alertBox.style.border = '1px solid #10b981';
+          alertBox.style.color = '#34d399';
+          alertBox.textContent = `✓ ${data.message}`;
+          loadEmployeesList();
+        } else {
+          alertBox.style.display = 'block';
+          alertBox.style.background = 'rgba(239,68,68,0.15)';
+          alertBox.style.border = '1px solid #ef4444';
+          alertBox.style.color = '#f87171';
+          alertBox.textContent = `✗ ${data.error || 'Import failed'}`;
+        }
+      } catch (err) {
+        alertBox.style.display = 'block';
+        alertBox.style.background = 'rgba(239,68,68,0.15)';
+        alertBox.style.border = '1px solid #ef4444';
+        alertBox.style.color = '#f87171';
+        alertBox.textContent = `✗ Connection error: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '⚡ Import &amp; Activate Embeddings for Recognition';
+      }
+    }
+
+    // Export current embeddings
+    async function exportCurrentEmbeddings() {
+      try {
+        const res = await fetch('/api/node/embeddings/export');
+        const data = await res.json();
+        if (data.success) {
+          const blob = new Blob([JSON.stringify(data.embeddings, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `embeddings_${data.branch_id || 'branch'}.json`;
+          a.click();
+        }
+      } catch (e) {
+        alert('Could not export embeddings: ' + e.message);
+      }
+    }
+
+    async function loadEmployeesList() {
+      try {
+        const res = await fetch('/api/node/employees');
+        const data = await res.json();
+        const container = document.getElementById('enrolledStaffList');
+        const badge = document.getElementById('staffCountBadge');
+        const topBadge = document.getElementById('topEmbCount');
+        if (data.success) {
+          badge.textContent = data.count || 0;
+          const activeWithEmb = data.employees.filter(e => e.has_embedding).length;
+          if (topBadge) topBadge.textContent = `${activeWithEmb}/${data.count || 0} active`;
+
+          if (data.employees.length === 0) {
+            container.innerHTML = '<div style="text-align:center; padding:24px 0; color:var(--muted); font-size:0.88rem;">No staff synced yet. Click <b>Sync Cloud Staff</b> to pull employees from Cloud!</div>';
+            return;
+          }
+          container.innerHTML = data.employees.map(emp => `
+            <div style="background:#090e17; border:1px solid #1e293b; border-radius:10px; padding:10px 14px; display:flex; align-items:center; justify-content:space-between;">
+              <div>
+                <div style="font-weight:700; color:#fff; font-size:0.92rem;">${emp.name}</div>
+                <div style="font-size:0.75rem; color:var(--muted); margin-top:2px;">
+                  <span>${emp.employee_code}</span> &bull; <span>${emp.department || 'General'}</span>
+                  ${emp.has_embedding ? '<span style="color:#34d399; font-weight:700; margin-left:8px;">✓ Active (Embedding Loaded)</span>' : '<span style="color:#f87171; margin-left:8px;">⚠ No Embedding (Recognition Off)</span>'}
+                </div>
+              </div>
+              <button type="button" onclick="deleteEmployee(${emp.id}, '${emp.name}')" style="background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.3); color:#f87171; border-radius:6px; padding:4px 10px; font-size:0.78rem; font-weight:700; cursor:pointer;">
+                Clear
+              </button>
+            </div>
+          `).join('');
+        }
+      } catch (e) {
+        console.error("Error loading employees:", e);
+      }
+    }
+
+    async function deleteEmployee(userId, name) {
+      if (!confirm(`Are you sure you want to clear embeddings for ${name}?`)) return;
+      try {
+        const res = await fetch('/api/node/employees/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_id: userId })
+        });
+        const data = await res.json();
+        if (data.success) {
+          loadEmployeesList();
+        } else {
+          alert(data.error || 'Could not delete employee');
+        }
+      } catch (e) {
+        alert('Network error deleting employee');
+      }
+    }
+
+    async function syncProfilesFromCloud() {
+      try {
+        const res = await fetch('/api/node/employees/sync', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          alert('✓ Cloud Staff Synchronized successfully!');
+          loadEmployeesList();
+        } else {
+          alert(data.error || 'Failed to sync');
+        }
+      } catch (e) {
+        alert(`Sync error: ${e.message}`);
+      }
+    }
+
+    // Branch Activation Submission
     async function handleActivationSubmit(e) {
       e.preventDefault();
       const btn = document.getElementById('btnActivateSubmit');
@@ -489,7 +885,7 @@
       const cloudUrl = document.getElementById('inputCloudUrl').value.trim();
 
       btn.disabled = true;
-      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Authenticating...';
+      btn.innerHTML = '⏳ Authenticating...';
       alertBox.style.display = 'none';
 
       try {
@@ -516,6 +912,7 @@
             closeActivationModal();
             loadCameras();
             checkCloudStatus();
+            loadEmployeesList();
           }, 1200);
         } else {
           alertBox.style.display = 'block';
@@ -532,37 +929,14 @@
         alertBox.textContent = `✗ Network error: ${err.message}`;
       } finally {
         btn.disabled = false;
-        btn.innerHTML = '<i class="fa-solid fa-link me-1"></i> Connect &amp; Authenticate';
+        btn.innerHTML = '🔗 Connect &amp; Authenticate';
       }
     }
 
     // Startup
-    window.addEventListener('load', () => {
-      // Direct Event Listeners to ensure buttons respond immediately
-      const btnKey = document.getElementById('btnOpenKeySetup');
-      if (btnKey) btnKey.addEventListener('click', openActivationModal);
-
-      const pill = document.getElementById('branchDisplayPill');
-      if (pill) pill.addEventListener('click', openActivationModal);
-
-      const closeX = document.getElementById('btnCloseModalX');
-      if (closeX) closeX.addEventListener('click', closeActivationModal);
-
-      // Close modal on outside backdrop click (only if already linked)
-      const isLinked = {% if config.linked %}true{% else %}false{% endif %};
-      const modal = document.getElementById('activationModal');
-      if (modal && isLinked) {
-        modal.addEventListener('click', (ev) => {
-          if (ev.target === modal) closeActivationModal();
-        });
-      }
-
-      // If Node is not linked yet on this PC, prompt activation immediately
-      if (!isLinked) {
-        openActivationModal();
-      }
-
+    document.addEventListener('DOMContentLoaded', () => {
       loadCameras();
+      loadEmployeesList();
       setInterval(pollDetections, 1500);
       setInterval(checkCloudStatus, 5000);
       checkCloudStatus();
