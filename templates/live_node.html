@@ -877,13 +877,15 @@
 
     // Branch Activation Submission
     async function handleActivationSubmit(e) {
-      e.preventDefault();
+      if (e && typeof e.preventDefault === 'function') {
+        e.preventDefault();
+      }
       const btn = document.getElementById('btnActivateSubmit');
       const alertBox = document.getElementById('activationAlert');
       const username = (document.getElementById('inputUsername')?.value || '').trim();
       const password = (document.getElementById('inputPassword')?.value || '').trim();
-      const branchKey = document.getElementById('inputBranchKey').value.trim();
-      const cloudUrl = document.getElementById('inputCloudUrl').value.trim();
+      const branchKey = (document.getElementById('inputBranchKey')?.value || '').trim();
+      const cloudUrl = (document.getElementById('inputCloudUrl')?.value || '').trim();
 
       btn.disabled = true;
       btn.innerHTML = '⏳ Authenticating...';
