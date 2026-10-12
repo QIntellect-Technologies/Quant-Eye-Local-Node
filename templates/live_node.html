@@ -428,7 +428,7 @@
 
       <div id="activationAlert" style="display:none; padding:12px; border-radius:10px; margin-bottom:16px; font-size:0.85rem; font-weight:600;"></div>
 
-      <form onsubmit="handleActivationSubmit(event)">
+      <form onsubmit="event.preventDefault(); handleActivationSubmit(event); return false;">
         <div style="margin-bottom:14px;">
           <label class="form-label">Username / Client Email</label>
           <input type="text" id="inputUsername" placeholder="e.g. admin@organization.com" value="{{ config.username or '' }}" class="form-input">
@@ -447,14 +447,15 @@
 
         <div style="margin-bottom:20px;">
           <label class="form-label">Cloud Server URL</label>
-          <input type="url" id="inputCloudUrl" required value="{{ config.cloud_url or 'http://127.0.0.1:5100' }}" class="form-input">
+          <input type="url" id="inputCloudUrl" required value="{{ config.cloud_url or 'https://quanteye-main-dashboard-production.up.railway.app' }}" class="form-input">
+          <small style="color:var(--muted); font-size:0.75rem; margin-top:4px; display:block;">Default: Main Control Dashboard (where Branch Key is created)</small>
         </div>
 
         <div style="display:flex; gap:10px;">
           {% if config.linked %}
           <button type="button" onclick="closeActivationModal()" style="flex:1; padding:12px; background:#1e293b; border:none; border-radius:10px; color:#fff; font-weight:700; cursor:pointer;">Cancel</button>
           {% endif %}
-          <button type="submit" id="btnActivateSubmit" style="flex:2; padding:12px; background:linear-gradient(135deg, var(--teal), #2b7a78); border:none; border-radius:10px; color:#090e17; font-weight:800; cursor:pointer; font-size:0.95rem;">
+          <button type="button" id="btnActivateSubmit" onclick="handleActivationSubmit(event)" style="flex:2; padding:12px; background:linear-gradient(135deg, var(--teal), #2b7a78); border:none; border-radius:10px; color:#090e17; font-weight:800; cursor:pointer; font-size:0.95rem;">
             🔗 Connect &amp; Authenticate
           </button>
         </div>
