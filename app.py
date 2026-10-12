@@ -535,12 +535,48 @@ def init_camera_streams():
         for cam in cameras_to_use:
             cid = str(cam.get("id") or cam.get("camera_id"))
             cname = cam.get("name") or cam.get("camera_name", f"Camera {cid}")
-            source = cam.get("rtsp_url", 0)
+            source = cam.get("rtsp_url", "")
+            cam_type = str(cam.get("camera_type", "rtsp")).lower()
+            
+            # Never open default 0 webcam unless explicitly requested
+            if not source or (str(source).strip() in ("0", "") and cam_type != "webcam"):
+                logger.info(f"Skipping camera without RTSP source: {cname} ({cid})")
+                continue
+
             try:
                 ACTIVE_CAMERA_READERS[cid] = NodeCameraReader(cid, cname, source)
                 logger.info(f"Started camera stream reader: {cname} ({cid}) -> {source}")
             except Exception as e:
                 logger.error(f"Failed to start camera {cid}: {e}")
+
+_last_cloud_cam_hash = None
+
+def _background_camera_sync_loop():
+    """Poll Cloud every 3 seconds for real-time camera additions or deletions."""
+    global _last_cloud_cam_hash
+    while True:
+        try:
+            time.sleep(3.0)
+            org_id = CONFIG.get("organization_id")
+            branch_id = CONFIG.get("branch_id")
+            cloud_url = CONFIG.get('cloud_url', 'https://quanteye-main-dashboard-production.up.railway.app').rstrip('/')
+            if org_id and branch_id:
+                url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={org_id}"
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode('utf-8'))
+                        if "cameras" in data:
+                            cams = data.get("cameras", [])
+                            cam_hash = json.dumps([(c.get("id") or c.get("camera_id"), c.get("rtsp_url")) for c in cams], sort_keys=True)
+                            if _last_cloud_cam_hash is not None and cam_hash != _last_cloud_cam_hash:
+                                logger.info(f"[REAL-TIME SYNC] Cloud camera changes detected. Reloading streams...")
+                                init_camera_streams()
+                            _last_cloud_cam_hash = cam_hash
+        except Exception:
+            pass
+
+threading.Thread(target=_background_camera_sync_loop, daemon=True).start()
 
 
 # ==============================================================================

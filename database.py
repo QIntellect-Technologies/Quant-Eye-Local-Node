@@ -656,15 +656,6 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            cursor.execute("SELECT COUNT(*) FROM cameras")
-            if cursor.fetchone()[0] == 0:
-                # No RTSP URLs are seeded. Only the machine's default local webcam (index 0) is
-                # registered so a fresh install has one working feed; the Admin adds all
-                # DVR / NVR / IP cameras from System Settings > Camera Management.
-                cursor.execute(
-                    "INSERT INTO cameras (camera_id, name, room_name, camera_type, rtsp_url) VALUES (?, ?, ?, ?, ?)",
-                    ('webcam', 'Local Webcam', 'Main Entrance', 'webcam', '0')
-                )
 
             # Shifts table
             cursor.execute('''
