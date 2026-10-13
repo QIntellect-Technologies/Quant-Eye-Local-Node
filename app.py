@@ -1586,9 +1586,10 @@ def init_camera_streams():
         for cam in cameras_to_use:
             cid = str(cam.get("id") or cam.get("camera_id"))
             cname = cam.get("name") or cam.get("camera_name", f"Camera {cid}")
-            source = cam.get("rtsp_url", "")
+            raw_source = cam.get("rtsp_url")
+            source = "" if raw_source is None else str(raw_source).strip()
             cam_type = str(cam.get("camera_type", "rtsp")).lower()
-            if not source or (str(source).strip() in ("0", "") and cam_type != "webcam"):
+            if not source or (source == "0" and cam_type != "webcam"):
                 continue
             valid_cams[cid] = (cname, source)
 
