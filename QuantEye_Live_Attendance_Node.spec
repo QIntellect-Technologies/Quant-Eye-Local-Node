@@ -29,6 +29,11 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        'tensorflow',
+        'keras',
+        'tensorboard',
+        'bitsandbytes',
+        'diffusers',
         'sentencepiece',
         'transformers',
         'torchaudio',

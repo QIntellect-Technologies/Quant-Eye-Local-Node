@@ -1059,9 +1059,9 @@
           QIntellect Technologies
         </span>
         <span class="header-separator">|</span>
-        <span id="headerBranchBadge" style="display:inline-flex; align-items:center; gap:6px; background:#e0f2fe; color:#0369a1; padding:4px 11px; border-radius:8px; font-weight:700; font-size:0.82rem; border:1px solid #bae6fd;" title="Current Organization & Branch">
+        <span id="headerBranchBadge" onclick="openActivationModal()" style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; background:#e0f2fe; color:#0369a1; padding:4px 11px; border-radius:8px; font-weight:700; font-size:0.82rem; border:1px solid #bae6fd;" title="Click to view/change Organization">
           <i class="fa-solid fa-building" style="color:#0284c7;"></i>
-          <span id="headerBranchNameText">{{ config.get('organization_name', 'QuantumMind') }} &bull; {{ config.get('branch_name', 'Main Branch') }}</span>
+          <span id="headerBranchNameText">{% if config.get('linked') %}{{ config.get('organization_name', '') }} &bull; {{ config.get('branch_name', '') }}{% else %}Not Linked &bull; Click to Connect{% endif %}</span>
         </span>
         <span class="header-separator">|</span>
         <span id="headerShiftBadge" style="display:inline-flex; align-items:center; gap:6px; background:#eff6ff; color:#1d4ed8; padding:4px 12px; border-radius:8px; font-weight:700; font-size:0.82rem; border:1px solid #bfdbfe;" title="Active Cloud Shift Timing">
@@ -1080,7 +1080,7 @@
         <span class="header-separator">|</span>
         <div class="header-user-badge" title="Authenticated User">
           <i class="fa-solid fa-user-tie"></i>
-          <span id="headerUserName">{{ config.get('username') or config.get('organization_name', 'QuantumMind') ~ '@gmail.com' }}</span>
+          <span id="headerUserName">{% if config.get('linked') %}{{ config.get('username') or config.get('organization_name', '') }}{% else %}Setup Required{% endif %}</span>
         </div>
         <span class="header-separator">|</span>
         <button type="button" id="headerRestartBtn" onclick="restartAndSyncCameras()" class="btn-header-action btn-header-restart" title="Restart & Sync Cameras from Cloud">
@@ -1088,10 +1088,17 @@
           <span>Restart</span>
         </button>
         <span class="header-separator">|</span>
+        {% if config.get('linked') %}
         <button type="button" id="headerLogoutBtn" onclick="handleNodeLogout()" class="btn-header-action btn-header-logout" title="Logout / Switch Organization">
           <i class="fa-solid fa-right-from-bracket"></i>
           <span>Logout</span>
         </button>
+        {% else %}
+        <button type="button" id="headerLoginBtn" onclick="openActivationModal()" class="btn-header-action" style="background:#0284c7; color:#fff; font-weight:700; padding:4px 12px; border-radius:6px; border:none;" title="Connect / Link Organization">
+          <i class="fa-solid fa-key"></i>
+          <span>Link Node</span>
+        </button>
+        {% endif %}
       </div>
     </header>
 
@@ -1971,6 +1978,9 @@
 
     // Initial Load & Real-Time Sync Intervals
     window.addEventListener('DOMContentLoaded', () => {
+      {% if not config.get('linked') %}
+      openActivationModal();
+      {% endif %}
       loadCameras();
       loadActiveShiftTiming();
       loadPendingStaffQueue();

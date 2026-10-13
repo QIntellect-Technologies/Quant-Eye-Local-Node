@@ -1,0 +1,14 @@
+{
+  "linked": false,
+  "organization_id": "",
+  "organization_name": "Unconfigured Node",
+  "branch_id": "",
+  "branch_name": "Setup Required",
+  "branch_key": "",
+  "username": "",
+  "cloud_url": "https://quanteye-main-dashboard-production.up.railway.app",
+  "client_portal_url": "https://quanteye-ai-attendence-production.up.railway.app",
+  "node_port": 5005,
+  "face_match_threshold": 0.45,
+  "cameras": []
+}

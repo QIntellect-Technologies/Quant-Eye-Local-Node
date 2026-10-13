@@ -81,6 +81,9 @@ app.secret_key = "quanteye-client-node-secret-key"
 # Persistent config must reside next to EXE, NOT inside temporary _MEIPASS
 CONFIG_PATH = os.path.join(EXE_DIR, 'config_node.json')
 
+DEFAULT_CLOUD_URL = "https://quanteye-main-dashboard-production.up.railway.app"
+DEFAULT_PORTAL_URL = "https://quanteye-ai-attendence-production.up.railway.app"
+
 def load_config() -> Dict[str, Any]:
     default_cfg = {
         "linked": False,
@@ -90,7 +93,8 @@ def load_config() -> Dict[str, Any]:
         "branch_name": "Setup Required",
         "branch_key": "",
         "username": "",
-        "cloud_url": "http://127.0.0.1:5100",
+        "cloud_url": DEFAULT_CLOUD_URL,
+        "client_portal_url": DEFAULT_PORTAL_URL,
         "node_port": 5005,
         "face_match_threshold": 0.45,
         "cameras": []
@@ -133,7 +137,7 @@ def push_event_to_cloud_worker():
     while True:
         try:
             event = cloud_event_queue.get()
-            cloud_url = f"{CONFIG.get('cloud_url', 'http://127.0.0.1:5100').rstrip('/')}/api/sync/attendance-event"
+            cloud_url = f"{CONFIG.get('cloud_url', DEFAULT_CLOUD_URL).rstrip('/')}/api/sync/attendance-event"
             portal_url = f"{CONFIG.get('client_portal_url', 'https://quanteye-ai-attendence-production.up.railway.app').rstrip('/')}/api/sync/attendance-event"
             req_data = json.dumps(event).encode('utf-8')
 
@@ -1776,7 +1780,7 @@ def get_live_detections():
 @app.route('/api/node/cloud-status')
 def get_node_cloud_status():
     """Check connectivity to Cloud Main Dashboard."""
-    cloud_url = CONFIG.get('cloud_url', 'http://127.0.0.1:5100').rstrip('/')
+    cloud_url = CONFIG.get('cloud_url', DEFAULT_CLOUD_URL).rstrip('/')
     is_connected = False
     try:
         health_url = f"{cloud_url}/api/integration/local/status"
@@ -1961,7 +1965,7 @@ def api_node_login_auth():
     username = (data.get('username') or data.get('email') or '').strip()
     password = (data.get('password') or '').strip()
     branch_key = (data.get('branch_key') or '').strip()
-    cloud_url = (data.get('cloud_url') or CONFIG.get('cloud_url', 'http://127.0.0.1:5100')).strip().rstrip('/')
+    cloud_url = (data.get('cloud_url') or CONFIG.get('cloud_url', DEFAULT_CLOUD_URL)).strip().rstrip('/')
 
     if not branch_key and not username:
         return jsonify({"success": False, "error": "Username/Email and Branch Key are required"}), 400
@@ -2393,7 +2397,7 @@ def api_node_sync_employees():
     """Sync profiles from Cloud or local master."""
     org_id = CONFIG.get("organization_id", "")
     branch_id = CONFIG.get("branch_id", "")
-    cloud_url = CONFIG.get("cloud_url", "http://127.0.0.1:5100")
+    cloud_url = CONFIG.get("cloud_url", DEFAULT_CLOUD_URL)
     if not org_id or not branch_id:
         return jsonify({"success": False, "error": "Node must be activated with branch key first"}), 400
     try:
@@ -2411,7 +2415,7 @@ def api_node_pending_staff():
     """
     org_id = CONFIG.get("organization_id", "")
     branch_id = CONFIG.get("branch_id", "")
-    cloud_url = CONFIG.get("cloud_url", "http://127.0.0.1:5100")
+    cloud_url = CONFIG.get("cloud_url", DEFAULT_CLOUD_URL)
 
     # Non-blocking background sync if online (throttled to 30s)
     if org_id:
