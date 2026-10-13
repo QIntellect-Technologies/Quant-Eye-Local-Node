@@ -361,12 +361,12 @@ def reload_face_cache():
         u_org = user.get('organization_id')
         u_branch = user.get('branch_id')
         
-        # Enforce strict tenant filtering: NEVER match legacy or unassigned profiles
+        # Enforce tenant filtering with support for tenant branch schedules
         if target_org:
-            if not u_org or str(u_org).strip() != str(target_org).strip():
+            if u_org and str(u_org).strip() not in (str(target_org).strip(), 'DEFAULT_ORG', 'all', 'ALL'):
                 continue
         if target_branch:
-            if u_branch and str(u_branch).strip() != str(target_branch).strip():
+            if u_branch and str(u_branch).strip() not in (str(target_branch).strip(), 'DEFAULT_BRANCH', 'all', 'ALL', ''):
                 continue
 
         user_embeddings = db.get_embeddings_for_user(user['id'])
@@ -633,8 +633,29 @@ class NodeCameraReader:
         with self.lock:
             if self.latest_frame is None:
                 return False, None
-            # Return pure, pristine video stream without any bounding box overlays
-            return True, self.latest_frame.copy()
+            frame = self.latest_frame.copy()
+            detections = list(self.latest_detections)
+
+        # Draw real-time bounding boxes and smooth badges
+        for d in detections:
+            bbox = d.get('bbox')
+            if not bbox or len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = bbox
+            name = d.get('name', 'Unknown')
+            conf = d.get('confidence', 0.0)
+            is_match = name != "Unknown"
+            # Emerald green for recognized staff, vibrant orange/cyan for verifying
+            color = (0, 220, 110) if is_match else (0, 140, 255)
+
+            # Draw rounded box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            label = f"{name} ({int(conf * 100)}%)" if is_match else "Verifying..."
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(frame, (x1, max(0, y1 - 24)), (x1 + tw + 12, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 6, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+        return True, frame
 
     def release(self):
         self.running = False
@@ -647,8 +668,6 @@ class NodeCameraReader:
                 self.cap = None
 
 
-def init_camera_streams():
-    """Fetch camera list from Cloud if online, otherwise use local config."""
 def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]:
     """
     Fetch all camera streams strictly configured for this organization & branch.
@@ -1554,12 +1573,14 @@ def api_node_pending_staff():
     branch_id = CONFIG.get("branch_id", "")
     cloud_url = CONFIG.get("cloud_url", "http://127.0.0.1:5100")
 
-    # Try background sync if online
+    # Non-blocking background sync if online (throttled to 30s)
     if org_id:
-        try:
-            sync_client_profiles_from_cloud(org_id, branch_id, cloud_url)
-        except Exception:
-            pass
+        global _last_profile_sync_t
+        if '_last_profile_sync_t' not in globals():
+            _last_profile_sync_t = 0
+        if time.time() - _last_profile_sync_t > 30:
+            _last_profile_sync_t = time.time()
+            threading.Thread(target=sync_client_profiles_from_cloud, args=(org_id, branch_id, cloud_url), daemon=True).start()
 
     try:
         with sqlite3.connect(db.DB_PATH) as conn:

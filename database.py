@@ -854,7 +854,9 @@ def get_all_users(role: Optional[str] = None) -> List[Dict]:
                        COALESCE(s.end_time, '17:00') as shift_end,
                        COALESCE(s.grace_period_minutes, 15) as shift_grace,
                        COALESCE(u.checkin_cameras, 'all') as checkin_cameras,
-                       COALESCE(u.checkout_cameras, 'all') as checkout_cameras
+                       COALESCE(u.checkout_cameras, 'all') as checkout_cameras,
+                       COALESCE(u.organization_id, '') as organization_id,
+                       COALESCE(u.branch_id, '') as branch_id
                 FROM users u
                 LEFT JOIN shifts s ON COALESCE(u.shift_id, 1) = s.id
                 LEFT JOIN (
@@ -878,7 +880,9 @@ def get_all_users(role: Optional[str] = None) -> List[Dict]:
             'position': r[11], 'cnic': r[12], 'salary': r[13], 'join_date': r[14],
             'shift_id': r[15], 'shift_name': r[16], 'shift_start': r[17],
             'shift_end': r[18], 'shift_grace': r[19],
-            'checkin_cameras': r[20], 'checkout_cameras': r[21]
+            'checkin_cameras': r[20], 'checkout_cameras': r[21],
+            'organization_id': r[22] if len(r) > 22 else '',
+            'branch_id': r[23] if len(r) > 23 else ''
         } for r in rows]
     except Exception as e:
         logger.error(f"Failed to get all users: {e}")
