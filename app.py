@@ -138,11 +138,28 @@ def push_event_to_cloud_worker():
                     },
                     method="POST"
                 )
-                with urllib.request.urlopen(preq, timeout=3.5) as presp:
+                with urllib.request.urlopen(preq, timeout=4.0) as presp:
                     if presp.status in (200, 201):
-                        logger.info(f"[ATTENDANCE SYNC OK] Live attendance for '{event.get('name')}' delivered to Cloud Portal.")
+                        resp_content = presp.read().decode('utf-8')
+                        try:
+                            resp_json = json.loads(resp_content)
+                            if resp_json.get("attendance_logged"):
+                                logger.info(f"✓ [CLOUD PORTAL ATTENDANCE OK] Live attendance for '{event.get('name')}' ({event.get('event_type', 'CHECKIN')}) recorded: {resp_json.get('reason')}")
+                            else:
+                                reason = resp_json.get("reason", "Rejected by cloud rules")
+                                logger.warning(f"[CLOUD PORTAL REJECTED] '{event.get('name')}': {reason}")
+                                uid = event.get("user_id")
+                                if uid and event.get("event_type") != "CHECKOUT":
+                                    with attendance_state_lock:
+                                        USER_ATTENDANCE_STATE.pop(uid, None)
+                        except Exception:
+                            logger.info(f"[ATTENDANCE SYNC OK] Live attendance for '{event.get('name')}' delivered to Cloud Portal.")
             except Exception as pe:
-                logger.debug(f"[PORTAL ATTENDANCE NOTE] {pe}")
+                logger.warning(f"[PORTAL ATTENDANCE ERROR] Failed syncing '{event.get('name')}': {pe}")
+                uid = event.get("user_id")
+                if uid and event.get("event_type") != "CHECKOUT":
+                    with attendance_state_lock:
+                        USER_ATTENDANCE_STATE.pop(uid, None)
 
             # 2. Deliver to Cloud Main Dashboard
             try:
@@ -166,7 +183,7 @@ def push_event_to_cloud_worker():
 threading.Thread(target=push_event_to_cloud_worker, daemon=True).start()
 
 
-def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: float, camera_id: str, camera_name: str, face_crop_b64: Optional[str] = None, timestamp: Optional[str] = None):
+def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: float, camera_id: str, camera_name: str, face_crop_b64: Optional[str] = None, timestamp: Optional[str] = None, event_type: str = "CHECKIN"):
     """Enqueue immediate event for Cloud dispatch."""
     event_payload = {
         "organization_id": CONFIG.get("organization_id", "ORG-001"),
@@ -179,6 +196,7 @@ def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: floa
         "status": "Present",
         "source": f"node_cam_{camera_id}",
         "face_crop_base64": face_crop_b64,
+        "event_type": event_type,
         "timestamp": timestamp or datetime.now().isoformat()
     }
     try:
@@ -569,7 +587,8 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                     source=source,
                     location=location,
                     device_id=camera_id,
-                    attendance_time=now
+                    attendance_time=now,
+                    bypass_shift_check=True
                 )
                 logger.info(f"✓ [CHECK-IN LOGGED] Staff '{name}' (ID #{user_id}) on Camera '{camera_id}' ({location}) at {now.strftime('%I:%M:%S %p')} ({effective_shift.get('name', 'Shift')})")
             except Exception as e:
@@ -583,7 +602,8 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                 camera_id=camera_id,
                 camera_name=location,
                 face_crop_b64=face_crop_b64,
-                timestamp=now.isoformat()
+                timestamp=now.isoformat(),
+                event_type="CHECKIN"
             )
             return "CHECKIN", f"Check-In recorded at {now.strftime('%I:%M %p')} on {location}"
 
@@ -641,7 +661,8 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                     device_id=camera_id,
                     checkout_camera_id=camera_id,
                     checkout_location=location,
-                    attendance_time=now
+                    attendance_time=now,
+                    bypass_shift_check=True
                 )
                 logger.info(f"✓ [CHECK-OUT LOGGED] Staff '{name}' (ID #{user_id}) Check-Out on Camera '{camera_id}' ({location}) updated to {now.strftime('%I:%M:%S %p')} (Check-In was {checkin_time.strftime('%I:%M:%S %p')})")
             except Exception as e:
@@ -655,7 +676,8 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                 camera_id=camera_id,
                 camera_name=location,
                 face_crop_b64=face_crop_b64,
-                timestamp=now.isoformat()
+                timestamp=now.isoformat(),
+                event_type="CHECKOUT"
             )
             return "CHECKOUT", f"Check-Out recorded at {now.strftime('%I:%M %p')} on {location}"
 
