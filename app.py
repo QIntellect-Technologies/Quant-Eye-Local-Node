@@ -169,66 +169,122 @@ def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: floa
 
 def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str) -> int:
     """
-    Sync client employees from Cloud for this specific organization & branch.
-    Strict tenant isolation: ensures profiles strictly belong to org_id and branch_id.
+    Sync client employees from Cloud Portal and Main Cloud for this organization & branch.
+    Ensures newly registered staff from Cloud Staff Directory immediately appear locally.
     """
-    if not org_id or not branch_id:
+    if not org_id:
         return 0
 
-    cloud_clean = cloud_url.rstrip('/')
+    cloud_clean = cloud_url.rstrip('/') if cloud_url else "https://quanteye-main-dashboard-production.up.railway.app"
+    portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
     imported_count = 0
 
-    # 1. Fetch branch employees directly from Cloud API
+    # 1. Fetch staff members directly from Cloud Client Portal (/api/users)
     try:
-        req_url = f"{cloud_clean}/api/branches/{branch_id}/employees?organization_id={org_id}"
-        req = urllib.request.Request(req_url, method="GET")
-        with urllib.request.urlopen(req, timeout=3.5) as resp:
+        req_url = f"{portal_url}/api/users"
+        req = urllib.request.Request(req_url, headers={
+            "User-Agent": "QuantEye-Node",
+            "X-Client-Auth": "true",
+            "X-Organization-Id": org_id,
+            "X-Branch-Id": branch_id or "DEFAULT_BRANCH"
+        }, method="GET")
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
-                employees = data.get("employees", [])
+                users = data.get("users", [])
                 with sqlite3.connect(db.DB_PATH) as conn:
                     cur = conn.cursor()
                     try: cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
                     except Exception: pass
                     try: cur.execute("ALTER TABLE users ADD COLUMN branch_id TEXT")
                     except Exception: pass
+                    try: cur.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+                    except Exception: pass
+                    try: cur.execute("ALTER TABLE users ADD COLUMN position TEXT")
+                    except Exception: pass
 
-                    for emp in employees:
-                        emp_name = emp.get("name") or "Employee"
-                        emp_code = emp.get("employee_code") or f"EMP-{emp.get('id')}"
-                        dept = emp.get("department") or "General"
-                        pos = emp.get("position") or ""
+                    for u in users:
+                        u_id = u.get("id")
+                        u_name = (u.get("name") or f"User-{u_id}").strip()
+                        u_email = (u.get("email") or "").strip()
+                        u_phone = (u.get("phone") or "").strip()
+                        u_dept = (u.get("department") or "General").strip()
+                        u_pos = (u.get("position") or "Staff Member").strip()
+                        u_code = (u.get("notes") or f"EMP-{u_id}").strip()
+                        u_org = u.get("organization_id") or org_id
+                        u_branch = u.get("branch_id") or branch_id or "DEFAULT_BRANCH"
+                        u_active = int(u.get("active", 1))
 
-                        cur.execute("""
-                            SELECT id FROM users 
-                            WHERE (notes = ? OR name = ?) AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')
-                        """, (emp_code, emp_name, org_id))
+                        # Check if user already exists by ID or Name
+                        cur.execute("SELECT id FROM users WHERE id = ? OR name = ?", (u_id, u_name))
                         row = cur.fetchone()
                         if row:
                             cur.execute("""
-                                UPDATE users SET name = ?, department = ?, position = ?, organization_id = ?, branch_id = ?, active = 1
+                                UPDATE users 
+                                SET name = ?, email = ?, phone = ?, department = ?, position = ?, notes = ?, active = ?, organization_id = ?, branch_id = ?
                                 WHERE id = ?
-                            """, (emp_name, dept, pos, org_id, branch_id, row[0]))
+                            """, (u_name, u_email, u_phone, u_dept, u_pos, u_code, u_active, u_org, u_branch, row[0]))
                         else:
                             cur.execute("""
-                                INSERT INTO users (name, department, position, notes, active, organization_id, branch_id)
-                                VALUES (?, ?, ?, ?, 1, ?, ?)
-                            """, (emp_name, dept, pos, emp_code, org_id, branch_id))
+                                INSERT INTO users (id, name, email, phone, department, position, notes, active, organization_id, branch_id)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (u_id, u_name, u_email, u_phone, u_dept, u_pos, u_code, u_active, u_org, u_branch))
                         imported_count += 1
                     conn.commit()
-                logger.info(f"[CLOUD SYNC] Synced {imported_count} employees from Cloud for {org_id} / {branch_id}")
-                return imported_count
-    except Exception as ce:
-        logger.warning(f"[CLOUD SYNC OFFLINE] Could not fetch employees from Cloud ({ce}). Falling back to local.")
+                logger.info(f"[PORTAL SYNC] Synced {imported_count} staff profiles from Cloud Portal for {org_id}")
+    except Exception as pe:
+        logger.warning(f"[PORTAL SYNC] Note querying portal users: {pe}")
 
-    # 2. Fallback to local DB if available
+    # 2. Also fetch branch employees directly from Main Cloud API
+    if branch_id:
+        try:
+            req_url = f"{cloud_clean}/api/branches/{branch_id}/employees?organization_id={org_id}"
+            req = urllib.request.Request(req_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    employees = data.get("employees", [])
+                    with sqlite3.connect(db.DB_PATH) as conn:
+                        cur = conn.cursor()
+                        try: cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
+                        except Exception: pass
+                        try: cur.execute("ALTER TABLE users ADD COLUMN branch_id TEXT")
+                        except Exception: pass
+
+                        for emp in employees:
+                            emp_name = (emp.get("name") or "Employee").strip()
+                            emp_code = emp.get("employee_code") or f"EMP-{emp.get('id')}"
+                            dept = emp.get("department") or "General"
+                            pos = emp.get("position") or "Staff Member"
+
+                            cur.execute("""
+                                SELECT id FROM users 
+                                WHERE (notes = ? OR name = ?) AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')
+                            """, (emp_code, emp_name, org_id))
+                            row = cur.fetchone()
+                            if row:
+                                cur.execute("""
+                                    UPDATE users SET name = ?, department = ?, position = ?, organization_id = ?, branch_id = ?, active = 1
+                                    WHERE id = ?
+                                """, (emp_name, dept, pos, org_id, branch_id, row[0]))
+                            else:
+                                cur.execute("""
+                                    INSERT INTO users (name, department, position, notes, active, organization_id, branch_id)
+                                    VALUES (?, ?, ?, ?, 1, ?, ?)
+                                """, (emp_name, dept, pos, emp_code, org_id, branch_id))
+                            imported_count += 1
+                        conn.commit()
+        except Exception as ce:
+            logger.debug(f"[CLOUD SYNC] Note querying cloud employees: {ce}")
+
+    # 3. Fallback to local DB if available and imported_count == 0
     try:
         master_db = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Local-Dashboard", "attendance.db"))
-        if os.path.exists(master_db):
+        if os.path.exists(master_db) and imported_count == 0:
             with sqlite3.connect(master_db) as mconn, sqlite3.connect(db.DB_PATH) as conn:
                 mcur = mconn.cursor()
                 cur = conn.cursor()
-                mcur.execute("SELECT id, name, email, department, active, organization_id, branch_id FROM users WHERE organization_id = ? AND branch_id = ?", (org_id, branch_id))
+                mcur.execute("SELECT id, name, email, department, active, organization_id, branch_id FROM users WHERE organization_id = ?", (org_id,))
                 musers = mcur.fetchall()
                 for u in musers:
                     cur.execute("""
@@ -1458,7 +1514,7 @@ def api_node_pending_staff():
     cloud_url = CONFIG.get("cloud_url", "http://127.0.0.1:5100")
 
     # Try background sync if online
-    if org_id and branch_id:
+    if org_id:
         try:
             sync_client_profiles_from_cloud(org_id, branch_id, cloud_url)
         except Exception:
@@ -1477,11 +1533,10 @@ def api_node_pending_staff():
                        COALESCE(u.notes, ''), COUNT(e.id) as emb_count, COALESCE(u.email, '')
                 FROM users u
                 LEFT JOIN embeddings e ON u.id = e.user_id
-                WHERE (u.organization_id = ? AND u.branch_id = ?)
-                   OR (u.organization_id IS NULL OR u.organization_id = '' OR u.organization_id = 'DEFAULT_ORG')
+                WHERE (u.organization_id = ? OR u.organization_id IS NULL OR u.organization_id = '' OR u.organization_id = 'DEFAULT_ORG')
                 GROUP BY u.id
                 ORDER BY u.id DESC
-            """, (org_id, branch_id))
+            """, (org_id,))
             rows = cur.fetchall()
 
             all_staff = []
@@ -1566,6 +1621,30 @@ def api_node_train_video():
         # Instantly refresh in-memory face matching matrix
         reload_face_cache()
         logger.info(f"[BIOMETRIC ENROLL SUCCESS] Enrolled biometric profile for user {user_id} ({saved_count} frames)")
+
+        # Sync registered embeddings to Cloud Portal so Staff Directory marks Training: Complete
+        def _sync_embeddings_to_cloud(uid, embs, src_name):
+            try:
+                p_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
+                sync_ep = f"{p_url}/api/users/{uid}/sync-embeddings"
+                post_payload = json.dumps({
+                    "embeddings": [e.tolist() if isinstance(e, np.ndarray) else list(e) for e in embs],
+                    "source": src_name
+                }).encode('utf-8')
+                s_req = urllib.request.Request(sync_ep, data=post_payload, headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "QuantEye-Node",
+                    "X-Client-Auth": "true",
+                    "X-Organization-Id": CONFIG.get("organization_id", ""),
+                    "X-Branch-Id": CONFIG.get("branch_id", "")
+                }, method="POST")
+                with urllib.request.urlopen(s_req, timeout=5.0) as s_resp:
+                    if s_resp.status == 200:
+                        logger.info(f"[CLOUD SYNC] Synced biometric profile to Cloud Portal for user {uid}")
+            except Exception as se:
+                logger.warning(f"[CLOUD SYNC] Note syncing biometric profile to Cloud Portal: {se}")
+
+        threading.Thread(target=_sync_embeddings_to_cloud, args=(user_id, embeddings, f"video_enroll_{video_file.filename}"), daemon=True).start()
 
         return jsonify({
             "success": True,
