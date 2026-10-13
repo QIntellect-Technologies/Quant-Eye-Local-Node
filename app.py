@@ -312,30 +312,22 @@ def reload_face_cache():
 
 
 # ==============================================================================
-# HIGH PERFORMANCE DUAL-THREADED CAMERA STREAM READER
 # ==============================================================================
+# HIGH PERFORMANCE DUAL-THREADED CAMERA STREAM READER & AI ENGINE
+# ==============================================================================
+
+# Global lock to serialize InsightFace / ONNX Runtime C++ execution across cameras
+# Completely prevents multi-threaded ONNX Runtime memory corruption and C++ abort crashes
+AI_INFERENCE_LOCK = threading.Lock()
 
 class NodeCameraReader:
     def __init__(self, camera_id: str, camera_name: str, rtsp_source: Any):
-        self.camera_id = camera_id
+        self.camera_id = str(camera_id)
         self.camera_name = camera_name
         self.rtsp_source = rtsp_source
         self.is_webcam = isinstance(rtsp_source, int) or (isinstance(rtsp_source, str) and rtsp_source.isdigit())
-        
-        if self.is_webcam:
-            self.rtsp_url = int(rtsp_source)
-            try:
-                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
-                if not self.cap.isOpened():
-                    self.cap = cv2.VideoCapture(self.rtsp_url)
-            except Exception:
-                self.cap = cv2.VideoCapture()
-        else:
-            self.rtsp_url = str(rtsp_source)
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap = None
+        self.cap_lock = threading.Lock()
         self.latest_frame = None
         self.latest_detections = []
         self.tracked_faces = {}
@@ -344,55 +336,91 @@ class NodeCameraReader:
         self.running = True
         self.lock = threading.Lock()
 
-        # Thread 1: Grabber
+        if self.is_webcam:
+            self.rtsp_url = int(rtsp_source)
+        else:
+            self.rtsp_url = str(rtsp_source)
+
+        # Thread 1: Grabber (handles opening capture in background without blocking Flask)
         threading.Thread(target=self._grabber_loop, daemon=True).start()
         # Thread 2: AI Processor
         threading.Thread(target=self._ai_loop, daemon=True).start()
 
+    def _open_capture(self):
+        try:
+            if self.is_webcam:
+                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
+                if not self.cap or not self.cap.isOpened():
+                    self.cap = cv2.VideoCapture(self.rtsp_url)
+            else:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;5000000|timeout;5000000"
+                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            if self.cap and self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                logger.info(f"[CAMERA CONNECTED] {self.camera_name} ({self.camera_id}) opened successfully.")
+                return True
+        except Exception as e:
+            logger.debug(f"Capture open failed for {self.camera_id}: {e}")
+            self.cap = None
+        return False
+
     def _grabber_loop(self):
         last_reconnect_attempt = 0
+        consecutive_failures = 0
         while self.running:
             try:
-                if not self.cap or not self.cap.isOpened():
+                need_open = False
+                with self.cap_lock:
+                    if not self.cap or not self.cap.isOpened():
+                        need_open = True
+
+                if need_open:
                     now = time.time()
-                    if now - last_reconnect_attempt > 1.5:
+                    if now - last_reconnect_attempt > 2.0:
                         last_reconnect_attempt = now
-                        try:
-                            if self.is_webcam:
-                                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
-                                if not self.cap.isOpened():
-                                    self.cap = cv2.VideoCapture(self.rtsp_url)
-                            else:
-                                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-                            if self.cap.isOpened():
-                                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                                logger.info(f"[CAMERA CONNECTED] {self.camera_name} ({self.camera_id}) opened successfully.")
-                        except Exception as ce:
-                            logger.debug(f"Reconnect attempt failed for {self.camera_id}: {ce}")
-                    time.sleep(0.5)
+                        with self.cap_lock:
+                            if self.running:
+                                self._open_capture()
+                    time.sleep(0.3)
                     continue
 
-                ret, frame = self.cap.read()
-                if ret and frame is not None:
+                frame = None
+                ret = False
+                with self.cap_lock:
+                    if not self.running:
+                        break
+                    if self.cap and self.cap.isOpened():
+                        ret, frame = self.cap.read()
+
+                if ret and frame is not None and frame.size > 0:
+                    consecutive_failures = 0
                     with self.lock:
                         self.latest_frame = frame
+                    time.sleep(0.01)
                 else:
-                    try:
-                        self.cap.release()
-                    except Exception:
-                        pass
-                    time.sleep(0.5)
+                    consecutive_failures += 1
+                    # Only release and trigger reconnect if continuous failure persists (15+ frames / ~1.5s)
+                    if consecutive_failures > 15:
+                        with self.cap_lock:
+                            if self.cap is not None:
+                                try:
+                                    self.cap.release()
+                                except Exception:
+                                    pass
+                                self.cap = None
+                        consecutive_failures = 0
+                        last_reconnect_attempt = time.time()
+                    time.sleep(0.04)
             except Exception as e:
-                # Catch any C++ / OpenCV exceptions gracefully so thread never terminates
                 logger.debug(f"Grabber loop exception in {self.camera_id}: {e}")
-                time.sleep(0.5)
+                time.sleep(0.2)
 
     def _ai_loop(self):
         last_ai_time = 0
         while self.running:
             now = time.time()
-            if (now - last_ai_time) < 0.05:  # ~20 FPS AI cadence
-                time.sleep(0.01)
+            if (now - last_ai_time) < 0.08:  # ~12 FPS AI check is optimal for real-time attendance
+                time.sleep(0.015)
                 continue
 
             frame = None
@@ -400,11 +428,19 @@ class NodeCameraReader:
                 if self.latest_frame is not None:
                     frame = self.latest_frame.copy()
 
-            if frame is None:
-                time.sleep(0.02)
+            if frame is None or frame.size == 0:
+                time.sleep(0.03)
                 continue
 
             last_ai_time = now
+
+            # Non-blocking lock: if another camera is currently executing InsightFace,
+            # this camera skips this single frame rather than piling up threads
+            # in ONNX Runtime/CUDA C++ engine. This completely prevents multi-camera C++ crashes!
+            if not AI_INFERENCE_LOCK.acquire(blocking=False):
+                time.sleep(0.01)
+                continue
+
             try:
                 face_results = fp.detect_and_extract_insightface(frame)
                 current_detections = []
@@ -477,6 +513,8 @@ class NodeCameraReader:
 
             except Exception as e:
                 logger.error(f"AI inference error in camera {self.camera_id}: {e}")
+            finally:
+                AI_INFERENCE_LOCK.release()
 
     def get_annotated_frame(self):
         with self.lock:
@@ -487,62 +525,124 @@ class NodeCameraReader:
 
     def release(self):
         self.running = False
-        try:
-            self.cap.release()
-        except Exception:
-            pass
+        with self.cap_lock:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
 
 
 def init_camera_streams():
     """Fetch camera list from Cloud if online, otherwise use local config."""
     global ACTIVE_CAMERA_READERS
-    cameras_to_use = CONFIG.get("cameras", [])
+def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]:
+    """
+    Fetch and combine all camera streams configured across:
+    1. Cloud Main Dashboard (/api/branches/{branch_id}/cameras)
+    2. Client Portal Cloud (/api/cameras?active_only=true)
+    3. Preserves valid existing cameras in config_node.json
+    Preserves all cameras by their unique camera_id without dropping distinct cameras that share RTSP sources.
+    """
+    cloud_url = CONFIG.get('cloud_url', 'https://quanteye-main-dashboard-production.up.railway.app').rstrip('/')
+    portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
 
-    org_id = CONFIG.get("organization_id")
-    branch_id = CONFIG.get("branch_id")
-    cloud_url = CONFIG.get('cloud_url', 'http://127.0.0.1:5100').rstrip('/')
+    collected_cams: Dict[str, Dict[str, Any]] = {}
 
-    # Fetch branch cameras from Cloud or Portal
+    def _add_cam(c: Any):
+        if not c or not isinstance(c, dict):
+            return
+        cam_id = str(c.get("camera_id") or "").strip()
+        raw_id = str(c.get("id") or "").strip()
+        url = str(c.get("rtsp_url") or "").strip()
+        if not url:
+            return
+
+        primary_id = cam_id or raw_id or f"cam_{len(collected_cams)+1}"
+        if primary_id in collected_cams:
+            return
+
+        # If primary_id is an integer (e.g. from portal) but has matching camera_id already collected, merge
+        if cam_id and any(existing.get("camera_id") == cam_id for existing in collected_cams.values()):
+            return
+
+        c_copy = dict(c)
+        c_copy["id"] = primary_id
+        c_copy["camera_id"] = primary_id
+        c_copy["name"] = c.get("name") or c.get("camera_name") or f"Camera {primary_id}"
+        c_copy["camera_name"] = c_copy["name"]
+        c_copy["rtsp_url"] = url
+        collected_cams[primary_id] = c_copy
+
+    # 1. Fetch from Cloud Main Dashboard
     if org_id and branch_id:
-        synced = False
         try:
-            cloud_cams_url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={org_id}"
-            req = urllib.request.Request(cloud_cams_url, method="GET")
-            with urllib.request.urlopen(req, timeout=3.5) as resp:
+            cloud_cams_url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={urllib.parse.quote(org_id)}"
+            req = urllib.request.Request(cloud_cams_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
-                    if "cameras" in data:
-                        cameras_to_use = data.get("cameras", [])
-                        CONFIG["cameras"] = cameras_to_use
-                        try:
-                            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                                json.dump(CONFIG, f, indent=2)
-                        except Exception:
-                            pass
-                        logger.info(f"[CLOUD SYNC] Synchronized {len(cameras_to_use)} cameras from Cloud for {org_id} / {branch_id}.")
-                        synced = True
+                    for c in data.get("cameras", []):
+                        _add_cam(c)
         except Exception as ce:
-            logger.debug(f"[CLOUD SYNC] Cloud camera query note: {ce}")
+            logger.debug(f"[CLOUD SYNC] Main cloud camera query note: {ce}")
 
-        # Secondary direct check with Client Portal if main cloud query was not reachable
-        if not synced:
-            try:
-                portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
-                portal_req = urllib.request.Request(f"{portal_url}/api/cameras?active_only=true", headers={"User-Agent": "QuantEye-Node"})
-                with urllib.request.urlopen(portal_req, timeout=3.5) as p_resp:
-                    if p_resp.status == 200:
-                        p_cams = json.loads(p_resp.read().decode('utf-8'))
-                        matching = [c for c in p_cams if (not c.get("organization_id") or c.get("organization_id") in (org_id, 'DEFAULT_ORG')) and (not c.get("branch_id") or c.get("branch_id") in (branch_id, 'DEFAULT_BRANCH'))]
-                        cameras_to_use = matching
-                        CONFIG["cameras"] = cameras_to_use
-                        try:
-                            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                                json.dump(CONFIG, f, indent=2)
-                        except Exception:
-                            pass
-                        logger.info(f"[PORTAL SYNC] Synchronized {len(matching)} cameras from Client Portal.")
-            except Exception as pe:
-                logger.debug(f"Direct portal check: {pe}")
+    # 2. Fetch from Client Portal Cloud (branch & org filtered)
+    if org_id and branch_id:
+        try:
+            req_url = f"{portal_url}/api/cameras?active_only=true&organization_id={urllib.parse.quote(org_id)}&branch_id={urllib.parse.quote(branch_id)}"
+            req = urllib.request.Request(req_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    p_cams = json.loads(resp.read().decode('utf-8'))
+                    if isinstance(p_cams, list):
+                        for c in p_cams:
+                            _add_cam(c)
+        except Exception as pe:
+            logger.debug(f"[PORTAL SYNC] Client portal camera query note: {pe}")
+
+    # 3. If no tenant cameras found in Portal yet, also check general Portal cameras
+    if not collected_cams:
+        try:
+            req_url = f"{portal_url}/api/cameras?active_only=true"
+            req = urllib.request.Request(req_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    p_cams = json.loads(resp.read().decode('utf-8'))
+                    if isinstance(p_cams, list):
+                        for c in p_cams:
+                            c_org = c.get("organization_id")
+                            c_br = c.get("branch_id")
+                            if (not c_org or c_org in (org_id, 'DEFAULT_ORG')) and (not c_br or c_br in (branch_id, 'DEFAULT_BRANCH')):
+                                _add_cam(c)
+        except Exception as pe2:
+            logger.debug(f"[PORTAL SYNC] Portal general cameras note: {pe2}")
+
+    # 4. If remote endpoints were temporarily unreachable, preserve existing local cameras
+    if not collected_cams:
+        for c in CONFIG.get("cameras", []):
+            _add_cam(c)
+
+    return list(collected_cams.values())
+
+
+def init_camera_streams():
+    """Fetch camera list in real time from Cloud or Client Portal and update streams."""
+    global ACTIVE_CAMERA_READERS
+    org_id = CONFIG.get("organization_id")
+    branch_id = CONFIG.get("branch_id")
+
+    cloud_cams = fetch_all_cloud_cameras(org_id, branch_id)
+    if cloud_cams:
+        CONFIG["cameras"] = cloud_cams
+        try:
+            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                json.dump(CONFIG, f, indent=2)
+        except Exception:
+            pass
+
+    cameras_to_use = CONFIG.get("cameras", [])
 
     with readers_lock:
         valid_cams = {}
@@ -593,20 +693,14 @@ def _background_camera_sync_loop():
             time.sleep(3.0)
             org_id = CONFIG.get("organization_id")
             branch_id = CONFIG.get("branch_id")
-            cloud_url = CONFIG.get('cloud_url', 'https://quanteye-main-dashboard-production.up.railway.app').rstrip('/')
             if org_id and branch_id:
-                url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={org_id}"
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
-                    if resp.status == 200:
-                        data = json.loads(resp.read().decode('utf-8'))
-                        if "cameras" in data:
-                            cams = data.get("cameras", [])
-                            cam_hash = json.dumps([(c.get("id") or c.get("camera_id"), c.get("rtsp_url")) for c in cams], sort_keys=True)
-                            if _last_cloud_cam_hash is not None and cam_hash != _last_cloud_cam_hash:
-                                logger.info(f"[REAL-TIME SYNC] Cloud camera changes detected. Reloading streams...")
-                                init_camera_streams()
-                            _last_cloud_cam_hash = cam_hash
+                cams = fetch_all_cloud_cameras(org_id, branch_id)
+                if cams:
+                    cam_hash = json.dumps([(c.get("id") or c.get("camera_id"), c.get("rtsp_url")) for c in cams], sort_keys=True)
+                    if _last_cloud_cam_hash is not None and cam_hash != _last_cloud_cam_hash:
+                        logger.info(f"[REAL-TIME SYNC] Cloud camera changes detected ({len(cams)} cameras). Reloading streams...")
+                        init_camera_streams()
+                    _last_cloud_cam_hash = cam_hash
         except Exception:
             pass
 
@@ -661,19 +755,50 @@ def camera_stream_feed(camera_id):
         return jsonify({"error": "Camera not found"}), 404
 
     def generate():
-        while True:
-            ret, frame = reader.get_annotated_frame()
-            if not ret or frame is None:
-                blank = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(blank, "CONNECTING CAMERA...", (160, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                _, jpeg = cv2.imencode('.jpg', blank)
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-                time.sleep(0.5)
-                continue
-            
-            _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-            time.sleep(0.03)
+        blank_bytes = None
+        try:
+            blank = np.zeros((360, 640, 3), dtype=np.uint8)
+            cv2.putText(blank, "CONNECTING CAMERA...", (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            _, blank_buf = cv2.imencode('.jpg', blank, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            blank_bytes = blank_buf.tobytes()
+        except Exception:
+            pass
+
+        try:
+            while True:
+                if not reader or not reader.running:
+                    break
+
+                ret, frame = reader.get_annotated_frame()
+                if not ret or frame is None or frame.size == 0:
+                    if blank_bytes:
+                        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + blank_bytes + b'\r\n')
+                    time.sleep(0.4)
+                    continue
+
+                try:
+                    h, w = frame.shape[:2]
+                    # Downscale 1080p/4K frames slightly to max 960px width for smooth grid streaming
+                    if w > 960:
+                        scale = 960.0 / w
+                        frame = cv2.resize(frame, (960, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+                    success, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    if not success:
+                        time.sleep(0.03)
+                        continue
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+                except (GeneratorExit, ConnectionResetError, BrokenPipeError):
+                    break
+                except Exception:
+                    time.sleep(0.04)
+                    continue
+
+                time.sleep(0.033)
+        except (GeneratorExit, ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as e:
+            logger.debug(f"Stream generator completed for {camera_id}: {e}")
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
@@ -716,6 +841,159 @@ def get_node_cloud_status():
         "cloud_url": cloud_url,
         "organization_id": CONFIG.get("organization_id"),
         "branch_id": CONFIG.get("branch_id")
+    })
+
+
+def fetch_active_cloud_shift(org_id: str = None, branch_id: str = None) -> Dict[str, Any]:
+    """
+    Fetch active shifts in real time from Cloud Client Portal (/api/shifts).
+    Calculates the currently active or default shift based on current time.
+    """
+    portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
+    shifts = []
+
+    # 1. Fetch from Cloud Client Portal
+    try:
+        req_url = f"{portal_url}/api/shifts"
+        if org_id:
+            req_url += f"?organization_id={urllib.parse.quote(org_id)}"
+        req = urllib.request.Request(req_url, headers={
+            "User-Agent": "QuantEye-Node",
+            "X-Client-Auth": "true"
+        }, method="GET")
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                shifts = data.get("shifts", [])
+    except Exception as e:
+        logger.debug(f"[SHIFT SYNC] Could not fetch shifts from cloud ({e}). Falling back to local.")
+
+    # 2. Fallback to local DB if available
+    if not shifts:
+        try:
+            with sqlite3.connect(db.DB_PATH) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT id, name, start_time, end_time, grace_period_minutes, COALESCE(is_default, 1) FROM shifts")
+                for r in cur.fetchall():
+                    shifts.append({
+                        "id": r[0], "name": r[1], "start_time": r[2], "end_time": r[3],
+                        "grace_period_minutes": r[4], "is_default": bool(r[5])
+                    })
+        except Exception:
+            pass
+
+    if not shifts:
+        return {
+            "name": "Standard Shift",
+            "start_time": "09:00",
+            "end_time": "17:00",
+            "formatted": "09:00 AM - 05:00 PM",
+            "display": "Standard Shift (09:00 AM - 05:00 PM)",
+            "is_active_now": True,
+            "grace_period_minutes": 15
+        }
+
+    now = datetime.now()
+    cur_mins = now.hour * 60 + now.minute
+
+    def to_mins(t_str):
+        try:
+            parts = str(t_str).strip().split(':')
+            return int(parts[0]) * 60 + int(parts[1])
+        except Exception:
+            return 0
+
+    def format_12h(t_str):
+        try:
+            parts = str(t_str).strip().split(':')
+            h, m = int(parts[0]), int(parts[1])
+            period = "AM" if h < 12 else "PM"
+            h12 = h % 12
+            if h12 == 0: h12 = 12
+            return f"{h12:02d}:{m:02d} {period}"
+        except Exception:
+            return str(t_str)
+
+    active_shift = None
+    for s in shifts:
+        s_start = to_mins(s.get("start_time", "09:00"))
+        s_end = to_mins(s.get("end_time", "17:00"))
+        if s_start <= s_end:
+            if s_start <= cur_mins <= s_end:
+                active_shift = s
+                break
+        else: # Overnight shift
+            if cur_mins >= s_start or cur_mins <= s_end:
+                active_shift = s
+                break
+
+    if not active_shift:
+        default_shifts = [s for s in shifts if s.get("is_default")]
+        active_shift = default_shifts[0] if default_shifts else shifts[0]
+
+    s_name = active_shift.get("name", "Shift")
+    start_12h = format_12h(active_shift.get("start_time", "09:00"))
+    end_12h = format_12h(active_shift.get("end_time", "17:00"))
+    grace = active_shift.get("grace_period_minutes", 15)
+
+    return {
+        "id": active_shift.get("id"),
+        "name": s_name,
+        "start_time": active_shift.get("start_time"),
+        "end_time": active_shift.get("end_time"),
+        "start_12h": start_12h,
+        "end_12h": end_12h,
+        "formatted": f"{start_12h} - {end_12h}",
+        "grace_period_minutes": grace,
+        "display": f"{s_name} ({start_12h} - {end_12h})"
+    }
+
+
+@app.route('/api/node/shift', methods=['GET'])
+def get_node_active_shift():
+    """Real-time active shift timing endpoint for header display."""
+    org_id = CONFIG.get("organization_id")
+    branch_id = CONFIG.get("branch_id")
+    shift_info = fetch_active_cloud_shift(org_id, branch_id)
+    return jsonify({
+        "success": True,
+        "shift": shift_info
+    })
+
+
+@app.route('/api/node/logout', methods=['POST'])
+def api_node_logout():
+    """
+    Log out from current organization/branch.
+    Clears runtime state, stops active camera stream readers, and resets config_node.json.
+    """
+    global CONFIG, ACTIVE_CAMERA_READERS
+    with readers_lock:
+        for cid, reader in list(ACTIVE_CAMERA_READERS.items()):
+            try:
+                reader.release()
+            except Exception:
+                pass
+        ACTIVE_CAMERA_READERS.clear()
+
+    CONFIG['linked'] = False
+    CONFIG['organization_id'] = None
+    CONFIG['organization_name'] = None
+    CONFIG['branch_id'] = None
+    CONFIG['branch_name'] = None
+    CONFIG['branch_key'] = None
+    CONFIG['cameras'] = []
+
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Error persisting reset config: {e}")
+
+    logger.info("[NODE LOGOUT] Successfully logged out from current organization.")
+    return jsonify({
+        "success": True,
+        "message": "Logged out successfully. Node is ready to bind to another organization."
     })
 
 
@@ -1168,6 +1446,143 @@ def api_node_sync_employees():
         return jsonify({"success": True, "message": "Profiles synchronized successfully"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/node/pending-staff', methods=['GET'])
+def api_node_pending_staff():
+    """
+    Return list of staff registered from Cloud for this tenant whose face embeddings are pending.
+    """
+    org_id = CONFIG.get("organization_id", "")
+    branch_id = CONFIG.get("branch_id", "")
+    cloud_url = CONFIG.get("cloud_url", "http://127.0.0.1:5100")
+
+    # Try background sync if online
+    if org_id and branch_id:
+        try:
+            sync_client_profiles_from_cloud(org_id, branch_id, cloud_url)
+        except Exception:
+            pass
+
+    try:
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            try: cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
+            except Exception: pass
+            try: cur.execute("ALTER TABLE users ADD COLUMN branch_id TEXT")
+            except Exception: pass
+
+            cur.execute("""
+                SELECT u.id, u.name, COALESCE(u.department, 'General'), COALESCE(u.position, 'Staff Member'), 
+                       COALESCE(u.notes, ''), COUNT(e.id) as emb_count, COALESCE(u.email, '')
+                FROM users u
+                LEFT JOIN embeddings e ON u.id = e.user_id
+                WHERE (u.organization_id = ? AND u.branch_id = ?)
+                   OR (u.organization_id IS NULL OR u.organization_id = '' OR u.organization_id = 'DEFAULT_ORG')
+                GROUP BY u.id
+                ORDER BY u.id DESC
+            """, (org_id, branch_id))
+            rows = cur.fetchall()
+
+            all_staff = []
+            pending_staff = []
+            for r in rows:
+                item = {
+                    "id": r[0],
+                    "name": r[1],
+                    "department": r[2],
+                    "position": r[3],
+                    "employee_code": r[4] or f"EMP-{r[0]}",
+                    "embedding_count": r[5],
+                    "has_embedding": (r[5] > 0),
+                    "email": r[6]
+                }
+                all_staff.append(item)
+                if r[5] == 0:
+                    pending_staff.append(item)
+
+            return jsonify({
+                "success": True,
+                "pending": pending_staff,
+                "pending_count": len(pending_staff),
+                "total_count": len(all_staff),
+                "all_staff": all_staff
+            })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/node/train-video', methods=['POST'])
+def api_node_train_video():
+    """
+    Train an employee's face embedding from an uploaded short video (or webcam recording).
+    Extracts face frames, extracts 512D InsightFace vectors, persists embeddings in SQLite,
+    and refreshes the live face recognition cache immediately.
+    """
+    user_id = request.form.get('user_id')
+    if not user_id:
+        data = request.get_json(silent=True) or {}
+        user_id = data.get('user_id')
+
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id is required"}), 400
+
+    if 'video' not in request.files:
+        return jsonify({"success": False, "error": "Video file is required"}), 400
+
+    video_file = request.files['video']
+    if not video_file or video_file.filename == '':
+        return jsonify({"success": False, "error": "Valid video file is required"}), 400
+
+    temp_path = None
+    try:
+        import tempfile
+        ext = os.path.splitext(video_file.filename)[1] or '.mp4'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+            temp_path = tf.name
+            video_file.save(temp_path)
+
+        # Call InsightFace video processor
+        enroll_res = fp.process_enrollment_video(temp_path, max_frames=120)
+        if not enroll_res or not enroll_res.get('success') or not enroll_res.get('embeddings'):
+            err = enroll_res.get('error') or "No valid face embeddings could be extracted from video. Ensure good lighting and face visibility."
+            return jsonify({"success": False, "error": err}), 400
+
+        embeddings = enroll_res['embeddings']
+        saved_count = 0
+
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM embeddings WHERE user_id = ?", (user_id,))
+            for emb in embeddings:
+                emb_list = emb.tolist() if isinstance(emb, np.ndarray) else list(emb)
+                cur.execute(
+                    "INSERT INTO embeddings (user_id, embedding, source_video) VALUES (?, ?, ?)",
+                    (user_id, json.dumps(emb_list).encode(), f"video_enroll_{video_file.filename}")
+                )
+                saved_count += 1
+            conn.commit()
+
+        # Instantly refresh in-memory face matching matrix
+        reload_face_cache()
+        logger.info(f"[VIDEO ENROLL SUCCESS] Enrolled {saved_count} face embeddings for user {user_id}")
+
+        return jsonify({
+            "success": True,
+            "message": f"Successfully trained {saved_count} face embeddings! Face recognition is now active for this staff member.",
+            "user_id": user_id,
+            "embeddings_count": saved_count
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error training video: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 def start_client_node(port: int = 5005):

@@ -3,1005 +3,1867 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>QuantEye Live AI Attendance Node</title>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <title>Live AI Attendance | QIntellect Technologies</title>
+  <!-- Google Fonts: Outfit & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <!-- FontAwesome 6 -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- Bootstrap 5 CSS -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+
   <style>
     :root {
-      --bg: #090e17;
-      --card-bg: #111927;
-      --border: #1e293b;
-      --teal: #3aafa9;
-      --teal-glow: rgba(58, 175, 169, 0.35);
-      --green: #10b981;
-      --red: #ef4444;
-      --text: #f8fafc;
-      --muted: #94a3b8;
+      --bg-primary: #eef8ff;
+      --bg-secondary: #f7fcff;
+      --bg-card: #ffffff;
+      --border-color: #cfe8f7;
+      --text-primary: #173042;
+      --text-secondary: #628095;
+      --accent-primary: #0284c7;
+      --accent-secondary: #38bdf8;
+      --accent-success: #10b981;
+      --accent-danger: #ef4444;
+      --accent-warning: #f59e0b;
+      --sidebar-width: 250px;
     }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
     body {
-      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      height: 100vh;
-      overflow: hidden;
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      min-height: 100vh;
+      overflow-x: hidden;
+      display: flex;
+    }
+
+    /* =========================================================================
+       PERSISTENT SIDEBAR NAVIGATION (ALWAYS VISIBLE)
+       ========================================================================= */
+    .sidebar {
+      width: var(--sidebar-width);
+      background: #ffffff;
+      border-right: 1px solid var(--border-color);
       display: flex;
       flex-direction: column;
-    }
-
-    /* TOP BAR */
-    .header {
-      height: 62px;
-      background: rgba(17, 25, 39, 0.95);
-      backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 20px;
-      flex-shrink: 0;
+      padding: 20px 14px 18px;
+      position: fixed;
+      height: 100vh;
+      left: 0;
+      top: 0;
       z-index: 100;
+      box-shadow: 6px 0 24px rgba(15, 23, 42, 0.04);
+      user-select: none;
     }
-    .brand {
+
+    .sidebar-brand {
       display: flex;
       align-items: center;
-      gap: 12px;
-      font-size: 1.25rem;
+      gap: 10px;
+      padding: 6px 12px 18px;
+      border-bottom: 1px solid #e2f1fb;
+      margin-bottom: 18px;
+    }
+
+    .sidebar-brand i {
+      font-size: 1.45rem;
+      color: var(--accent-primary);
+    }
+
+    .sidebar-brand span {
       font-weight: 800;
-      letter-spacing: -0.5px;
-    }
-    .brand-badge {
-      background: linear-gradient(135deg, var(--teal), #2b7a78);
-      width: 38px;
-      height: 38px;
-      border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 0 0 15px var(--teal-glow);
-      font-size: 1.1rem;
-    }
-    .brand span { color: var(--teal); }
-
-    .node-info {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-size: 0.9rem;
-    }
-    .branch-pill {
-      background: rgba(30, 41, 59, 0.75);
-      padding: 6px 14px;
-      border-radius: 20px;
-      border: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-weight: 600;
-      cursor: pointer;
-      user-select: none;
-      transition: all 0.2s;
-    }
-    .branch-pill:hover {
-      border-color: var(--teal);
-      background: rgba(58, 175, 169, 0.15);
-    }
-    .cloud-status {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 14px;
-      border-radius: 20px;
-      font-weight: 600;
-      font-size: 0.85rem;
-      background: rgba(16, 185, 129, 0.1);
-      border: 1px solid rgba(16, 185, 129, 0.3);
-      color: #34d399;
-      user-select: none;
-    }
-    .cloud-status.offline {
-      background: rgba(239, 68, 68, 0.1);
-      border-color: rgba(239, 68, 68, 0.3);
-      color: #f87171;
-    }
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: currentColor;
-      box-shadow: 0 0 8px currentColor;
-      animation: pulse 2s infinite;
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.4; transform: scale(0.85); }
+      font-size: 0.98rem;
+      color: #0f172a;
+      letter-spacing: -0.3px;
+      line-height: 1.2;
     }
 
-    .btn-top {
-      background: rgba(58,175,169,0.2);
-      border: 1px solid var(--teal);
-      color: var(--teal);
-      border-radius: 10px;
-      padding: 8px 14px;
+    .sidebar-brand small {
+      display: block;
+      font-size: 0.68rem;
       font-weight: 700;
-      font-size: 0.88rem;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      transition: all 0.2s;
-      user-select: none;
-    }
-    .btn-top:hover {
-      background: var(--teal);
-      color: #090e17;
-      box-shadow: 0 0 12px var(--teal-glow);
-    }
-    .btn-top-secondary {
-      background: rgba(30, 41, 59, 0.8);
-      border: 1px solid var(--border);
-      color: var(--text);
-    }
-    .btn-top-secondary:hover {
-      background: #1e293b;
-      color: #fff;
-    }
-
-    /* MAIN CONTAINER */
-    .main-content {
-      flex: 1;
-      display: grid;
-      grid-template-columns: 1fr 380px;
-      gap: 16px;
-      padding: 16px;
-      overflow: hidden;
-    }
-
-    /* CAMERA GRID */
-    .camera-stage {
-      background: #060a10;
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      overflow: hidden;
-      display: grid;
-      gap: 12px;
-      padding: 12px;
-      height: 100%;
-      width: 100%;
-    }
-    .grid-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
-    .grid-2 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
-    .grid-3 { grid-template-columns: repeat(3, 1fr); grid-template-rows: 1fr; }
-    .grid-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
-    .grid-5-6 { grid-template-columns: repeat(3, 1fr); grid-template-rows: 1fr 1fr; }
-    .grid-multi { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); grid-auto-rows: 1fr; }
-
-    .camera-cell {
-      position: relative;
-      background: #020408;
-      border-radius: 14px;
-      overflow: hidden;
-      border: 1px solid #1e293b;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      height: 100%;
-      width: 100%;
-    }
-    .camera-cell img {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      background: #000;
-    }
-    .cam-tag {
-      position: absolute;
-      top: 12px;
-      left: 12px;
-      background: rgba(15, 23, 42, 0.85);
-      border: 1px solid var(--border);
-      padding: 4px 10px;
-      border-radius: 8px;
-      font-size: 0.75rem;
-      font-weight: 700;
+      color: #64748b;
       letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .sidebar-menu {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex: 1;
+    }
+
+    .menu-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 0.88rem;
+      color: #475569;
+      cursor: pointer;
+      transition: all 0.18s ease;
+      position: relative;
+    }
+
+    .menu-item i {
+      font-size: 1.1rem;
+      width: 20px;
+      text-align: center;
+      color: #64748b;
+      transition: color 0.18s ease;
+    }
+
+    .menu-item:hover {
+      background: #f0f9ff;
+      color: #0284c7;
+    }
+
+    .menu-item:hover i {
+      color: #0284c7;
+    }
+
+    .menu-item.active {
+      background: #e0f2fe;
+      color: #0369a1;
+      font-weight: 700;
+      border: 1px solid #bae6fd;
+    }
+
+    .menu-item.active i {
+      color: #0284c7;
+    }
+
+    .sidebar-counter-badge {
+      margin-left: auto;
+      background: #fef3c7;
+      color: #b45309;
+      border: 1px solid #fde68a;
+      font-size: 0.72rem;
+      font-weight: 800;
+      padding: 2px 7px;
+      border-radius: 10px;
+    }
+
+    .sidebar-footer {
+      border-top: 1px solid #e2f1fb;
+      padding-top: 14px;
+      font-size: 0.75rem;
+      color: #94a3b8;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .sidebar-footer .status-row {
       display: flex;
       align-items: center;
       gap: 6px;
-      backdrop-filter: blur(8px);
-      z-index: 2;
-    }
-    .cam-live-indicator {
-      width: 6px;
-      height: 6px;
-      background: var(--red);
-      border-radius: 50%;
-      box-shadow: 0 0 6px var(--red);
-      animation: pulse 1.5s infinite;
+      font-weight: 700;
+      color: #10b981;
     }
 
-    /* LIVE ATTENDANCE TICKER (RIGHT PANEL) */
-    .ticker-panel {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
+    .sidebar-footer .pulse-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+      animation: pulse-glow 1.5s infinite;
     }
-    .ticker-header {
-      padding: 16px 20px;
-      border-bottom: 1px solid var(--border);
+
+    @keyframes pulse-glow {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.2); opacity: 0.6; }
+    }
+
+    /* =========================================================================
+       MAIN PANEL & GLOBAL HEADER
+       ========================================================================= */
+    .main-panel {
+      width: calc(100% - var(--sidebar-width));
+      margin-left: var(--sidebar-width);
+      min-height: 100vh;
+      padding: 20px 24px 30px;
+      overflow-y: auto;
+      transition: all 0.25s ease;
+    }
+
+    /* Global Application Header */
+    .app-global-header {
+      background: #ffffff;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 11px 20px;
+      margin-bottom: 20px;
       display: flex;
       align-items: center;
       justify-content: space-between;
+      box-shadow: 0 4px 16px rgba(61, 159, 212, 0.08);
+      flex-wrap: wrap;
+      gap: 12px;
     }
-    .ticker-title {
-      font-size: 1rem;
-      font-weight: 800;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .ticker-count {
-      font-size: 0.8rem;
-      background: rgba(58, 175, 169, 0.15);
-      color: var(--teal);
-      border: 1px solid var(--teal);
-      padding: 2px 8px;
-      border-radius: 12px;
-      font-weight: 700;
-    }
-    .ticker-list {
-      flex: 1;
-      overflow-y: auto;
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .ticker-item {
-      background: rgba(30, 41, 59, 0.4);
-      border: 1px solid rgba(51, 65, 85, 0.4);
-      border-radius: 12px;
-      padding: 12px;
+
+    .header-left-cluster {
       display: flex;
       align-items: center;
       gap: 12px;
-      animation: slideIn 0.3s ease-out;
+      flex-wrap: wrap;
     }
-    @keyframes slideIn {
-      from { opacity: 0; transform: translateY(-10px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-    .ticker-photo {
-      width: 44px;
-      height: 44px;
-      border-radius: 10px;
-      object-fit: cover;
-      background: #1e293b;
-      border: 1px solid var(--teal);
-    }
-    .ticker-details {
-      flex: 1;
-      min-width: 0;
-    }
-    .ticker-name {
-      font-weight: 700;
-      font-size: 0.95rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      color: #fff;
-    }
-    .ticker-meta {
-      font-size: 0.78rem;
-      color: var(--muted);
+
+    .header-company-name {
+      font-weight: 800;
+      color: #173042;
+      letter-spacing: -0.2px;
       display: flex;
       align-items: center;
       gap: 8px;
-      margin-top: 2px;
-    }
-    .ticker-time {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.75rem;
-      color: var(--teal);
-      font-weight: 600;
-    }
-    .ticker-pill {
-      background: rgba(16, 185, 129, 0.15);
-      color: #34d399;
-      font-size: 0.7rem;
-      font-weight: 700;
-      padding: 2px 8px;
-      border-radius: 8px;
-      border: 1px solid rgba(16, 185, 129, 0.3);
+      font-size: 0.98rem;
     }
 
-    /* MODAL BASE */
-    .modal-backdrop {
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100vw;
-      height: 100vh;
-      background: rgba(0, 0, 0, 0.85);
-      z-index: 99999;
-      backdrop-filter: blur(8px);
+    .header-separator {
+      color: #bae6fd;
+      font-weight: 300;
+      user-select: none;
+    }
+
+    .header-current-page {
+      font-weight: 700;
+      color: #334155;
+      font-size: 0.9rem;
+    }
+
+    .header-right-cluster {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .header-system-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-weight: 700;
+      font-size: 0.78rem;
+      background: #ecfdf5;
+      border: 1px solid #a7f3d0;
+      color: #065f46;
+    }
+
+    .status-indicator-dot {
+      width: 7px;
+      height: 7px;
+      background-color: #10b981;
+      border-radius: 50%;
+      animation: pulse-glow 1.5s infinite;
+    }
+
+    .header-user-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 700;
+      color: #1e293b;
+      background: #f8fafc;
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      border: 1px solid #e2e8f0;
+    }
+
+    .header-user-badge i {
+      color: #0284c7;
+    }
+
+    /* Header Action Buttons */
+    .btn-header-action {
+      border: none;
+      outline: none;
+      padding: 5px 12px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+    }
+
+    .btn-header-restart {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      color: #1d4ed8;
+    }
+
+    .btn-header-restart:hover {
+      background: #dbeafe;
+      color: #1e40af;
+      transform: translateY(-1px);
+    }
+
+    .btn-header-restart.loading i {
+      animation: spin 1s infinite linear;
+    }
+
+    @keyframes spin {
+      100% { transform: rotate(360deg); }
+    }
+
+    .btn-header-logout {
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px solid rgba(239, 68, 68, 0.28);
+      color: #dc2626;
+    }
+
+    .btn-header-logout:hover {
+      background: #fee2e2;
+      color: #b91c1c;
+      transform: translateY(-1px);
+    }
+
+    /* Page View Containers */
+    .page-view {
+      display: none;
+    }
+
+    .page-view.active {
+      display: block;
+    }
+
+    .page-header {
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .page-header h1 {
+      font-size: 1.35rem;
+      font-weight: 800;
+      color: #0f172a;
+      margin-bottom: 2px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .page-subtitle {
+      font-size: 0.82rem;
+      color: var(--text-secondary);
+      margin: 0;
+    }
+
+    /* =========================================================================
+       PAGE 1: LIVE AI ATTENDANCE (EXACT CCTV GRID & ACTIVITY FEED)
+       ========================================================================= */
+    .live-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      background: #ffffff;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 9px 14px;
+      margin-bottom: 14px;
+      box-shadow: 0 4px 14px rgba(61, 159, 212, 0.05);
+    }
+
+    .cctv-camera-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .camera-tab-btn {
+      background-color: #ffffff;
+      border: 1.5px solid #cfe8f7;
+      color: #475569;
+      padding: 6px 13px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .camera-tab-btn:hover {
+      color: #0369a1;
+      border-color: #38bdf8;
+      background: #f0f9ff;
+    }
+
+    .camera-tab-btn.active {
+      background: #0284c7;
+      border-color: #0284c7;
+      color: #ffffff;
+      box-shadow: 0 2px 8px rgba(2, 132, 199, 0.25);
+    }
+
+    .live-layout-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .live-layout-btn {
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
+      color: #475569;
+      border-radius: 6px;
+      padding: 5px 11px;
+      font-size: 0.78em;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.15s ease;
+    }
+
+    .live-layout-btn:hover {
+      border-color: #0284c7;
+      color: #0284c7;
+    }
+
+    .live-layout-btn.active {
+      background: #0284c7;
+      border-color: #0284c7;
+      color: #ffffff;
+    }
+
+    /* Main CCTV Stage Layout (Left: Grid, Right: Compact Feed) */
+    .cctv-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 16px;
+      align-items: stretch;
+    }
+
+    @media (max-width: 1100px) {
+      .cctv-layout {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .cctv-main-monitoring {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    /* Single Camera View Container */
+    .cctv-screen-wrapper {
+      position: relative;
+      width: 100%;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid #1e293b;
+      background: #020617;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+      aspect-ratio: 16 / 9;
       display: flex;
       align-items: center;
       justify-content: center;
     }
-    .modal-box {
-      background: #111927;
-      border: 1px solid #1e293b;
-      border-radius: 20px;
-      padding: 28px;
-      box-shadow: 0 25px 60px rgba(0,0,0,0.6);
-      text-align: left;
-      position: relative;
-      max-height: 90vh;
-      overflow-y: auto;
+
+    .cctv-screen-wrapper:fullscreen,
+    .cctv-screen-wrapper:-webkit-full-screen {
+      width: 100vw !important;
+      height: 100vh !important;
+      border-radius: 0 !important;
+      border: none !important;
+      background: #000 !important;
     }
-    .form-label {
-      display: block;
-      font-size: 0.82rem;
-      font-weight: 700;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }
-    .form-input {
+
+    .cctv-viewport {
       width: 100%;
-      padding: 10px 14px;
-      background: #090e17;
-      border: 1px solid #1e293b;
-      border-radius: 10px;
-      color: #fff;
-      font-size: 0.88rem;
-      outline: none;
-      box-sizing: border-box;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
     }
-    .form-input:focus {
-      border-color: var(--teal);
+
+    .cctv-viewport img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center;
+      display: block;
+      background: #020617;
+    }
+
+    .cctv-badge {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(6px);
+      color: #10b981;
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-size: 0.75em;
+      font-weight: 700;
+      letter-spacing: 0.4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    .cctv-badge-dot {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      background-color: #10b981;
+      border-radius: 50%;
+      animation: pulse-glow 1.5s infinite;
+    }
+
+    .cctv-top-actions {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      z-index: 15;
+    }
+
+    .cctv-fullscreen-btn {
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(6px);
+      color: #f1f5f9;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 0.78em;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+    }
+
+    .cctv-fullscreen-btn:hover {
+      background: #1e293b;
+      color: #38bdf8;
+      border-color: #38bdf8;
+      transform: scale(1.02);
+    }
+
+    /* Multi-Camera Grid (STRICT 2-COLUMN GRID) */
+    .cctv-multi-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+      width: 100%;
+    }
+
+    @media (max-width: 768px) {
+      .cctv-multi-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .grid-cam-card {
+      position: relative;
+      background: #020617;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid #1e293b;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+      aspect-ratio: 16 / 9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .grid-cam-card img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #020617;
+      display: block;
+    }
+
+    /* Compact Attendance Activity Feed */
+    .live-compact-feed {
+      background: #ffffff;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 165px);
+      min-height: 520px;
+      overflow: hidden;
+      box-shadow: 0 4px 16px rgba(61, 159, 212, 0.05);
+    }
+
+    .live-compact-header {
+      padding: 12px 14px;
+      background: #f8fafc;
+      border-bottom: 1px solid #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .live-compact-title {
+      font-size: 0.82em;
+      font-weight: 800;
+      color: #0f172a;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .live-compact-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .compact-attend-card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-left: 3.5px solid #10b981;
+      border-radius: 8px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .compact-attend-card:hover {
+      transform: translateX(2px);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+    }
+
+    .compact-attend-name {
+      font-size: 0.84rem;
+      font-weight: 700;
+      color: #0f172a;
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .compact-attend-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 0.72rem;
+      color: #64748b;
+      margin-top: 2px;
+    }
+
+    .compact-attend-time {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: #0284c7;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* =========================================================================
+       PAGE 2: STAFF TRAINING QUEUE (ONLY PENDING STAFF)
+       ========================================================================= */
+    .stats-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .stat-card {
+      background: #ffffff;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      box-shadow: 0 4px 14px rgba(61, 159, 212, 0.05);
+    }
+
+    .stat-card-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      flex-shrink: 0;
+    }
+
+    .stat-card-info h3 {
+      font-size: 1.45rem;
+      font-weight: 800;
+      margin: 0;
+      line-height: 1.1;
+      color: #0f172a;
+    }
+
+    .stat-card-info p {
+      margin: 0;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .training-table-card {
+      background: #ffffff;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 16px rgba(61, 159, 212, 0.06);
+    }
+
+    .training-filter-bar {
+      padding: 12px 18px;
+      background: #f8fbfe;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .search-input-wrap {
+      position: relative;
+      flex: 1;
+      max-width: 380px;
+    }
+
+    .search-input-wrap i {
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: #0284c7;
+      font-size: 0.85rem;
+    }
+
+    .search-input-wrap input {
+      width: 100%;
+      padding: 7px 12px 7px 34px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      font-size: 0.84rem;
+      outline: none;
+      background: #ffffff;
+    }
+
+    .search-input-wrap input:focus {
+      border-color: #0284c7;
+      box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.12);
+    }
+
+    .training-table {
+      width: 100%;
+      margin: 0;
+      border-collapse: collapse;
+    }
+
+    .training-table th {
+      background: #f8fafc;
+      padding: 10px 14px;
+      font-size: 0.74rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #64748b;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .training-table td {
+      padding: 10px 14px;
+      font-size: 0.82rem;
+      border-bottom: 1px solid #f1f5f9;
+      vertical-align: middle;
+    }
+
+    .training-table tbody tr:hover {
+      background: #f8fbff;
+    }
+
+    .badge-pending {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px;
+      border-radius: 12px;
+      font-size: 0.72rem;
+      font-weight: 800;
+      background: #fffbeb;
+      color: #d97706;
+      border: 1px solid #fde68a;
+    }
+
+    .btn-train-action {
+      background: #0284c7;
+      color: #ffffff;
+      border: none;
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+    }
+
+    .btn-train-action:hover {
+      background: #0369a1;
+      transform: translateY(-1px);
+      box-shadow: 0 2px 8px rgba(2, 132, 199, 0.3);
+    }
+
+    /* Modal Styling */
+    .app-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.6);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 20px;
+    }
+
+    .app-modal-card {
+      background: #ffffff;
+      border-radius: 16px;
+      width: 100%;
+      max-width: 540px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+      overflow: hidden;
+      animation: modalFadeIn 0.2s ease-out;
+    }
+
+    @keyframes modalFadeIn {
+      from { transform: scale(0.96); opacity: 0; }
+      to { transform: scale(1); opacity: 1; }
+    }
+
+    .app-modal-header {
+      padding: 16px 20px;
+      background: #f8fafc;
+      border-bottom: 1px solid #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .app-modal-header h4 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 800;
+      color: #0f172a;
+    }
+
+    .app-modal-body {
+      padding: 20px;
+    }
+
+    .app-modal-footer {
+      padding: 14px 20px;
+      background: #f8fafc;
+      border-top: 1px solid #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    /* Toast Notification Container */
+    .app-toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 2000;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    .app-toast {
+      background: #ffffff;
+      border: 1px solid #cfe8f7;
+      border-left: 4px solid #0284c7;
+      border-radius: 10px;
+      padding: 12px 18px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.12);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #173042;
+      animation: slideInRight 0.25s ease-out;
+      pointer-events: auto;
+      max-width: 360px;
+    }
+
+    .app-toast.success { border-left-color: #10b981; }
+    .app-toast.error { border-left-color: #ef4444; }
+
+    @keyframes slideInRight {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
     }
   </style>
 </head>
 <body>
 
-  <!-- TOP HEADER -->
-  <header class="header">
-    <div class="brand">
-      <div class="brand-badge">⚡</div>
-      <div>QuantEye <span>AI Node</span></div>
+  <!-- Floating Toast Notifications -->
+  <div id="toastContainer" class="app-toast-container"></div>
+
+  <!-- =========================================================================
+       PERSISTENT SIDEBAR NAVIGATION (ALWAYS VISIBLE)
+       ========================================================================= -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <i class="fa-solid fa-circle-nodes"></i>
+      <div>
+        <span>QIntellect Technologies</span>
+        <small>AI Edge Vision Node</small>
+      </div>
     </div>
 
-    <div class="node-info">
-      <!-- Clickable Branch Switch Pill -->
-      <div class="branch-pill" id="branchDisplayPill" onclick="openActivationModal()" title="Click to Connect or Switch Branch Key">
-        <span style="color:var(--teal)">🔑</span>
-        <span id="headerBranchName">
-          {% if config.linked %}
-            {{ config.organization_name }} &bull; {{ config.branch_name }}
-          {% else %}
-            Unconfigured Node &bull; Setup Required
-          {% endif %}
+    <ul class="sidebar-menu">
+      <li id="menuItemLive" class="menu-item active" onclick="switchPage('live-view', this)">
+        <i class="fa-solid fa-display"></i>
+        <span>Live AI Attendance</span>
+      </li>
+      <li id="menuItemTraining" class="menu-item" onclick="switchPage('training-view', this)">
+        <i class="fa-solid fa-user-graduate"></i>
+        <span>Staff Training</span>
+        <span id="sidebarPendingBadge" class="sidebar-counter-badge">0</span>
+      </li>
+    </ul>
+
+    <div class="sidebar-footer">
+      <div class="status-row">
+        <span class="pulse-dot"></span>
+        <span>Local AI Engine Active</span>
+      </div>
+      <div>Port: 5005 &bull; InsightFace 512D</div>
+    </div>
+  </aside>
+
+  <!-- =========================================================================
+       MAIN PANEL & GLOBAL HEADER
+       ========================================================================= -->
+  <main class="main-panel">
+    <!-- Top Global Header -->
+    <header class="app-global-header">
+      <div class="header-left-cluster">
+        <span class="header-company-name">
+          <i class="fa-solid fa-circle-nodes" style="color:#0284c7;"></i>
+          QIntellect Technologies
         </span>
+        <span class="header-separator">|</span>
+        <span id="headerBranchBadge" style="display:inline-flex; align-items:center; gap:6px; background:#e0f2fe; color:#0369a1; padding:4px 11px; border-radius:8px; font-weight:700; font-size:0.82rem; border:1px solid #bae6fd;" title="Current Organization & Branch">
+          <i class="fa-solid fa-building" style="color:#0284c7;"></i>
+          <span id="headerBranchNameText">{{ config.get('organization_name', 'QuantumMind') }} &bull; {{ config.get('branch_name', 'Main Branch') }}</span>
+        </span>
+        <span class="header-separator">|</span>
+        <span id="headerShiftBadge" style="display:inline-flex; align-items:center; gap:6px; background:#eff6ff; color:#1d4ed8; padding:4px 12px; border-radius:8px; font-weight:700; font-size:0.82rem; border:1px solid #bfdbfe;" title="Active Cloud Shift Timing">
+          <i class="fa-solid fa-clock" style="color:#2563eb;"></i>
+          <span id="headerShiftText">Loading Shift...</span>
+        </span>
+        <span class="header-separator">|</span>
+        <span class="header-current-page" id="headerCurrentPageTitle">Live AI Attendance</span>
       </div>
 
-      <!-- Cloud Status Badge -->
-      <div id="cloudStatusBadge" class="cloud-status">
-        <div class="status-dot"></div>
-        <span id="cloudStatusText">Cloud Connected</span>
+      <div class="header-right-cluster">
+        <div class="header-system-status">
+          <span class="status-indicator-dot"></span>
+          <span>System Online</span>
+        </div>
+        <span class="header-separator">|</span>
+        <div class="header-user-badge" title="Authenticated User">
+          <i class="fa-solid fa-user-tie"></i>
+          <span id="headerUserName">{{ config.get('username') or config.get('organization_name', 'QuantumMind') ~ '@gmail.com' }}</span>
+        </div>
+        <span class="header-separator">|</span>
+        <button type="button" id="headerRestartBtn" onclick="restartAndSyncCameras()" class="btn-header-action btn-header-restart" title="Restart & Sync Cameras from Cloud">
+          <i class="fa-solid fa-arrows-rotate"></i>
+          <span>Restart</span>
+        </button>
+        <span class="header-separator">|</span>
+        <button type="button" id="headerLogoutBtn" onclick="handleNodeLogout()" class="btn-header-action btn-header-logout" title="Logout / Switch Organization">
+          <i class="fa-solid fa-right-from-bracket"></i>
+          <span>Logout</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- =======================================================================
+         PAGE 1: LIVE AI ATTENDANCE
+         ======================================================================= -->
+    <div id="live-view" class="page-view active">
+      <div class="page-header">
+        <div>
+          <h1><i class="fa-solid fa-display" style="color:#0284c7;"></i> Live AI Attendance</h1>
+          <p class="page-subtitle">24/7 AI-powered real-time camera streaming and live attendance activity.</p>
+        </div>
+        <div class="header-system-status">
+          <span class="status-indicator-dot"></span>
+          <span id="liveStreamStatusBadgeText">Live AI Streaming Active</span>
+        </div>
       </div>
 
-      <!-- Button: Restart & Sync Cameras from Cloud -->
-      <button type="button" id="btnFetchCameras" class="btn-top btn-top-secondary" onclick="restartAndSyncCameras()" title="Restart engine and immediately fetch updated cameras and staff from Cloud">
-        🔄 Restart
-      </button>
+      <!-- Live Camera Toolbar -->
+      <div class="live-toolbar">
+        <div class="cctv-camera-tabs" id="cctvCameraTabs">
+          <button class="camera-tab-btn active" type="button">
+            <i class="fa-solid fa-spinner fa-spin"></i>
+            <span>Loading Cameras...</span>
+          </button>
+        </div>
 
-      <!-- Button: Import Embeddings & Manage Staff -->
-      <button type="button" class="btn-top" onclick="openEmployeesModal()" title="Import Embeddings & Sync Cloud Staff">
-        📥 Import Embeddings (<span id="topEmbCount">0</span>)
-      </button>
+        <div class="live-layout-group">
+          <span style="font-size:0.75rem; font-weight:700; color:#64748b; text-transform:uppercase; margin-right:4px;">Layout:</span>
+          <button type="button" class="live-layout-btn" id="btnLayoutSingle" onclick="setLiveCameraLayout('single')">
+            <i class="fa-regular fa-square"></i> Single Cam
+          </button>
+          <button type="button" class="live-layout-btn active" id="btnLayoutGrid" onclick="setLiveCameraLayout('grid')">
+            <i class="fa-solid fa-table-cells-large"></i> All Grid
+          </button>
+          <button type="button" class="btn btn-sm btn-outline-primary" onclick="restartAndSyncCameras()" style="padding:4px 9px; font-size:0.76rem; border-radius:6px; margin-left:4px;" title="Reconnect All Streams">
+            <i class="fa-solid fa-arrows-rotate"></i> Reconnect
+          </button>
+        </div>
+      </div>
+
+      <!-- CCTV Layout: Stage on Left, Compact Feed on Right -->
+      <div class="cctv-layout">
+        <!-- Main Monitoring Stage -->
+        <div class="cctv-main-monitoring">
+          <!-- Single Camera View Container -->
+          <div id="singleCameraContainer" style="display: none;">
+            <div class="cctv-screen-wrapper" id="singleCamWrapper">
+              <div class="cctv-badge">
+                <span class="cctv-badge-dot"></span>
+                <span id="singleCamBadgeName">LIVE AI FEED ACTIVE</span>
+              </div>
+              <div class="cctv-top-actions">
+                <button type="button" class="cctv-fullscreen-btn" onclick="toggleCameraFullscreen('singleCamWrapper')">
+                  <i class="fa-solid fa-expand"></i> Full Screen
+                </button>
+              </div>
+              <div class="cctv-viewport">
+                <img id="streamView" src="" alt="Live AI Camera Feed" onerror="handleStreamImgError(this)" />
+              </div>
+            </div>
+          </div>
+
+          <!-- Multi-Camera Grid Container (Strict 2-Column Grid) -->
+          <div id="multiCameraGridContainer" style="display: block;">
+            <div class="cctv-multi-grid" id="liveMultiGrid">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Side: Compact Attendance Activity Feed -->
+        <div class="live-compact-feed">
+          <div class="live-compact-header">
+            <div class="live-compact-title">
+              <i class="fa-solid fa-bolt" style="color:#f59e0b;"></i>
+              <span>Live Attendance</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <span id="liveTotalCountBadge" style="background:#e0f2fe; color:#0369a1; font-weight:800; font-size:0.72rem; padding:2px 8px; border-radius:6px; border:1px solid #bae6fd;">Total: 0</span>
+              <button type="button" class="btn btn-sm btn-outline-danger" onclick="clearLiveDetectionsList()" style="padding:2px 7px; font-size:0.72rem; border-radius:6px;" title="Clear List">
+                <i class="fa-solid fa-trash-can"></i>
+              </button>
+            </div>
+          </div>
+
+          <!-- Activity List -->
+          <div id="tickerList" class="live-compact-list">
+            <div style="text-align:center; color:#94a3b8; padding:30px 10px; font-size:0.8rem;">
+              <i class="fa-solid fa-satellite-dish fa-fade" style="font-size:1.8rem; margin-bottom:8px; display:block; color:#38bdf8;"></i>
+              <span>Live attendance feed active.<br>Awaiting camera detections...</span>
+            </div>
+          </div>
+
+          <!-- Pagination Bar -->
+          <div style="display:flex; align-items:center; justify-content:space-between; padding:6px 12px; border-top:1px solid #e2e8f0; background:#f8fafc; font-size:0.74rem;">
+            <button type="button" class="btn btn-sm btn-light" id="btnTickerPrev" onclick="changeTickerPage(-1)" disabled style="padding:2px 8px; font-size:0.72rem; border:1px solid #cbd5e1;">
+              <i class="fa-solid fa-chevron-left"></i> Prev
+            </button>
+            <span id="tickerPageIndicator" style="font-weight:600; color:#475569;">Page 1 / 1</span>
+            <button type="button" class="btn btn-sm btn-light" id="btnTickerNext" onclick="changeTickerPage(1)" disabled style="padding:2px 8px; font-size:0.72rem; border:1px solid #cbd5e1;">
+              Next <i class="fa-solid fa-chevron-right"></i>
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
-  </header>
 
-  <!-- ============================================================== -->
-  <!-- MODAL 1: ACTIVATION & BRANCH KEY SETUP                         -->
-  <!-- ============================================================== -->
-  <div id="activationModal" class="modal-backdrop" style="{% if config.linked %}display:none;{% else %}display:flex;{% endif %}">
-    <div class="modal-box" style="width:min(500px, calc(100% - 32px));">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-        <div style="display:flex; align-items:center; gap:12px;">
-          <div style="background:var(--teal); width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center; color:#090e17; font-size:1.2rem; font-weight:800;">
-            🏢
-          </div>
-          <div>
-            <h3 style="font-size:1.18rem; font-weight:800; color:#fff; margin:0;">Client Branch Activation</h3>
-            <span style="font-size:0.8rem; color:var(--muted);">Connect this AI Node to your Organization</span>
-          </div>
+    <!-- =======================================================================
+         PAGE 2: STAFF TRAINING QUEUE (ONLY PENDING STAFF)
+         ======================================================================= -->
+    <div id="training-view" class="page-view">
+      <div class="page-header">
+        <div>
+          <h1><i class="fa-solid fa-user-graduate" style="color:#0284c7;"></i> Staff Face Training Queue</h1>
+          <p class="page-subtitle">Real-time queue of staff registered from Cloud awaiting local AI face enrollment.</p>
         </div>
-        <button type="button" onclick="closeActivationModal()" style="background:none; border:none; color:var(--muted); font-size:1.6rem; cursor:pointer; line-height:1;">&times;</button>
+        <div>
+          <button type="button" class="btn btn-sm btn-outline-primary" onclick="loadPendingStaffQueue(true)" style="padding:6px 14px; font-weight:700; border-radius:8px;">
+            <i class="fa-solid fa-rotate"></i> Sync Cloud Profiles
+          </button>
+        </div>
       </div>
 
-      <div id="activationAlert" style="display:none; padding:12px; border-radius:10px; margin-bottom:16px; font-size:0.85rem; font-weight:600;"></div>
-
-      <form onsubmit="event.preventDefault(); handleActivationSubmit(event); return false;">
-        <div style="margin-bottom:14px;">
-          <label class="form-label">Username / Client Email</label>
-          <input type="text" id="inputUsername" placeholder="e.g. admin@organization.com" value="{{ config.username or '' }}" class="form-input">
+      <!-- Stats Summary -->
+      <div class="stats-summary-grid">
+        <div class="stat-card">
+          <div class="stat-card-icon" style="background:#fffbeb; color:#d97706;">
+            <i class="fa-solid fa-hourglass-half"></i>
+          </div>
+          <div class="stat-card-info">
+            <h3 id="statPendingCount" style="color:#d97706;">0</h3>
+            <p>Pending Training</p>
+          </div>
         </div>
 
-        <div style="margin-bottom:14px;">
-          <label class="form-label">Client Password</label>
-          <input type="password" id="inputPassword" placeholder="••••••••" class="form-input">
+        <div class="stat-card">
+          <div class="stat-card-icon" style="background:#eff6ff; color:#0284c7;">
+            <i class="fa-solid fa-users"></i>
+          </div>
+          <div class="stat-card-info">
+            <h3 id="statTotalStaffCount">0</h3>
+            <p>Total Registered Staff</p>
+          </div>
         </div>
 
-        <div style="margin-bottom:14px;">
-          <label class="form-label">Branch Key (from Cloud Dashboard)</label>
-          <input type="text" id="inputBranchKey" required placeholder="e.g. QE-A03FEAD2A7AA433A9742" value="{{ config.branch_key or '' }}" class="form-input" style="font-family:'JetBrains Mono',monospace;">
-          <small style="color:var(--muted); font-size:0.75rem; margin-top:4px; display:block;">Found in Cloud Dashboard under Organization &gt; Branch Key</small>
+        <div class="stat-card">
+          <div class="stat-card-icon" style="background:#ecfdf5; color:#10b981;">
+            <i class="fa-solid fa-brain"></i>
+          </div>
+          <div class="stat-card-info">
+            <h3 style="color:#10b981;">512D</h3>
+            <p>InsightFace Vector Engine</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Filter Bar & Table Card -->
+      <div class="training-table-card">
+        <div class="training-filter-bar">
+          <div class="search-input-wrap">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <input type="text" id="pendingSearchInput" placeholder="Search pending staff by name, ID, code..." oninput="filterPendingTable()">
+          </div>
+          <div style="font-size:0.8rem; font-weight:700; color:#64748b;">
+            Showing: <span id="pendingShowingCount" style="color:#0284c7;">0</span> pending staff
+          </div>
         </div>
 
-        <div style="margin-bottom:20px;">
-          <label class="form-label">Cloud Server URL</label>
-          <input type="url" id="inputCloudUrl" required value="{{ config.cloud_url or 'https://quanteye-main-dashboard-production.up.railway.app' }}" class="form-input">
-          <small style="color:var(--muted); font-size:0.75rem; margin-top:4px; display:block;">Default: Main Control Dashboard (where Branch Key is created)</small>
+        <div class="table-responsive">
+          <table class="training-table">
+            <thead>
+              <tr>
+                <th style="width:70px;"># ID</th>
+                <th>Staff Member</th>
+                <th>Department</th>
+                <th>Position</th>
+                <th>Employee Code</th>
+                <th>Status</th>
+                <th style="text-align:right;">Action</th>
+              </tr>
+            </thead>
+            <tbody id="pendingTableBody">
+              <tr>
+                <td colspan="7" style="text-align:center; padding:30px; color:#64748b;">
+                  <i class="fa-solid fa-spinner fa-spin" style="font-size:1.5rem; color:#0284c7; display:block; margin-bottom:8px;"></i>
+                  Loading pending staff queue...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- =========================================================================
+       MODAL: VIDEO FACE TRAINING
+       ========================================================================= -->
+  <div id="videoTrainModal" class="app-modal-backdrop">
+    <div class="app-modal-card">
+      <div class="app-modal-header">
+        <h4><i class="fa-solid fa-video" style="color:#0284c7; margin-right:6px;"></i> Enroll Face Video</h4>
+        <button type="button" class="btn-close" onclick="closeVideoTrainModal()"></button>
+      </div>
+      <div class="app-modal-body">
+        <div style="background:#f0f9ff; border:1px solid #bae6fd; border-radius:10px; padding:12px; margin-bottom:16px;">
+          <div style="font-size:0.95rem; font-weight:800; color:#0f172a;" id="trainModalStaffName">Staff Member</div>
+          <div style="font-size:0.78rem; color:#0369a1;" id="trainModalStaffSub">ID: -- &bull; Dept: --</div>
         </div>
 
-        <div style="display:flex; gap:10px;">
-          {% if config.linked %}
-          <button type="button" onclick="closeActivationModal()" style="flex:1; padding:12px; background:#1e293b; border:none; border-radius:10px; color:#fff; font-weight:700; cursor:pointer;">Cancel</button>
-          {% endif %}
-          <button type="button" id="btnActivateSubmit" onclick="handleActivationSubmit(event)" style="flex:2; padding:12px; background:linear-gradient(135deg, var(--teal), #2b7a78); border:none; border-radius:10px; color:#090e17; font-weight:800; cursor:pointer; font-size:0.95rem;">
-            🔗 Connect &amp; Authenticate
+        <!-- File Upload Zone -->
+        <div style="margin-bottom:16px;">
+          <label style="font-size:0.82rem; font-weight:700; color:#334155; margin-bottom:6px; display:block;">
+            Upload Face Video (MP4 / WEBM / MOV)
+          </label>
+          <input type="file" id="trainVideoFileInput" accept="video/*" class="form-control" style="font-size:0.84rem; padding:8px 12px; border-radius:8px; border:1.5px dashed #38bdf8;">
+          <small style="color:#64748b; font-size:0.74rem; margin-top:4px; display:block;">
+            Tip: A short 5 to 10 second clip moving head slightly left & right produces maximum AI recognition accuracy.
+          </small>
+        </div>
+
+        <!-- Progress Indicator -->
+        <div id="trainProgressContainer" style="display:none; margin-top:14px;">
+          <div style="display:flex; justify-content:space-between; font-size:0.78rem; font-weight:700; color:#0284c7; margin-bottom:6px;">
+            <span id="trainProgressText">Extracting face frames & computing 512D vectors...</span>
+            <span id="trainProgressPct">--%</span>
+          </div>
+          <div class="progress" style="height:8px; border-radius:6px; background:#e2e8f0;">
+            <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary" id="trainProgressBar" style="width:100%;"></div>
+          </div>
+        </div>
+      </div>
+      <div class="app-modal-footer">
+        <button type="button" class="btn btn-sm btn-light" onclick="closeVideoTrainModal()" style="font-weight:700;">Cancel</button>
+        <button type="button" class="btn btn-sm btn-primary" id="btnSubmitVideoTraining" onclick="submitVideoTraining()" style="font-weight:700; background:#0284c7; border:none; padding:7px 16px;">
+          <i class="fa-solid fa-brain"></i> Start AI Training
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================================
+       MODAL: ORGANIZATION & BRANCH ACTIVATION
+       ========================================================================= -->
+  <div id="activationModal" class="app-modal-backdrop">
+    <div class="app-modal-card">
+      <div class="app-modal-header">
+        <h4><i class="fa-solid fa-key" style="color:#0284c7; margin-right:6px;"></i> Link Client Organization</h4>
+        <button type="button" class="btn-close" onclick="closeActivationModal()"></button>
+      </div>
+      <form onsubmit="handleActivationSubmit(event)">
+        <div class="app-modal-body">
+          <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; padding:10px 12px; margin-bottom:14px; font-size:0.78rem; color:#1e40af;">
+            Enter your Cloud Client Credentials or Branch Key to link this Node to an organization.
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:0.8rem; font-weight:700; color:#475569;">Username / Email</label>
+            <input type="text" id="authUsernameInput" class="form-control" placeholder="e.g. QuantumMind@gmail.com" required style="font-size:0.84rem;">
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:0.8rem; font-weight:700; color:#475569;">Password</label>
+            <input type="password" id="authPasswordInput" class="form-control" placeholder="Client account password" required style="font-size:0.84rem;">
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:0.8rem; font-weight:700; color:#475569;">Branch Key (Optional)</label>
+            <input type="text" id="authBranchKeyInput" class="form-control" placeholder="Leave blank to use default branch" style="font-size:0.84rem;">
+          </div>
+          <div id="authErrorMsg" style="color:#dc2626; font-size:0.78rem; font-weight:700; display:none;"></div>
+        </div>
+        <div class="app-modal-footer">
+          <button type="button" class="btn btn-sm btn-light" onclick="closeActivationModal()" style="font-weight:700;">Cancel</button>
+          <button type="submit" class="btn btn-sm btn-primary" id="btnAuthSubmit" style="font-weight:700; background:#0284c7; border:none; padding:7px 18px;">
+            <i class="fa-solid fa-link"></i> Connect & Sync
           </button>
         </div>
       </form>
     </div>
   </div>
 
-
-  <!-- ============================================================== -->
-  <!-- MODAL 2: EMBEDDINGS IMPORT & CLOUD EMPLOYEES                   -->
-  <!-- ============================================================== -->
-  <div id="employeesModal" class="modal-backdrop" style="display:none;">
-    <div class="modal-box" style="width:min(700px, calc(100% - 32px));">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px;">
-        <div style="display:flex; align-items:center; gap:12px;">
-          <div style="background:var(--teal); width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center; color:#090e17; font-size:1.2rem; font-weight:800;">
-            📥
-          </div>
-          <div>
-            <h3 style="font-size:1.18rem; font-weight:800; color:#fff; margin:0;">Import Embeddings &amp; Branch Staff</h3>
-            <span style="font-size:0.8rem; color:var(--muted);">Cloud employees auto-sync; import embeddings to activate AI recognition for specific employees</span>
-          </div>
-        </div>
-        <button type="button" onclick="closeEmployeesModal()" style="background:none; border:none; color:var(--muted); font-size:1.6rem; cursor:pointer; line-height:1;">&times;</button>
-      </div>
-
-      <div id="enrollAlert" style="display:none; padding:12px; border-radius:10px; margin-bottom:14px; font-size:0.85rem; font-weight:600;"></div>
-
-      <!-- Action Tabs: Quick Import Embeddings / View Staff & Active Embeddings -->
-      <div style="display:flex; gap:10px; border-bottom:1px solid #1e293b; padding-bottom:12px; margin-bottom:18px; align-items:center;">
-        <button type="button" id="tabBtnImport" onclick="switchEnrollTab('import')" style="padding:8px 16px; background:var(--teal); color:#090e17; border:none; border-radius:8px; font-weight:700; font-size:0.88rem; cursor:pointer;">
-          📥 Import Embeddings File
-        </button>
-        <button type="button" id="tabBtnList" onclick="switchEnrollTab('list')" style="padding:8px 16px; background:#1e293b; color:var(--text); border:none; border-radius:8px; font-weight:700; font-size:0.88rem; cursor:pointer;">
-          👥 Branch Staff (<span id="staffCountBadge">0</span>)
-        </button>
-        <button type="button" onclick="syncProfilesFromCloud()" style="margin-left:auto; padding:8px 14px; background:rgba(58,175,169,0.15); border:1px solid var(--teal); color:var(--teal); border-radius:8px; font-weight:700; font-size:0.85rem; cursor:pointer;">
-          ☁️ Sync Cloud Staff
-        </button>
-      </div>
-
-      <!-- TAB 1: IMPORT EMBEDDINGS (JSON / FILE) -->
-      <div id="tabContentImport">
-        <div style="background:#090e17; border:1px solid #1e293b; border-radius:14px; padding:20px; margin-bottom:18px;">
-          <h4 style="font-size:1rem; color:#fff; margin-bottom:6px;">Select Exported Embeddings File</h4>
-          <p style="font-size:0.82rem; color:var(--muted); margin-bottom:14px;">
-            Upload your exported embeddings JSON file. The node will automatically map embeddings to your Cloud employees by Name or Employee ID and activate AI recognition <b>strictly for only those employees</b>.
-          </p>
-
-          <div style="border:2px dashed #334155; border-radius:12px; padding:24px; text-align:center; background:rgba(17,25,39,0.5); cursor:pointer;" onclick="document.getElementById('fileEmbeddingsInput').click()">
-            <div style="font-size:2rem; margin-bottom:8px;">📁</div>
-            <div style="font-weight:700; color:#fff; font-size:0.95rem; margin-bottom:4px;">Click to select Embeddings File (.json)</div>
-            <div id="selectedFileName" style="font-size:0.8rem; color:var(--teal);">Supports JSON list of profiles or key-value embeddings</div>
-            <input type="file" id="fileEmbeddingsInput" accept=".json,application/json" style="display:none;" onchange="handleEmbeddingsFileSelect(event)">
-          </div>
-        </div>
-
-        <button type="button" id="btnSubmitImport" onclick="submitEmbeddingsImport()" style="width:100%; padding:13px; background:linear-gradient(135deg, var(--teal), #2b7a78); border:none; border-radius:10px; color:#090e17; font-weight:800; cursor:pointer; font-size:0.95rem;">
-          ⚡ Import &amp; Activate Embeddings for Recognition
-        </button>
-      </div>
-
-      <!-- TAB 2: STAFF LIST & STATUS -->
-      <div id="tabContentList" style="display:none;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-          <span style="font-size:0.82rem; color:var(--muted);">Employees fetched from Cloud for this Branch:</span>
-          <button type="button" onclick="exportCurrentEmbeddings()" style="padding:4px 10px; background:#1e293b; border:1px solid #334155; color:var(--teal); border-radius:6px; font-size:0.78rem; font-weight:700; cursor:pointer;">
-            📤 Export Current Embeddings (.json)
-          </button>
-        </div>
-        <div id="enrolledStaffList" style="max-height:360px; overflow-y:auto; display:flex; flex-direction:column; gap:8px;">
-          <div style="text-align:center; padding:30px 0; color:var(--muted);">Loading staff...</div>
-        </div>
-      </div>
-
-    </div>
-  </div>
-
-
-  <!-- MAIN LIVE STAGE -->
-  <main class="main-content">
-    
-    <!-- DYNAMIC CAMERA GRID -->
-    <div id="cameraGrid" class="camera-stage {% if config.cameras and config.cameras|length == 1 %}grid-1{% elif config.cameras and config.cameras|length == 2 %}grid-2{% elif config.cameras and config.cameras|length <= 4 %}grid-3-4{% else %}grid-multi{% endif %}">
-      {% if config.cameras and config.cameras|length > 0 %}
-        {% for cam in config.cameras %}
-        <div class="camera-cell">
-          <div class="cam-tag">
-            <div class="cam-live-indicator"></div>
-            <span>{{ cam.name or cam.camera_name or 'Live Camera' }}</span>
-          </div>
-          <img src="/stream/{{ cam.id or cam.camera_id }}" alt="{{ cam.name }}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'640\' height=\'360\'><rect width=\'100%\' height=\'100%\' fill=\'%23080d14\'/><text x=\'50%\' y=\'50%\' fill=\'%2364748b\' dominant-baseline=\'middle\' text-anchor=\'middle\' font-size=\'18\'>Connecting Stream...</text></svg>'">
-        </div>
-        {% endfor %}
-      {% else %}
-        <div class="camera-cell" style="flex-direction:column; gap:14px; padding:40px 20px; text-align:center;">
-          <div class="cam-tag" style="position:static;">
-            <div class="cam-live-indicator" style="background:#64748b; box-shadow:none;"></div>
-            <span style="color:#94a3b8;">No Cameras Connected</span>
-          </div>
-          <div style="font-size:2.6rem; opacity:0.85; margin-top:8px;">📡</div>
-          <div style="font-size:1.2rem; font-weight:800; color:#fff;">No Active Cameras Configured</div>
-          <p style="font-size:0.88rem; color:var(--muted); max-width:440px; line-height:1.6; margin:0 auto;">
-            Configure your DVR, NVR, or IP cameras in your Cloud Dashboard under <b>Settings &gt; Camera Management</b>.<br>
-            Once added, streams will automatically connect and appear here in real time.
-          </p>
-        </div>
-      {% endif %}
-    </div>
-
-    <!-- REAL-TIME DETECTION FEED -->
-    <aside class="ticker-panel">
-      <div class="ticker-header">
-        <div class="ticker-title">
-          <span style="color:var(--teal)">⚡</span>
-          <span>Live AI Detections</span>
-        </div>
-        <span id="detectionCounter" class="ticker-count">0 Synced</span>
-      </div>
-      <div id="tickerFeed" class="ticker-list">
-        <div style="text-align: center; color: var(--muted); padding: 40px 0; font-size: 0.85rem;">
-          <div style="font-size: 2rem; margin-bottom: 12px; opacity: 0.5;">📷</div>
-          Waiting for face detections...
-        </div>
-      </div>
-    </aside>
-
-  </main>
-
+  <!-- =========================================================================
+       JAVASCRIPT LOGIC
+       ========================================================================= -->
   <script>
-    let activeCameras = [];
-    let parsedEmbeddingsData = null;
+    // State
+    let allCameras = [];
+    let currentLayout = 'grid';
+    let selectedCameraId = null;
+    let detectionsFeed = [];
+    let tickerCurrentPage = 1;
+    const tickerPageSize = 10;
+    let pendingStaffList = [];
+    let activeTrainingUserId = null;
 
-    // Load active cameras from node
+    // Toast helper
+    function showToast(message, type = 'success') {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      toast.className = `app-toast ${type}`;
+      const icon = type === 'success' ? 'fa-circle-check' : 'fa-circle-exclamation';
+      const color = type === 'success' ? '#10b981' : '#ef4444';
+      toast.innerHTML = `<i class="fa-solid ${icon}" style="color:${color}; font-size:1.1rem;"></i> <span>${message}</span>`;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(10px)';
+        toast.style.transition = 'all 0.3s ease';
+        setTimeout(() => toast.remove(), 300);
+      }, 3500);
+    }
+
+    // Tab & Page Switching
+    function switchPage(pageId, navEl) {
+      document.querySelectorAll('.page-view').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.menu-item').forEach(m => m.classList.remove('active'));
+      const target = document.getElementById(pageId);
+      if (target) target.classList.add('active');
+      if (navEl) navEl.classList.add('active');
+
+      const titleEl = document.getElementById('headerCurrentPageTitle');
+      if (pageId === 'live-view' && titleEl) titleEl.textContent = 'Live AI Attendance';
+      if (pageId === 'training-view' && titleEl) {
+        titleEl.textContent = 'Staff Training Queue';
+        loadPendingStaffQueue();
+      }
+    }
+
+    // Active Shift Timing Sync
+    async function loadActiveShiftTiming() {
+      try {
+        const res = await fetch('/api/node/shift');
+        const data = await res.json();
+        const textEl = document.getElementById('headerShiftText');
+        if (data.success && data.shift && textEl) {
+          textEl.textContent = data.shift.display || `${data.shift.name} (${data.shift.formatted})`;
+        }
+      } catch (e) {
+        console.debug('Shift fetch error:', e);
+      }
+    }
+
+    // Camera Management & Grid Rendering
     async function loadCameras() {
       try {
         const res = await fetch('/api/node/cameras');
         const data = await res.json();
-        if (data.success && data.cameras) {
-          activeCameras = data.cameras;
+        if (data.success && Array.isArray(data.cameras)) {
+          allCameras = data.cameras;
+          renderCameraTabs();
           renderCameraGrid();
         }
       } catch (e) {
-        console.error("Error loading cameras:", e);
+        console.error('Error loading cameras:', e);
       }
     }
 
-    function showNotification(msg, type) {
-      let toast = document.getElementById('nodeToast');
-      if (!toast) {
-        toast = document.createElement('div');
-        toast.id = 'nodeToast';
-        document.body.appendChild(toast);
+    function renderCameraTabs() {
+      const container = document.getElementById('cctvCameraTabs');
+      if (!container) return;
+      if (allCameras.length === 0) {
+        container.innerHTML = `<button class="camera-tab-btn active" type="button"><i class="fa-solid fa-video-slash"></i> <span>No Cameras Configured</span></button>`;
+        return;
       }
-      toast.style.cssText = 'position:fixed; top:24px; left:50%; transform:translateX(-50%); z-index:99999; padding:14px 28px; border-radius:12px; font-weight:800; font-size:1rem; box-shadow:0 12px 40px rgba(0,0,0,0.8); transition:all 0.3s cubic-bezier(0.4, 0, 0.2, 1); display:flex; align-items:center; gap:10px;';
-      toast.style.background = (type === 'success') ? '#064e3b' : '#7f1d1d';
-      toast.style.border = (type === 'success') ? '2px solid #10b981' : '2px solid #ef4444';
-      toast.style.color = '#ffffff';
-      toast.innerHTML = (type === 'success' ? '⚡ ' : '⚠️ ') + msg;
-      toast.style.opacity = '1';
-      toast.style.display = 'flex';
-      setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.style.display = 'none', 300); }, 4000);
+
+      let html = '';
+      allCameras.forEach((cam, idx) => {
+        const isAct = (selectedCameraId === cam.id || (!selectedCameraId && idx === 0));
+        if (isAct && !selectedCameraId) selectedCameraId = cam.id;
+        html += `
+          <button type="button" class="camera-tab-btn ${isAct ? 'active' : ''}" onclick="selectSingleCamera('${cam.id}', '${cam.name.replace(/'/g, "\\'")}')">
+            <i class="fa-solid fa-camera"></i>
+            <span>${cam.name}</span>
+          </button>
+        `;
+      });
+      container.innerHTML = html;
+    }
+
+    function selectSingleCamera(camId, camName) {
+      selectedCameraId = camId;
+      renderCameraTabs();
+      const badge = document.getElementById('singleCamBadgeName');
+      if (badge) badge.textContent = camName.toUpperCase();
+      const img = document.getElementById('streamView');
+      if (img) img.src = `/stream/${camId}`;
+      setLiveCameraLayout('single');
+    }
+
+    function setLiveCameraLayout(layout) {
+      currentLayout = layout;
+      const btnSingle = document.getElementById('btnLayoutSingle');
+      const btnGrid = document.getElementById('btnLayoutGrid');
+      const singleBox = document.getElementById('singleCameraContainer');
+      const gridBox = document.getElementById('multiCameraGridContainer');
+
+      if (layout === 'single') {
+        if (btnSingle) btnSingle.classList.add('active');
+        if (btnGrid) btnGrid.classList.remove('active');
+        if (singleBox) singleBox.style.display = 'block';
+        if (gridBox) gridBox.style.display = 'none';
+
+        if (allCameras.length > 0 && !selectedCameraId) {
+          selectSingleCamera(allCameras[0].id, allCameras[0].name);
+        } else if (selectedCameraId) {
+          const img = document.getElementById('streamView');
+          if (img) img.src = `/stream/${selectedCameraId}`;
+        }
+      } else {
+        if (btnSingle) btnSingle.classList.remove('active');
+        if (btnGrid) btnGrid.classList.add('active');
+        if (singleBox) singleBox.style.display = 'none';
+        if (gridBox) gridBox.style.display = 'block';
+        renderCameraGrid();
+      }
     }
 
     function renderCameraGrid() {
-      const grid = document.getElementById('cameraGrid');
-      if (!activeCameras || activeCameras.length === 0) {
-        grid.className = 'camera-stage grid-1';
+      const grid = document.getElementById('liveMultiGrid');
+      if (!grid) return;
+      if (allCameras.length === 0) {
         grid.innerHTML = `
-          <div class="camera-cell" style="flex-direction:column; gap:14px; padding:40px 20px; text-align:center;">
-            <div class="cam-tag" style="position:static;">
-              <div class="cam-live-indicator" style="background:#64748b; box-shadow:none;"></div>
-              <span style="color:#94a3b8;">No Cameras Connected</span>
-            </div>
-            <div style="font-size:2.6rem; opacity:0.85; margin-top:8px;">📡</div>
-            <div style="font-size:1.2rem; font-weight:800; color:#fff;">No Active Cameras Configured</div>
-            <p style="font-size:0.88rem; color:var(--muted); max-width:440px; line-height:1.6; margin:0 auto;">
-              Configure your DVR, NVR, or IP cameras in your Cloud Dashboard under <b>Settings &gt; Camera Management</b>.<br>
-              Once added, streams will automatically connect and appear here in real time.
-            </p>
+          <div style="grid-column: 1 / -1; text-align: center; color: #94a3b8; padding: 50px 20px;">
+            <i class="fa-solid fa-video-slash" style="font-size: 2.5rem; margin-bottom: 12px; display: block; color: #38bdf8;"></i>
+            <h5 style="font-weight: 700; color: #f1f5f9;">No Active Cameras Configured</h5>
+            <p style="font-size: 0.85rem;">Add cameras in Cloud Portal or click Restart to sync.</p>
           </div>
         `;
         return;
       }
 
-      grid.className = 'camera-stage';
-      const count = activeCameras.length;
-      if (count === 1) grid.classList.add('grid-1');
-      else if (count === 2) grid.classList.add('grid-2');
-      else if (count === 3) grid.classList.add('grid-3');
-      else if (count === 4) grid.classList.add('grid-4');
-      else if (count <= 6) grid.classList.add('grid-5-6');
-      else grid.classList.add('grid-multi');
-
-      grid.innerHTML = activeCameras.map(cam => `
-        <div class="camera-cell">
-          <div class="cam-tag">
-            <div class="cam-live-indicator"></div>
-            <span>${cam.name}</span>
+      let html = '';
+      allCameras.forEach(cam => {
+        html += `
+          <div class="grid-cam-card" id="camCard_${cam.id}">
+            <div class="cctv-badge">
+              <span class="cctv-badge-dot"></span>
+              <span>${cam.name.toUpperCase()}</span>
+            </div>
+            <div class="cctv-top-actions">
+              <button type="button" class="cctv-fullscreen-btn" onclick="toggleCameraFullscreen('camCard_${cam.id}')">
+                <i class="fa-solid fa-expand"></i> Full Screen
+              </button>
+            </div>
+            <img src="/stream/${cam.id}" alt="${cam.name}" onerror="handleStreamImgError(this)" />
           </div>
-          <img src="${cam.stream_url}" alt="${cam.name}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'640\\' height=\\'360\\'><rect width=\\'100%\\' height=\\'100%\\' fill=\\'%23080d14\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%2364748b\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\' font-size=\\'18\\'>Connecting Stream...</text></svg>'">
-        </div>
-      `).join('');
+        `;
+      });
+      grid.innerHTML = html;
     }
 
-    async function pollDetections() {
+    function handleStreamImgError(img) {
+      setTimeout(() => {
+        if (img && img.src) {
+          const u = new URL(img.src, window.location.origin);
+          u.searchParams.set('_t', Date.now());
+          img.src = u.toString();
+        }
+      }, 2500);
+    }
+
+    function toggleCameraFullscreen(elemId) {
+      const el = document.getElementById(elemId);
+      if (!el) return;
+      if (!document.fullscreenElement) {
+        el.requestFullscreen().catch(err => console.debug(err));
+      } else {
+        document.exitFullscreen().catch(err => console.debug(err));
+      }
+    }
+
+    // Restart & Cloud Camera Sync
+    async function restartAndSyncCameras() {
+      const btn = document.getElementById('headerRestartBtn');
+      if (btn) btn.classList.add('loading');
+      showToast('Restarting camera streams & fetching latest Cloud settings...', 'success');
+
+      try {
+        const res = await fetch('/api/node/cameras/refresh', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          allCameras = data.cameras || [];
+          renderCameraTabs();
+          if (currentLayout === 'single') {
+            if (allCameras.length > 0) {
+              selectSingleCamera(allCameras[0].id, allCameras[0].name);
+            }
+          } else {
+            renderCameraGrid();
+          }
+          loadActiveShiftTiming();
+          showToast(`Successfully refreshed ${allCameras.length} cameras!`, 'success');
+        } else {
+          showToast(data.error || 'Failed to refresh cameras', 'error');
+        }
+      } catch (e) {
+        showToast('Error syncing with Cloud: ' + e.message, 'error');
+      } finally {
+        if (btn) btn.classList.remove('loading');
+      }
+    }
+
+    // Real-Time Attendance Feed
+    async function pollLiveDetections() {
       try {
         const res = await fetch('/api/node/detections');
         const data = await res.json();
-        if (data.success && data.detections && data.detections.length > 0) {
-          document.getElementById('detectionCounter').textContent = `${data.detections.length} Synced`;
-          const ticker = document.getElementById('tickerFeed');
-          ticker.innerHTML = data.detections.map(item => `
-            <div class="ticker-item">
-              <img class="ticker-photo" src="${item.face_crop || 'data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'80\\' height=\\'80\\'><rect width=\\'100%\\' height=\\'100%\\' fill=\\'%231e293b\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%2394a3b8\\' font-size=\\'24\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>👤</text></svg>'}" alt="${item.name}">
-              <div class="ticker-details">
-                <div class="ticker-name">${item.name}</div>
-                <div class="ticker-meta">
-                  <span>${item.camera_name}</span>
-                  <span class="ticker-pill">${item.confidence}% Match</span>
+        if (data.success && Array.isArray(data.detections)) {
+          detectionsFeed = data.detections;
+          renderTickerFeed();
+          const badge = document.getElementById('liveTotalCountBadge');
+          if (badge) badge.textContent = `Total: ${detectionsFeed.length}`;
+        }
+      } catch (e) {
+        console.debug('Detections polling error:', e);
+      }
+    }
+
+    function renderTickerFeed() {
+      const listEl = document.getElementById('tickerList');
+      if (!listEl) return;
+
+      if (detectionsFeed.length === 0) {
+        listEl.innerHTML = `
+          <div style="text-align:center; color:#94a3b8; padding:30px 10px; font-size:0.8rem;">
+            <i class="fa-solid fa-satellite-dish fa-fade" style="font-size:1.8rem; margin-bottom:8px; display:block; color:#38bdf8;"></i>
+            <span>Live attendance feed active.<br>Awaiting camera detections...</span>
+          </div>
+        `;
+        return;
+      }
+
+      const totalItems = detectionsFeed.length;
+      const totalPages = Math.ceil(totalItems / tickerPageSize) || 1;
+      if (tickerCurrentPage > totalPages) tickerCurrentPage = totalPages;
+      if (tickerCurrentPage < 1) tickerCurrentPage = 1;
+
+      const startIndex = (tickerCurrentPage - 1) * tickerPageSize;
+      const paged = detectionsFeed.slice(startIndex, startIndex + tickerPageSize);
+
+      let html = '';
+      paged.forEach(det => {
+        const initial = det.name ? det.name.charAt(0).toUpperCase() : '?';
+        const thumb = det.face_crop 
+          ? `<img src="${det.face_crop}" style="width:28px; height:28px; border-radius:50%; object-fit:cover;">`
+          : `<div style="width:28px; height:28px; border-radius:50%; background:#e0f2fe; color:#0284c7; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:0.75rem;">${initial}</div>`;
+
+        html += `
+          <div class="compact-attend-card">
+            <div class="compact-attend-name">
+              <div style="display:flex; align-items:center; gap:8px;">
+                ${thumb}
+                <span>${det.name}</span>
+              </div>
+              <span style="font-size:0.68rem; font-weight:800; background:#ecfdf5; color:#059669; padding:2px 6px; border-radius:10px;">${det.confidence}%</span>
+            </div>
+            <div class="compact-attend-meta">
+              <span class="compact-attend-time"><i class="fa-regular fa-clock"></i> ${det.timestamp}</span>
+              <span><i class="fa-solid fa-video" style="font-size:0.68rem;"></i> ${det.camera_name || 'Camera'}</span>
+            </div>
+          </div>
+        `;
+      });
+      listEl.innerHTML = html;
+
+      // Update Pagination
+      const pageInd = document.getElementById('tickerPageIndicator');
+      if (pageInd) pageInd.textContent = `Page ${tickerCurrentPage} / ${totalPages}`;
+      const btnPrev = document.getElementById('btnTickerPrev');
+      const btnNext = document.getElementById('btnTickerNext');
+      if (btnPrev) btnPrev.disabled = (tickerCurrentPage <= 1);
+      if (btnNext) btnNext.disabled = (tickerCurrentPage >= totalPages);
+    }
+
+    function changeTickerPage(delta) {
+      tickerCurrentPage += delta;
+      renderTickerFeed();
+    }
+
+    function clearLiveDetectionsList() {
+      detectionsFeed = [];
+      renderTickerFeed();
+      const badge = document.getElementById('liveTotalCountBadge');
+      if (badge) badge.textContent = 'Total: 0';
+    }
+
+    // =========================================================================
+    // PAGE 2: PENDING STAFF QUEUE & VIDEO TRAINING
+    // =========================================================================
+    async function loadPendingStaffQueue(forceSync = false) {
+      const tbody = document.getElementById('pendingTableBody');
+      if (tbody && forceSync) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:24px; color:#64748b;"><i class="fa-solid fa-arrows-rotate fa-spin"></i> Syncing fresh profiles from Cloud...</td></tr>`;
+      }
+
+      try {
+        const res = await fetch('/api/node/pending-staff');
+        const data = await res.json();
+        if (data.success) {
+          pendingStaffList = data.pending || [];
+          const pendingCount = data.pending_count || 0;
+          const totalCount = data.total_count || 0;
+
+          // Update Counter Badges
+          const sbBadge = document.getElementById('sidebarPendingBadge');
+          if (sbBadge) sbBadge.textContent = pendingCount;
+          const statPend = document.getElementById('statPendingCount');
+          if (statPend) statPend.textContent = pendingCount;
+          const statTot = document.getElementById('statTotalStaffCount');
+          if (statTot) statTot.textContent = totalCount;
+
+          renderPendingStaffRows();
+          if (forceSync) showToast(`Synced profiles! ${pendingCount} staff pending training.`, 'success');
+        }
+      } catch (e) {
+        console.error('Error loading pending queue:', e);
+      }
+    }
+
+    function renderPendingStaffRows() {
+      const tbody = document.getElementById('pendingTableBody');
+      if (!tbody) return;
+
+      const q = (document.getElementById('pendingSearchInput')?.value || '').toLowerCase().trim();
+      const filtered = pendingStaffList.filter(s => {
+        if (!q) return true;
+        return (s.name || '').toLowerCase().includes(q) ||
+               (s.department || '').toLowerCase().includes(q) ||
+               (s.employee_code || '').toLowerCase().includes(q) ||
+               String(s.id).includes(q);
+      });
+
+      const countEl = document.getElementById('pendingShowingCount');
+      if (countEl) countEl.textContent = filtered.length;
+
+      if (filtered.length === 0) {
+        if (pendingStaffList.length === 0) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="7" style="text-align:center; padding:40px; color:#10b981;">
+                <i class="fa-solid fa-circle-check" style="font-size:2.5rem; margin-bottom:10px; display:block;"></i>
+                <h5 style="font-weight:800; color:#0f172a; margin-bottom:4px;">All Staff Face Enrollments Complete!</h5>
+                <p style="font-size:0.84rem; color:#64748b; margin:0;">No staff members are currently pending training. Live AI recognition is active for all registered employees.</p>
+              </td>
+            </tr>
+          `;
+        } else {
+          tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:24px; color:#64748b;">No matching staff found for "${q}".</td></tr>`;
+        }
+        return;
+      }
+
+      let html = '';
+      filtered.forEach(s => {
+        const initial = s.name ? s.name.charAt(0).toUpperCase() : '?';
+        const safeName = (s.name || '').replace(/'/g, "\\'");
+        const safeDept = (s.department || '').replace(/'/g, "\\'");
+        const safePos = (s.position || '').replace(/'/g, "\\'");
+
+        html += `
+          <tr>
+            <td style="font-weight:800; color:#0284c7;">#${s.id}</td>
+            <td>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <div style="width:32px; height:32px; border-radius:50%; background:#e0f2fe; color:#0284c7; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:0.8rem; flex-shrink:0;">
+                  ${initial}
+                </div>
+                <div>
+                  <strong style="display:block; color:#0f172a;">${s.name}</strong>
+                  <span style="font-size:0.74rem; color:#64748b;">${s.email || '--'}</span>
                 </div>
               </div>
-              <div class="ticker-time">${item.timestamp}</div>
-            </div>
-          `).join('');
-        }
-      } catch (e) {
-        console.error("Error polling detections:", e);
-      }
+            </td>
+            <td><span style="font-weight:600; color:#2563eb;">${s.department || 'General'}</span></td>
+            <td>${s.position || 'Staff Member'}</td>
+            <td><code style="background:#f1f5f9; padding:2px 6px; border-radius:4px; color:#0f172a;">${s.employee_code}</code></td>
+            <td><span class="badge-pending"><i class="fa-solid fa-hourglass-half"></i> Pending Training</span></td>
+            <td style="text-align:right;">
+              <button type="button" class="btn-train-action" onclick="openVideoTrainModal(${s.id}, '${safeName}', '${safeDept}', '${safePos}')">
+                <i class="fa-solid fa-video"></i> Train Face
+              </button>
+            </td>
+          </tr>
+        `;
+      });
+      tbody.innerHTML = html;
     }
 
-    async function checkCloudStatus() {
+    function filterPendingTable() {
+      renderPendingStaffRows();
+    }
+
+    function openVideoTrainModal(userId, name, dept, pos) {
+      activeTrainingUserId = userId;
+      document.getElementById('trainModalStaffName').textContent = name;
+      document.getElementById('trainModalStaffSub').textContent = `ID #${userId} • Dept: ${dept} • ${pos}`;
+      document.getElementById('trainVideoFileInput').value = '';
+      document.getElementById('trainProgressContainer').style.display = 'none';
+      document.getElementById('videoTrainModal').style.display = 'flex';
+    }
+
+    function closeVideoTrainModal() {
+      document.getElementById('videoTrainModal').style.display = 'none';
+      activeTrainingUserId = null;
+    }
+
+    async function submitVideoTraining() {
+      const fileInput = document.getElementById('trainVideoFileInput');
+      if (!fileInput.files || fileInput.files.length === 0) {
+        showToast('Please select a video file first', 'error');
+        return;
+      }
+
+      const file = fileInput.files[0];
+      const formData = new FormData();
+      formData.append('user_id', activeTrainingUserId);
+      formData.append('video', file);
+
+      const progContainer = document.getElementById('trainProgressContainer');
+      const submitBtn = document.getElementById('btnSubmitVideoTraining');
+      progContainer.style.display = 'block';
+      submitBtn.disabled = true;
+
       try {
-        const res = await fetch('/api/node/cloud-status');
+        const res = await fetch('/api/node/train-video', {
+          method: 'POST',
+          body: formData
+        });
         const data = await res.json();
-        const badge = document.getElementById('cloudStatusBadge');
-        const text = document.getElementById('cloudStatusText');
-        if (data.cloud_connected) {
-          badge.className = 'cloud-status';
-          text.textContent = 'Cloud Connected';
+        if (data.success) {
+          showToast(`Face enrolled successfully! ${data.embeddings_count} frames extracted.`, 'success');
+          closeVideoTrainModal();
+          loadPendingStaffQueue();
         } else {
-          badge.className = 'cloud-status offline';
-          text.textContent = 'Offline (Buffered)';
+          showToast(data.error || 'Training failed', 'error');
         }
       } catch (e) {
-        const badge = document.getElementById('cloudStatusBadge');
-        const text = document.getElementById('cloudStatusText');
-        badge.className = 'cloud-status offline';
-        text.textContent = 'Offline (Buffered)';
-      }
-    }
-
-    // Restart engine and refresh cameras & staff from Cloud
-    async function restartAndSyncCameras() {
-      const btn = document.getElementById('btnFetchCameras');
-      const origText = btn ? btn.innerHTML : '🔄 Restart';
-      if (btn) {
-        btn.disabled = true;
-        btn.innerHTML = '⏳ Restarting...';
-      }
-      try {
-        // Trigger both camera refresh and employee synchronization
-        const [camRes, empRes] = await Promise.all([
-          fetch('/api/node/cameras/refresh', { method: 'POST' }),
-          fetch('/api/node/employees/sync', { method: 'POST' }).catch(() => null)
-        ]);
-        const data = await camRes.json();
-        if (data.success) {
-          await loadCameras();
-          await loadEmployeesList();
-          showNotification(data.camera_count > 0 ? `✓ Restart complete: ${data.camera_count} camera(s) active & staff synced` : '✓ Restart complete: 0 cameras currently configured in Cloud', 'success');
-        } else {
-          showNotification(`✗ Restart note: ${data.error || 'Failed'}`, 'error');
-        }
-      } catch (err) {
-        showNotification(`✗ Connection error: ${err.message}`, 'error');
+        showToast('Server connection error: ' + e.message, 'error');
       } finally {
-        if (btn) {
-          btn.disabled = false;
-          btn.innerHTML = origText;
-        }
+        submitBtn.disabled = false;
+        progContainer.style.display = 'none';
       }
     }
 
-    // Modal toggles
+    // Node Logout & Activation
+    async function handleNodeLogout() {
+      if (!confirm('Log out from current organization? This will reset local node configuration.')) return;
+      try {
+        const res = await fetch('/api/node/logout', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          showToast('Logged out successfully', 'success');
+          openActivationModal();
+        }
+      } catch (e) {
+        showToast('Error during logout: ' + e.message, 'error');
+      }
+    }
+
     function openActivationModal() {
       document.getElementById('activationModal').style.display = 'flex';
-      document.getElementById('activationAlert').style.display = 'none';
     }
 
     function closeActivationModal() {
       document.getElementById('activationModal').style.display = 'none';
     }
 
-    function openEmployeesModal() {
-      document.getElementById('employeesModal').style.display = 'flex';
-      document.getElementById('enrollAlert').style.display = 'none';
-      loadEmployeesList();
-    }
-
-    function closeEmployeesModal() {
-      document.getElementById('employeesModal').style.display = 'none';
-    }
-
-    function switchEnrollTab(tab) {
-      const isImport = (tab === 'import');
-      document.getElementById('tabContentImport').style.display = isImport ? 'block' : 'none';
-      document.getElementById('tabContentList').style.display = isImport ? 'none' : 'block';
-      document.getElementById('tabBtnImport').style.background = isImport ? 'var(--teal)' : '#1e293b';
-      document.getElementById('tabBtnImport').style.color = isImport ? '#090e17' : 'var(--text)';
-      document.getElementById('tabBtnList').style.background = isImport ? '#1e293b' : 'var(--teal)';
-      document.getElementById('tabBtnList').style.color = isImport ? 'var(--text)' : '#090e17';
-      if (!isImport) loadEmployeesList();
-    }
-
-    // File selection for embeddings
-    function handleEmbeddingsFileSelect(e) {
-      const file = e.target.files[0];
-      if (!file) return;
-      document.getElementById('selectedFileName').textContent = `Selected: ${file.name} (${Math.round(file.size / 1024)} KB)`;
-      const reader = new FileReader();
-      reader.onload = function(evt) {
-        try {
-          parsedEmbeddingsData = JSON.parse(evt.target.result);
-          const count = Array.isArray(parsedEmbeddingsData) ? parsedEmbeddingsData.length : Object.keys(parsedEmbeddingsData).length;
-          document.getElementById('selectedFileName').textContent = `✓ Ready: ${file.name} (${count} embeddings found)`;
-        } catch (err) {
-          alert("Invalid JSON format in selected embeddings file: " + err.message);
-          parsedEmbeddingsData = null;
-        }
-      };
-      reader.readAsText(file);
-    }
-
-    // Submit embeddings import
-    async function submitEmbeddingsImport() {
-      const alertBox = document.getElementById('enrollAlert');
-      const btn = document.getElementById('btnSubmitImport');
-      if (!parsedEmbeddingsData) {
-        alertBox.style.display = 'block';
-        alertBox.style.background = 'rgba(239,68,68,0.15)';
-        alertBox.style.border = '1px solid #ef4444';
-        alertBox.style.color = '#f87171';
-        alertBox.textContent = 'Please choose a valid .json embeddings file first.';
-        return;
-      }
-
-      btn.disabled = true;
-      btn.innerHTML = '⚡ Importing &amp; Loading Embeddings...';
-      alertBox.style.display = 'none';
-
-      try {
-        const res = await fetch('/api/node/embeddings/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(parsedEmbeddingsData)
-        });
-        const data = await res.json();
-        if (data.success) {
-          alertBox.style.display = 'block';
-          alertBox.style.background = 'rgba(16,185,129,0.15)';
-          alertBox.style.border = '1px solid #10b981';
-          alertBox.style.color = '#34d399';
-          alertBox.textContent = `✓ ${data.message}`;
-          loadEmployeesList();
-        } else {
-          alertBox.style.display = 'block';
-          alertBox.style.background = 'rgba(239,68,68,0.15)';
-          alertBox.style.border = '1px solid #ef4444';
-          alertBox.style.color = '#f87171';
-          alertBox.textContent = `✗ ${data.error || 'Import failed'}`;
-        }
-      } catch (err) {
-        alertBox.style.display = 'block';
-        alertBox.style.background = 'rgba(239,68,68,0.15)';
-        alertBox.style.border = '1px solid #ef4444';
-        alertBox.style.color = '#f87171';
-        alertBox.textContent = `✗ Connection error: ${err.message}`;
-      } finally {
-        btn.disabled = false;
-        btn.innerHTML = '⚡ Import &amp; Activate Embeddings for Recognition';
-      }
-    }
-
-    // Export current embeddings
-    async function exportCurrentEmbeddings() {
-      try {
-        const res = await fetch('/api/node/embeddings/export');
-        const data = await res.json();
-        if (data.success) {
-          const blob = new Blob([JSON.stringify(data.embeddings, null, 2)], { type: 'application/json' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = `embeddings_${data.branch_id || 'branch'}.json`;
-          a.click();
-        }
-      } catch (e) {
-        alert('Could not export embeddings: ' + e.message);
-      }
-    }
-
-    async function loadEmployeesList() {
-      try {
-        const res = await fetch('/api/node/employees');
-        const data = await res.json();
-        const container = document.getElementById('enrolledStaffList');
-        const badge = document.getElementById('staffCountBadge');
-        const topBadge = document.getElementById('topEmbCount');
-        if (data.success) {
-          badge.textContent = data.count || 0;
-          const activeWithEmb = data.employees.filter(e => e.has_embedding).length;
-          if (topBadge) topBadge.textContent = `${activeWithEmb}/${data.count || 0} active`;
-
-          if (data.employees.length === 0) {
-            container.innerHTML = '<div style="text-align:center; padding:24px 0; color:var(--muted); font-size:0.88rem;">No staff synced yet. Click <b>Sync Cloud Staff</b> to pull employees from Cloud!</div>';
-            return;
-          }
-          container.innerHTML = data.employees.map(emp => `
-            <div style="background:#090e17; border:1px solid #1e293b; border-radius:10px; padding:10px 14px; display:flex; align-items:center; justify-content:space-between;">
-              <div>
-                <div style="font-weight:700; color:#fff; font-size:0.92rem;">${emp.name}</div>
-                <div style="font-size:0.75rem; color:var(--muted); margin-top:2px;">
-                  <span>${emp.employee_code}</span> &bull; <span>${emp.department || 'General'}</span>
-                  ${emp.has_embedding ? '<span style="color:#34d399; font-weight:700; margin-left:8px;">✓ Active (Embedding Loaded)</span>' : '<span style="color:#f87171; margin-left:8px;">⚠ No Embedding (Recognition Off)</span>'}
-                </div>
-              </div>
-              <button type="button" onclick="deleteEmployee(${emp.id}, '${emp.name}')" style="background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.3); color:#f87171; border-radius:6px; padding:4px 10px; font-size:0.78rem; font-weight:700; cursor:pointer;">
-                Clear
-              </button>
-            </div>
-          `).join('');
-        }
-      } catch (e) {
-        console.error("Error loading employees:", e);
-      }
-    }
-
-    async function deleteEmployee(userId, name) {
-      if (!confirm(`Are you sure you want to clear embeddings for ${name}?`)) return;
-      try {
-        const res = await fetch('/api/node/employees/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ user_id: userId })
-        });
-        const data = await res.json();
-        if (data.success) {
-          loadEmployeesList();
-        } else {
-          alert(data.error || 'Could not delete employee');
-        }
-      } catch (e) {
-        alert('Network error deleting employee');
-      }
-    }
-
-    async function syncProfilesFromCloud() {
-      try {
-        const res = await fetch('/api/node/employees/sync', { method: 'POST' });
-        const data = await res.json();
-        if (data.success) {
-          alert('✓ Cloud Staff Synchronized successfully!');
-          loadEmployeesList();
-        } else {
-          alert(data.error || 'Failed to sync');
-        }
-      } catch (e) {
-        alert(`Sync error: ${e.message}`);
-      }
-    }
-
-    // Branch Activation Submission
     async function handleActivationSubmit(e) {
-      if (e && typeof e.preventDefault === 'function') {
-        e.preventDefault();
-      }
-      const btn = document.getElementById('btnActivateSubmit');
-      const alertBox = document.getElementById('activationAlert');
-      const username = (document.getElementById('inputUsername')?.value || '').trim();
-      const password = (document.getElementById('inputPassword')?.value || '').trim();
-      const branchKey = (document.getElementById('inputBranchKey')?.value || '').trim();
-      const cloudUrl = (document.getElementById('inputCloudUrl')?.value || '').trim();
-
+      e.preventDefault();
+      const u = document.getElementById('authUsernameInput').value.trim();
+      const p = document.getElementById('authPasswordInput').value.trim();
+      const k = document.getElementById('authBranchKeyInput').value.trim();
+      const btn = document.getElementById('btnAuthSubmit');
+      const errEl = document.getElementById('authErrorMsg');
+      errEl.style.display = 'none';
       btn.disabled = true;
-      btn.innerHTML = '⏳ Authenticating...';
-      alertBox.style.display = 'none';
 
       try {
         const res = await fetch('/api/node/login-auth', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            username: username,
-            password: password,
-            branch_key: branchKey, 
-            cloud_url: cloudUrl 
-          })
+          body: JSON.stringify({ username: u, password: p, branch_key: k })
         });
         const data = await res.json();
         if (data.success) {
-          alertBox.style.display = 'block';
-          alertBox.style.background = 'rgba(16, 185, 129, 0.15)';
-          alertBox.style.border = '1px solid #10b981';
-          alertBox.style.color = '#34d399';
-          alertBox.textContent = `✓ ${data.message} (${data.camera_count} cameras connected)`;
-          document.getElementById('headerBranchName').textContent = `${data.organization_name} • ${data.branch_name}`;
-
-          setTimeout(() => {
-            closeActivationModal();
-            loadCameras();
-            checkCloudStatus();
-            loadEmployeesList();
-          }, 1200);
+          showToast('Organization linked successfully! Reloading...', 'success');
+          closeActivationModal();
+          setTimeout(() => window.location.reload(), 1200);
         } else {
-          alertBox.style.display = 'block';
-          alertBox.style.background = 'rgba(239, 68, 68, 0.15)';
-          alertBox.style.border = '1px solid #ef4444';
-          alertBox.style.color = '#f87171';
-          alertBox.textContent = `✗ ${data.error || 'Authentication failed'}`;
+          errEl.textContent = data.error || 'Authentication failed';
+          errEl.style.display = 'block';
         }
       } catch (err) {
-        alertBox.style.display = 'block';
-        alertBox.style.background = 'rgba(239, 68, 68, 0.15)';
-        alertBox.style.border = '1px solid #ef4444';
-        alertBox.style.color = '#f87171';
-        alertBox.textContent = `✗ Network error: ${err.message}`;
+        errEl.textContent = 'Connection error: ' + err.message;
+        errEl.style.display = 'block';
       } finally {
         btn.disabled = false;
-        btn.innerHTML = '🔗 Connect &amp; Authenticate';
       }
     }
 
-    // Startup
-    function initLiveNode() {
-      loadCameras();
-      loadEmployeesList();
-      checkCloudStatus();
-      setInterval(pollDetections, 1500);
-      setInterval(checkCloudStatus, 5000);
-      setInterval(loadCameras, 5000);
-    }
+    // Keyboard Shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        closeVideoTrainModal();
+        closeActivationModal();
+      }
+    });
 
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initLiveNode);
-    } else {
-      initLiveNode();
-    }
+    // Initial Load & Intervals
+    window.addEventListener('DOMContentLoaded', () => {
+      loadCameras();
+      loadActiveShiftTiming();
+      loadPendingStaffQueue();
+      pollLiveDetections();
+
+      // Periodic Polls
+      setInterval(pollLiveDetections, 1500);
+      setInterval(loadActiveShiftTiming, 30000);
+      setInterval(() => loadPendingStaffQueue(false), 20000);
+    });
   </script>
 </body>
 </html>
