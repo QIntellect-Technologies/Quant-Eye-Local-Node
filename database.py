@@ -1,12 +1,47 @@
 import sqlite3
 import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple, Any, Union
 from logger_config import get_logger
 from config import DB_PATH, ATTENDANCE_LOG_RETENTION_DAYS
 
 logger = get_logger(__name__)
+
+def _get_local_instance_id() -> str:
+    """Retrieve persistent local instance ID from config_integration.json or fallback."""
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_integration.json")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return str(data.get("local_instance_id") or "LOC-INST-001")
+        except Exception:
+            pass
+    return "LOC-INST-001"
+
+def enqueue_sync_outbox(
+    cursor: sqlite3.Cursor,
+    organization_id: str,
+    branch_id: str,
+    event_type: str,
+    payload: Dict[str, Any],
+    event_id: Optional[str] = None
+) -> str:
+    """
+    Transactionally enqueue an event into sync_outbox_queue.
+    Must be called within an active database transaction cursor.
+    """
+    ev_id = event_id or f"EVT-{uuid.uuid4().hex.upper()}"
+    inst_id = _get_local_instance_id()
+    cursor.execute('''
+        INSERT OR IGNORE INTO sync_outbox_queue (
+            event_id, organization_id, branch_id, local_instance_id,
+            event_type, payload_json, status, attempts, next_attempt_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, CURRENT_TIMESTAMP)
+    ''', (ev_id, organization_id, branch_id, inst_id, event_type, json.dumps(payload)))
+    return ev_id
 
 
 def init_db():
@@ -15,11 +50,11 @@ def init_db():
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
 
-            # Users table
+            # Users table (scoped per organization)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
                     email TEXT,
                     phone TEXT,
                     department TEXT,
@@ -42,13 +77,67 @@ def init_db():
                 ("shift_id", "INTEGER DEFAULT 1"),
                 ("checkin_cameras", "TEXT DEFAULT 'all'"),
                 ("checkout_cameras", "TEXT DEFAULT 'all'"),
-                ("exit_date", "TEXT")
+                ("exit_date", "TEXT"),
+                ("organization_id", "TEXT DEFAULT 'DEFAULT_ORG'"),
+                ("branch_id", "TEXT DEFAULT 'DEFAULT_BRANCH'"),
+                ("face_trained", "INTEGER DEFAULT 0")
             ]:
                 try:
                     cursor.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
                     conn.commit()
                 except sqlite3.OperationalError:
                     pass
+
+            # Multi-Tenant Migration: Remove legacy global UNIQUE constraint on users.name
+            try:
+                cursor.execute("PRAGMA index_list(users)")
+                indexes = cursor.fetchall()
+                has_global_name_unique = any(idx[2] == 1 for idx in indexes if 'name' in idx[1].lower() or 'autoindex' in idx[1].lower())
+                if has_global_name_unique:
+                    cursor.execute("PRAGMA table_info(users)")
+                    cols_info = cursor.fetchall()
+                    col_names = [c[1] for c in cols_info if c[1] != 'id']
+                    cols_str = ", ".join(col_names)
+                    cursor.execute("ALTER TABLE users RENAME TO _users_legacy_unique_old")
+                    cursor.execute("""
+                        CREATE TABLE users (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT NOT NULL,
+                            email TEXT,
+                            phone TEXT,
+                            department TEXT,
+                            enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            active INTEGER DEFAULT 1,
+                            notes TEXT,
+                            photo_path TEXT,
+                            password TEXT DEFAULT '123456',
+                            role TEXT DEFAULT 'staff',
+                            cnic TEXT,
+                            position TEXT,
+                            salary REAL DEFAULT 0,
+                            join_date TEXT,
+                            shift_id INTEGER DEFAULT 1,
+                            checkin_cameras TEXT DEFAULT 'all',
+                            checkout_cameras TEXT DEFAULT 'all',
+                            exit_date TEXT,
+                            organization_id TEXT DEFAULT 'DEFAULT_ORG',
+                            branch_id TEXT DEFAULT 'DEFAULT_BRANCH',
+                            face_trained INTEGER DEFAULT 0
+                        )
+                    """)
+                    cursor.execute("PRAGMA table_info(_users_legacy_unique_old)")
+                    old_cols = set(c[1] for c in cursor.fetchall())
+                    common_cols = [c for c in col_names if c in old_cols]
+                    common_str = ", ".join(common_cols)
+                    cursor.execute(f"INSERT INTO users (id, {common_str}) SELECT id, {common_str} FROM _users_legacy_unique_old")
+                    cursor.execute("DROP TABLE _users_legacy_unique_old")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_org ON users(organization_id)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_name_org ON users(name, organization_id)")
+                    conn.commit()
+                    logger.info("✓ Multi-tenant migration applied: Removed global UNIQUE on users.name.")
+            except Exception as me:
+                logger.debug(f"Note on multi-tenant migration: {me}")
 
             # Create the base table before applying migrations that alter it.
             cursor.execute('''
@@ -656,6 +745,15 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            cursor.execute("SELECT COUNT(*) FROM cameras")
+            if cursor.fetchone()[0] == 0:
+                # No RTSP URLs are seeded. Only the machine's default local webcam (index 0) is
+                # registered so a fresh install has one working feed; the Admin adds all
+                # DVR / NVR / IP cameras from System Settings > Camera Management.
+                cursor.execute(
+                    "INSERT INTO cameras (camera_id, name, room_name, camera_type, rtsp_url) VALUES (?, ?, ?, ?, ?)",
+                    ('webcam', 'Local Webcam', 'Main Entrance', 'webcam', '0')
+                )
 
             # Shifts table
             cursor.execute('''
@@ -745,16 +843,57 @@ def init_db():
                 AND effective_from != '2020-01-01'
             ''')
 
-            # Create indexes for performance
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_name ON users(name)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_embeddings_user ON embeddings(user_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_user ON attendance(user_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_timestamp ON attendance(timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_source ON attendance(source)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_manual_absent_user_date ON manual_absent(user_id, date)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_locator_history_user_time ON locator_history(user_id, recorded_at)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_locator_history_room_time ON locator_history(room_name, recorded_at)')
+            # =========================================================================
+            # MULTI-TENANT ENTERPRISE ISOLATION: Add organization_id & branch_id
+            # =========================================================================
+            for table_name in [
+                'users', 'attendance', 'embeddings', 'shifts', 'departments',
+                'designations', 'leave_requests', 'leave_types', 'overtime',
+                'salary_configs', 'payroll_runs', 'payroll_records', 'company_holidays',
+                'employee_leave_balances', 'employee_shift_history', 'manual_absent', 'cameras'
+            ]:
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN organization_id TEXT DEFAULT 'DEFAULT_ORG'")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN branch_id TEXT DEFAULT 'DEFAULT_BRANCH'")
+                except sqlite3.OperationalError:
+                    pass
+
+            # Create composite tenant indexes for ultra-fast, 100% isolated queries
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_org ON users(organization_id, active)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_org ON attendance(organization_id, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_embeddings_org ON embeddings(organization_id, user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_departments_org ON departments(organization_id, active)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_shifts_org ON shifts(organization_id, active)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_payroll_records_org ON payroll_records(organization_id)')
+
+            # =========================================================================
+            # PHASE 2.3 — LOCAL OUTBOX QUEUE (sync_outbox_queue)
+            # =========================================================================
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS sync_outbox_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    organization_id TEXT NOT NULL,
+                    branch_id TEXT NOT NULL,
+                    local_instance_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_attempt_at TIMESTAMP,
+                    last_error TEXT,
+                    synced_at TIMESTAMP
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outbox_status ON sync_outbox_queue(status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outbox_next_attempt ON sync_outbox_queue(next_attempt_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outbox_event_id ON sync_outbox_queue(event_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outbox_org_branch ON sync_outbox_queue(organization_id, branch_id)')
 
             conn.commit()
             
@@ -779,42 +918,118 @@ def add_user(
     join_date: str = '',
     shift_id: int = 1,
     checkin_cameras: str = 'all',
-    checkout_cameras: str = 'all'
+    checkout_cameras: str = 'all',
+    organization_id: Optional[str] = None,
+    branch_id: Optional[str] = None
 ) -> Optional[int]:
     """Add a new user with validation, HR profile attributes, shift assignment, and camera assignments."""
     if not name or len(name.strip()) == 0:
         logger.warning("Attempted to add user with empty name")
         return None
 
+    clean_name = name.strip()
+    org_target = organization_id or 'DEFAULT_ORG'
+    branch_target = branch_id or 'DEFAULT_BRANCH'
+
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            
+            # 1. Multi-Tenant Check: Check if user with same name already exists in THIS organization
+            cursor.execute(
+                "SELECT id, active FROM users WHERE LOWER(TRIM(name)) = LOWER(?) AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')",
+                (clean_name, org_target)
+            )
+            existing = cursor.fetchone()
+            if existing:
+                existing_id, is_active = existing
+                # If previously marked inactive or re-enrolling, re-activate with updated details
+                cursor.execute("""
+                    UPDATE users 
+                    SET active = 1, email = ?, phone = ?, department = ?, password = ?, role = ?,
+                        notes = ?, cnic = ?, position = ?, salary = ?, join_date = ?, shift_id = ?,
+                        checkin_cameras = ?, checkout_cameras = ?, organization_id = ?, branch_id = ?
+                    WHERE id = ?
+                """, (email, phone, department, password, role, notes, cnic, position, salary, join_date, shift_id or 1, checkin_cameras or 'all', checkout_cameras or 'all', org_target, branch_target, existing_id))
+                effective_from = join_date if join_date else None
+                if effective_from:
+                    try: datetime.strptime(effective_from, "%Y-%m-%d")
+                    except ValueError: effective_from = None
+                _record_employee_shift_history(cursor, existing_id, shift_id or 1, effective_from)
+                conn.commit()
+                logger.info(f"✓ Re-activated/Updated user '{clean_name}' for Org '{org_target}' (ID: {existing_id})")
+                return existing_id
+
+            # 2. Insert new user safely scoped to this organization
             cursor.execute(
                 '''INSERT INTO users
-                   (name, email, phone, department, password, role, notes, cnic, position, salary, join_date, shift_id, checkin_cameras, checkout_cameras)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (name.strip(), email, phone, department, password, role, notes, cnic, position, salary, join_date, shift_id or 1, checkin_cameras or 'all', checkout_cameras or 'all')
+                   (name, email, phone, department, password, role, notes, cnic, position, salary, join_date, shift_id, checkin_cameras, checkout_cameras, organization_id, branch_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (clean_name, email, phone, department, password, role, notes, cnic, position, salary, join_date, shift_id or 1, checkin_cameras or 'all', checkout_cameras or 'all', org_target, branch_target)
             )
             user_id = cursor.lastrowid
             if user_id is None:
                 raise RuntimeError("Failed to create employee record")
             effective_from = join_date if join_date else None
             if effective_from:
-                try:
-                    datetime.strptime(effective_from, "%Y-%m-%d")
-                except ValueError:
-                    effective_from = None
+                try: datetime.strptime(effective_from, "%Y-%m-%d")
+                except ValueError: effective_from = None
             _record_employee_shift_history(cursor, user_id, shift_id or 1, effective_from)
             conn.commit()
 
-        logger.info(f"✓ User '{name}' created (ID: {user_id}, Shift ID: {shift_id}, In-Cams: {checkin_cameras}, Out-Cams: {checkout_cameras}")
+        logger.info(f"✓ User '{clean_name}' created for Org '{org_target}' (ID: {user_id}, Shift ID: {shift_id})")
         return user_id
-    except sqlite3.IntegrityError:
-        logger.warning(f"User '{name}' or email already exists")
+    except sqlite3.IntegrityError as ie:
+        logger.warning(f"Integrity check for user '{clean_name}' under Org '{org_target}': {ie}")
+        # As fail-safe, query existing ID if duplicate constraint triggered
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM users WHERE LOWER(TRIM(name)) = LOWER(?)", (clean_name,))
+                row = cursor.fetchone()
+                if row:
+                    return row[0]
+        except Exception:
+            pass
         return None
     except Exception as e:
         logger.error(f"Failed to add user: {e}")
         return None
+
+
+def purge_organization_data(organization_id: str) -> bool:
+    """
+    Completely purge all staff, embeddings, attendance logs, and camera configs
+    when an organization is deleted or wiped from the platform.
+    """
+    if not organization_id or organization_id in ('DEFAULT_ORG', ''):
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            # 1. Delete embeddings
+            cursor.execute("""
+                DELETE FROM embeddings 
+                WHERE organization_id = ? 
+                   OR user_id IN (SELECT id FROM users WHERE organization_id = ?)
+            """, (organization_id, organization_id))
+            # 2. Delete attendance records
+            cursor.execute("""
+                DELETE FROM attendance 
+                WHERE user_id IN (SELECT id FROM users WHERE organization_id = ?)
+            """, (organization_id,))
+            # 3. Delete shifts
+            cursor.execute("DELETE FROM shifts WHERE organization_id = ?", (organization_id,))
+            # 4. Delete cameras
+            cursor.execute("DELETE FROM cameras WHERE organization_id = ?", (organization_id,))
+            # 5. Delete users
+            cursor.execute("DELETE FROM users WHERE organization_id = ?", (organization_id,))
+            conn.commit()
+        logger.info(f"✓ Purged all data for deleted organization '{organization_id}'")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to purge organization '{organization_id}': {e}")
+        return False
 
 
 def get_user_by_name(name: str) -> Optional[Dict]:
@@ -831,12 +1046,12 @@ def get_user_by_name(name: str) -> Optional[Dict]:
     return None
 
 
-def get_all_users(role: Optional[str] = None) -> List[Dict]:
-    """Get all active users with today's attendance status, shift details, and camera assignments via optimized join."""
+def get_all_users(role: Optional[str] = None, organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> List[Dict]:
+    """Get all active users with today's attendance status, shift details, and camera assignments via optimized join, strictly scoped by organization and branch."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            query = '''
                 SELECT u.id, u.name, u.email, u.phone, u.department, u.enrollment_date, 
                        u.created_at, u.active, u.notes, u.photo_path,
                        CASE 
@@ -855,8 +1070,9 @@ def get_all_users(role: Optional[str] = None) -> List[Dict]:
                        COALESCE(s.grace_period_minutes, 15) as shift_grace,
                        COALESCE(u.checkin_cameras, 'all') as checkin_cameras,
                        COALESCE(u.checkout_cameras, 'all') as checkout_cameras,
-                       COALESCE(u.organization_id, '') as organization_id,
-                       COALESCE(u.branch_id, '') as branch_id
+                       COALESCE(u.organization_id, 'DEFAULT_ORG') as organization_id,
+                       COALESCE(u.branch_id, 'DEFAULT_BRANCH') as branch_id,
+                       COALESCE((SELECT COUNT(*) FROM embeddings emb WHERE emb.user_id = u.id), 0) as embedding_count
                 FROM users u
                 LEFT JOIN shifts s ON COALESCE(u.shift_id, 1) = s.id
                 LEFT JOIN (
@@ -870,7 +1086,24 @@ def get_all_users(role: Optional[str] = None) -> List[Dict]:
                     WHERE date = date('now', 'localtime')
                 ) ma ON u.id = ma.user_id
                 WHERE u.active = 1
-            ''')
+            '''
+            params = []
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    query += " AND (u.organization_id = 'DEFAULT_ORG' OR u.organization_id IS NULL)"
+                else:
+                    query += " AND u.organization_id = ?"
+                    params.append(organization_id)
+            if branch_id and branch_id != 'all':
+                if branch_id == 'DEFAULT_BRANCH':
+                    query += " AND (u.branch_id = 'DEFAULT_BRANCH' OR u.branch_id IS NULL)"
+                else:
+                    query += " AND u.branch_id = ?"
+                    params.append(branch_id)
+            if role:
+                query += " AND u.role = ?"
+                params.append(role)
+            cursor.execute(query, params)
             rows = cursor.fetchall()
             
         return [{
@@ -881,8 +1114,9 @@ def get_all_users(role: Optional[str] = None) -> List[Dict]:
             'shift_id': r[15], 'shift_name': r[16], 'shift_start': r[17],
             'shift_end': r[18], 'shift_grace': r[19],
             'checkin_cameras': r[20], 'checkout_cameras': r[21],
-            'organization_id': r[22] if len(r) > 22 else '',
-            'branch_id': r[23] if len(r) > 23 else ''
+            'organization_id': r[22], 'branch_id': r[23],
+            'embedding_count': r[24] if len(r) > 24 else 0,
+            'has_embedding': (r[24] > 0) if len(r) > 24 else False
         } for r in rows]
     except Exception as e:
         logger.error(f"Failed to get all users: {e}")
@@ -1043,28 +1277,44 @@ def delete_user(user_id: int) -> bool:
         return False
 
 
-def store_embedding(user_id: int, embedding: List[float], source_video: str | None = None):
-    """Store face embedding for a user."""
+def store_embedding(user_id: int, embedding: List[float], source_video: str | None = None, organization_id: Optional[str] = None, branch_id: Optional[str] = None):
+    """Store face embedding for a user with tenant organization_id and branch_id."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if not organization_id or not branch_id:
+                cursor.execute('SELECT organization_id, branch_id FROM users WHERE id = ?', (user_id,))
+                urow = cursor.fetchone()
+                if urow:
+                    organization_id = organization_id or urow[0] or 'DEFAULT_ORG'
+                    branch_id = branch_id or urow[1] or 'DEFAULT_BRANCH'
+                else:
+                    organization_id = organization_id or 'DEFAULT_ORG'
+                    branch_id = branch_id or 'DEFAULT_BRANCH'
             embedding_blob = json.dumps(embedding).encode()
             cursor.execute(
-                'INSERT INTO embeddings (user_id, embedding, source_video) VALUES (?, ?, ?)',
-                (user_id, embedding_blob, source_video)
+                'INSERT INTO embeddings (user_id, embedding, source_video, organization_id, branch_id) VALUES (?, ?, ?, ?, ?)',
+                (user_id, embedding_blob, source_video, organization_id, branch_id)
             )
             conn.commit()
     except Exception as e:
         logger.error(f"Failed to store embedding for user {user_id}: {e}")
 
 
-def get_embeddings_for_user(user_id: int) -> List[Dict]:
-    """Retrieve all embeddings for a user."""
+def get_embeddings_for_user(user_id: int, organization_id: Optional[str] = None) -> List[Dict]:
+    """Retrieve all embeddings for a user, verifying tenant ownership if organization_id is provided."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT id FROM users WHERE id = ? AND (organization_id = 'DEFAULT_ORG' OR organization_id IS NULL)", (user_id,))
+                else:
+                    cursor.execute("SELECT id FROM users WHERE id = ? AND organization_id = ?", (user_id, organization_id))
+                if not cursor.fetchone():
+                    return []
             cursor.execute(
-                'SELECT id, embedding, source_video, created_at FROM embeddings WHERE user_id = ?',
+                'SELECT id, embedding, source_video, created_at, organization_id, branch_id FROM embeddings WHERE user_id = ?',
                 (user_id,)
             )
             rows = cursor.fetchall()
@@ -1073,7 +1323,9 @@ def get_embeddings_for_user(user_id: int) -> List[Dict]:
             'id': row[0],
             'embedding': json.loads(row[1].decode()),
             'source_video': row[2],
-            'created_at': row[3]
+            'created_at': row[3],
+            'organization_id': row[4],
+            'branch_id': row[5]
         } for row in rows]
     except Exception as e:
         logger.error(f"Failed to get embeddings for user {user_id}: {e}")
@@ -1235,11 +1487,16 @@ def _record_employee_shift_history(
     shift = cursor.fetchone()
     if not shift:
         raise ValueError("Shift not found")
+    cursor.execute("SELECT organization_id, branch_id FROM users WHERE id = ?", (user_id,))
+    u_row = cursor.fetchone()
+    u_org = (u_row[0] if u_row else None) or 'DEFAULT_ORG'
+    u_branch = (u_row[1] if u_row else None) or 'DEFAULT_BRANCH'
     cursor.execute('''
         INSERT INTO employee_shift_history (
             user_id, shift_id, effective_from, shift_name, start_time, end_time,
-            grace_period_minutes, checkout_grace_period_minutes, working_days, history_source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            grace_period_minutes, checkout_grace_period_minutes, working_days, history_source,
+            organization_id, branch_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, effective_from) DO UPDATE SET
             shift_id = excluded.shift_id,
             shift_name = excluded.shift_name,
@@ -1248,9 +1505,11 @@ def _record_employee_shift_history(
             grace_period_minutes = excluded.grace_period_minutes,
             checkout_grace_period_minutes = excluded.checkout_grace_period_minutes,
             working_days = excluded.working_days,
-            history_source = excluded.history_source
+            history_source = excluded.history_source,
+            organization_id = excluded.organization_id,
+            branch_id = excluded.branch_id
     ''', (user_id, shift_id, effective_date, shift[0], shift[1], shift[2], shift[3] or 15, shift[4] or 0,
-          shift[5] or '[0,1,2,3,4,5]', history_source))
+          shift[5] or '[0,1,2,3,4,5]', history_source, u_org, u_branch))
 
 
 def _resolve_calendar_override(
@@ -1366,23 +1625,34 @@ def _is_scheduled_workday(work_date, working_days: Any, override_type: Optional[
     return work_date.weekday() in weekdays
 
 
-def get_all_shifts(active_only: bool = True) -> List[Dict]:
-    """Retrieve all defined shifts along with assigned employee count and default flag."""
+def get_all_shifts(active_only: bool = True, organization_id: Optional[str] = None) -> List[Dict]:
+    """Retrieve all defined shifts along with assigned employee count and default flag, scoped by organization."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            where_clause = "WHERE s.active = 1" if active_only else ""
+            where_clauses = []
+            params = []
+            if active_only:
+                where_clauses.append("s.active = 1")
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    where_clauses.append("(s.organization_id = 'DEFAULT_ORG' OR s.organization_id IS NULL OR s.id = 1)")
+                else:
+                    where_clauses.append("(s.organization_id = ? OR s.id = 1)")
+                    params.append(organization_id)
+            where_clause = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
             cursor.execute(f'''
                 SELECT s.id, s.name, s.start_time, s.end_time, s.grace_period_minutes, 
                        COALESCE(s.is_default, CASE WHEN s.id = 1 THEN 1 ELSE 0 END) as is_default,
                        s.active, s.created_at,
-                       COUNT(u.id) as user_count, s.working_days, s.checkout_grace_period_minutes
+                       COUNT(u.id) as user_count, s.working_days, s.checkout_grace_period_minutes,
+                       COALESCE(s.organization_id, 'DEFAULT_ORG') as organization_id
                 FROM shifts s
                 LEFT JOIN users u ON COALESCE(u.shift_id, 1) = s.id AND u.active = 1
                 {where_clause}
                 GROUP BY s.id
                 ORDER BY s.id ASC
-            ''')
+            ''', params)
             rows = cursor.fetchall()
 
         return [{
@@ -1396,7 +1666,8 @@ def get_all_shifts(active_only: bool = True) -> List[Dict]:
             'created_at': r[7],
             'user_count': r[8],
             'working_days': _normalize_shift_working_days(r[9]),
-            'checkout_grace_period_minutes': r[10] or 0
+            'checkout_grace_period_minutes': r[10] or 0,
+            'organization_id': r[11]
         } for r in rows]
     except Exception as e:
         logger.error(f"Failed to fetch shifts: {e}")
@@ -1443,29 +1714,37 @@ def get_default_shift() -> Optional[Dict]:
     return None
 
 
-def get_shift_by_id(shift_id: int) -> Optional[Dict]:
-    """Retrieve a single shift by ID."""
+def get_shift_by_id(shift_id: int, organization_id: Optional[str] = None) -> Optional[Dict]:
+    """Retrieve a single shift by ID, optionally verifying tenant isolation."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, name, start_time, end_time, grace_period_minutes, active FROM shifts WHERE id = ?', (shift_id,))
+            cursor.execute('SELECT id, name, start_time, end_time, grace_period_minutes, active, organization_id FROM shifts WHERE id = ?', (shift_id,))
             row = cursor.fetchone()
             if row:
-                return {
+                shift_dict = {
                     'id': row[0],
                     'name': row[1],
                     'start_time': row[2],
                     'end_time': row[3],
                     'grace_period_minutes': row[4],
-                    'active': row[5]
+                    'active': row[5],
+                    'organization_id': row[6] or 'DEFAULT_ORG'
                 }
+                if organization_id and organization_id != 'all' and shift_dict['id'] != 1:
+                    if organization_id == 'DEFAULT_ORG':
+                        if shift_dict['organization_id'] not in ('DEFAULT_ORG', None):
+                            return None
+                    elif shift_dict['organization_id'] != organization_id:
+                        return None
+                return shift_dict
     except Exception as e:
         logger.error(f"Failed to fetch shift ID {shift_id}: {e}")
     return None
 
 
-def add_shift(name: str, start_time: str, end_time: str, grace_period_minutes: int = 15, checkout_grace_period_minutes: int = 0, working_days: Any = None) -> Optional[int]:
-    """Add a new custom shift."""
+def add_shift(name: str, start_time: str, end_time: str, grace_period_minutes: int = 15, checkout_grace_period_minutes: int = 0, working_days: Any = None, organization_id: Optional[str] = 'DEFAULT_ORG', branch_id: Optional[str] = 'DEFAULT_BRANCH') -> Optional[int]:
+    """Add a new custom shift with tenant organization_id and branch_id."""
     if not name or not name.strip():
         logger.warning("Attempted to add shift with empty name")
         return None
@@ -1473,13 +1752,13 @@ def add_shift(name: str, start_time: str, end_time: str, grace_period_minutes: i
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                'INSERT INTO shifts (name, start_time, end_time, grace_period_minutes, checkout_grace_period_minutes, working_days) VALUES (?, ?, ?, ?, ?, ?)',
+                'INSERT INTO shifts (name, start_time, end_time, grace_period_minutes, checkout_grace_period_minutes, working_days, organization_id, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                 (name.strip(), start_time, end_time, max(0, int(grace_period_minutes)), max(0, int(checkout_grace_period_minutes)),
-                 json.dumps(_normalize_shift_working_days(working_days)))
+                 json.dumps(_normalize_shift_working_days(working_days)), organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH')
             )
             conn.commit()
             shift_id = cursor.lastrowid
-            logger.info(f"✓ Shift '{name}' created (ID: {shift_id})")
+            logger.info(f"✓ Shift '{name}' created for Org '{organization_id or 'DEFAULT_ORG'}' (ID: {shift_id})")
             return shift_id
     except ValueError:
         raise
@@ -1491,11 +1770,16 @@ def add_shift(name: str, start_time: str, end_time: str, grace_period_minutes: i
         return None
 
 
-def update_shift(shift_id: int, name: str, start_time: str, end_time: str, grace_period_minutes: int = 15, checkout_grace_period_minutes: int = 0, working_days: Any = None) -> bool:
-    """Update custom shift configuration."""
+def update_shift(shift_id: int, name: str, start_time: str, end_time: str, grace_period_minutes: int = 15, checkout_grace_period_minutes: int = 0, working_days: Any = None, organization_id: Optional[str] = None) -> bool:
+    """Update custom shift configuration, ensuring tenant authorization."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id and organization_id != 'all' and shift_id != 1:
+                cursor.execute("SELECT organization_id FROM shifts WHERE id = ?", (shift_id,))
+                s_row = cursor.fetchone()
+                if not s_row or (s_row[0] and s_row[0] not in (organization_id, 'DEFAULT_ORG')):
+                    return False
             if working_days is None:
                 cursor.execute(
                     'UPDATE shifts SET name = ?, start_time = ?, end_time = ?, grace_period_minutes = ?, checkout_grace_period_minutes = ? WHERE id = ?',
@@ -1523,14 +1807,19 @@ def update_shift(shift_id: int, name: str, start_time: str, end_time: str, grace
         return False
 
 
-def delete_shift(shift_id: int) -> bool:
-    """Delete shift (reassigns users of this shift back to shift ID 1)."""
+def delete_shift(shift_id: int, organization_id: Optional[str] = None) -> bool:
+    """Delete shift (reassigns users of this shift back to shift ID 1), ensuring tenant authorization."""
     if shift_id == 1:
         logger.warning("Cannot delete default Morning Shift")
         return False
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id and organization_id != 'all':
+                cursor.execute("SELECT organization_id FROM shifts WHERE id = ?", (shift_id,))
+                s_row = cursor.fetchone()
+                if not s_row or (s_row[0] and s_row[0] not in (organization_id, 'DEFAULT_ORG')):
+                    return False
             cursor.execute("SELECT id FROM users WHERE shift_id = ?", (shift_id,))
             reassigned_users = [row[0] for row in cursor.fetchall()]
             cursor.execute('UPDATE users SET shift_id = 1 WHERE shift_id = ?', (shift_id,))
@@ -1654,17 +1943,23 @@ def _record_automatic_checkout_overtime(
             )
         return overtime_hours
 
+    cursor.execute("SELECT organization_id, branch_id FROM users WHERE id = ?", (user_id,))
+    u_ot_row = cursor.fetchone()
+    u_ot_org = (u_ot_row[0] if u_ot_row else None) or 'DEFAULT_ORG'
+    u_ot_branch = (u_ot_row[1] if u_ot_row else None) or 'DEFAULT_BRANCH'
     cursor.execute(
-        "INSERT INTO overtime (user_id, user_name, ot_date, hours, reason, status) VALUES (?, ?, ?, ?, ?, 'pending')",
-        (user_id, user_name, actual_date, overtime_hours, reason),
+        "INSERT INTO overtime (user_id, user_name, ot_date, hours, reason, status, organization_id, branch_id) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+        (user_id, user_name, actual_date, overtime_hours, reason, u_ot_org, u_ot_branch),
     )
     return overtime_hours
 
 
-def log_attendance(user_id: int, detected_name: str, confidence: float, source: str = 'camera', location: str | None = None, device_id: str | None = None, bypass_shift_check: bool = False, checkout_camera_id: str | None = None, checkout_location: str | None = None) -> Tuple[bool, str]:
+def log_attendance(user_id: int, detected_name: str, confidence: float, source: str = 'camera', location: str | None = None, device_id: str | None = None, bypass_shift_check: bool = False, checkout_camera_id: str | None = None, checkout_location: str | None = None, attendance_time: Optional[datetime] = None) -> Tuple[bool, str]:
     """Log attendance detection with room location, device ID, and shift grace period verification."""
+    if attendance_time is None:
+        attendance_time = datetime.now()
     if not bypass_shift_check:
-        allowed, reason, shift_info = check_user_shift_allowed(user_id)
+        allowed, reason, shift_info = check_user_shift_allowed(user_id, dt=attendance_time)
         if not allowed:
             logger.info(f"Skipped attendance log for '{detected_name}' (User ID {user_id}): {reason}")
             return False, reason
@@ -1673,25 +1968,56 @@ def log_attendance(user_id: int, detected_name: str, confidence: float, source: 
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            attendance_time = datetime.now()
             cursor.execute(
-                'DELETE FROM manual_absent WHERE user_id = ? AND date = date("now", "localtime")',
-                (user_id,)
+                'DELETE FROM manual_absent WHERE user_id = ? AND date = date(?)',
+                (user_id, attendance_time.strftime('%Y-%m-%d'))
             )
+            cursor.execute("SELECT organization_id, branch_id FROM users WHERE id = ?", (user_id,))
+            u_row = cursor.fetchone()
+            u_org = (u_row[0] if u_row else None) or 'DEFAULT_ORG'
+            u_branch = (u_row[1] if u_row else None) or 'DEFAULT_BRANCH'
             cursor.execute(
                 '''INSERT INTO attendance (
                        user_id, detected_name, confidence, source, location, device_id,
-                       checkout_camera_id, checkout_location, timestamp
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                       checkout_camera_id, checkout_location, timestamp, organization_id, branch_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (user_id, detected_name, confidence, source, location, device_id,
-                 checkout_camera_id, checkout_location, attendance_time.strftime('%Y-%m-%d %H:%M:%S'))
+                 checkout_camera_id, checkout_location, attendance_time.strftime('%Y-%m-%d %H:%M:%S'),
+                 u_org, u_branch)
             )
+            att_id = cursor.lastrowid
             if checkout_camera_id:
                 overtime_hours = _record_automatic_checkout_overtime(
                     cursor, user_id, detected_name, attendance_time
                 )
+
+            # PHASE 2.3: Transactional Outbox Enqueue
+            ev_id = f"ATT-{u_org}-{u_branch}-{att_id}-{int(attendance_time.timestamp())}"
+            payload = {
+                "local_attendance_id": att_id,
+                "user_id": user_id,
+                "detected_name": detected_name,
+                "confidence": float(confidence),
+                "source": source,
+                "location": location or "",
+                "device_id": device_id or "",
+                "checkout_camera_id": checkout_camera_id or "",
+                "checkout_location": checkout_location or "",
+                "timestamp": attendance_time.strftime('%Y-%m-%d %H:%M:%S'),
+                "organization_id": u_org,
+                "branch_id": u_branch
+            }
+            enqueue_sync_outbox(
+                cursor=cursor,
+                organization_id=u_org,
+                branch_id=u_branch,
+                event_type="CHECK_IN" if not checkout_camera_id else "CHECK_OUT",
+                payload=payload,
+                event_id=ev_id
+            )
+
             conn.commit()
-            logger.info(f"✓ Attendance logged for '{detected_name}' (User ID {user_id})")
+            logger.info(f"✓ Attendance logged for '{detected_name}' (User ID {user_id}) [Outbox: {ev_id}]")
             if checkout_camera_id and overtime_hours > 0:
                 logger.info(f"✓ Pending automatic overtime created for '{detected_name}': {overtime_hours:.2f} hour(s)")
             return True, "Attendance marked successfully"
@@ -1792,17 +2118,33 @@ def get_locator_history(user_id: Optional[int] = None, room_name: Optional[str] 
         return []
 
 
-def get_attendance_logs(limit: int = 100) -> List[Dict]:
-    """Retrieve recent attendance logs with location and device."""
+def get_attendance_logs(limit: int = 100, organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> List[Dict]:
+    """Retrieve recent attendance logs with location and device, strictly scoped by organization and branch."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            query = '''
                 SELECT a.id, u.name, a.detected_name, a.confidence, a.timestamp, a.source, a.location, a.device_id
                 FROM attendance a
                 JOIN users u ON a.user_id = u.id
-                ORDER BY a.timestamp DESC LIMIT ?
-            ''', (limit,))
+                WHERE 1=1
+            '''
+            params = []
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    query += " AND (a.organization_id = 'DEFAULT_ORG' OR a.organization_id IS NULL OR u.organization_id = 'DEFAULT_ORG' OR u.organization_id IS NULL)"
+                else:
+                    query += " AND (a.organization_id = ? OR u.organization_id = ?)"
+                    params.extend([organization_id, organization_id])
+            if branch_id and branch_id != 'all':
+                if branch_id == 'DEFAULT_BRANCH':
+                    query += " AND (a.branch_id = 'DEFAULT_BRANCH' OR a.branch_id IS NULL OR u.branch_id = 'DEFAULT_BRANCH' OR u.branch_id IS NULL)"
+                else:
+                    query += " AND (a.branch_id = ? OR u.branch_id = ?)"
+                    params.extend([branch_id, branch_id])
+            query += " ORDER BY a.timestamp DESC LIMIT ?"
+            params.append(limit)
+            cursor.execute(query, params)
             rows = cursor.fetchall()
             
         def serialize_timestamp(value):
@@ -1831,11 +2173,19 @@ def get_attendance_by_user(
     days: int = 7,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    organization_id: Optional[str] = None,
 ) -> List[Dict]:
-    """Get attendance logs for a user in the last N days, or between start_date and end_date (YYYY-MM-DD)."""
+    """Get attendance logs for a user in the last N days, or between start_date and end_date (YYYY-MM-DD), verifying tenant ownership."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT id FROM users WHERE id = ? AND (organization_id = 'DEFAULT_ORG' OR organization_id IS NULL)", (user_id,))
+                else:
+                    cursor.execute("SELECT id FROM users WHERE id = ? AND organization_id = ?", (user_id, organization_id))
+                if not cursor.fetchone():
+                    return []
             if start_date and end_date:
                 cursor.execute('''
                     SELECT id, timestamp, confidence, source FROM attendance
@@ -1879,38 +2229,59 @@ def cleanup_old_logs(days: int = ATTENDANCE_LOG_RETENTION_DAYS):
         return 0
 
 
-def get_attendance_statistics() -> Dict:
-    """Get comprehensive attendance statistics."""
+def get_attendance_statistics(organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict:
+    """Get comprehensive attendance statistics scoped strictly to organization and branch."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             
-            cursor.execute('SELECT COUNT(*) FROM attendance')
+            att_where = "WHERE 1=1"
+            user_where = "WHERE 1=1"
+            ma_where = "WHERE 1=1"
+            params_att = []
+            params_user = []
+            params_ma = []
+
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    att_where += " AND (organization_id = 'DEFAULT_ORG' OR organization_id IS NULL)"
+                    user_where += " AND (organization_id = 'DEFAULT_ORG' OR organization_id IS NULL)"
+                    ma_where += " AND (organization_id = 'DEFAULT_ORG' OR organization_id IS NULL)"
+                else:
+                    att_where += " AND organization_id = ?"
+                    user_where += " AND organization_id = ?"
+                    ma_where += " AND organization_id = ?"
+                    params_att.append(organization_id)
+                    params_user.append(organization_id)
+                    params_ma.append(organization_id)
+
+            cursor.execute(f'SELECT COUNT(*) FROM attendance {att_where}', params_att)
             total_records = cursor.fetchone()[0]
             
-            cursor.execute('''
+            cursor.execute(f'''
                 SELECT COUNT(*) FROM attendance
-                WHERE date(timestamp) = date('now', 'localtime')
-            ''')
+                {att_where} AND date(timestamp) = date('now', 'localtime')
+            ''', params_att)
             today_count = cursor.fetchone()[0]
 
-            cursor.execute('''
+            cursor.execute(f'''
                 SELECT COUNT(DISTINCT user_id) FROM attendance
-                WHERE date(timestamp) = date('now', 'localtime')
+                {att_where} AND date(timestamp) = date('now', 'localtime')
                 AND user_id NOT IN (
-                    SELECT user_id FROM manual_absent WHERE date = date('now', 'localtime')
+                    SELECT user_id FROM manual_absent {ma_where} AND date = date('now', 'localtime')
                 )
-            ''')
+            ''', [*params_att, *params_ma])
             unique_today = cursor.fetchone()[0]
             
-            cursor.execute('SELECT AVG(confidence) FROM attendance')
+            cursor.execute(f'SELECT AVG(confidence) FROM attendance {att_where}', params_att)
             avg_confidence = cursor.fetchone()[0] or 0
             
-            cursor.execute('''
+            cursor.execute(f'''
                 SELECT u.name, a.timestamp, a.confidence FROM attendance a
                 JOIN users u ON a.user_id = u.id
+                {att_where.replace('organization_id', 'a.organization_id')}
                 ORDER BY a.timestamp DESC LIMIT 10
-            ''')
+            ''', params_att)
             recent = cursor.fetchall()
             
         return {
@@ -1927,18 +2298,27 @@ def get_attendance_statistics() -> Dict:
         logger.error(f"Failed to get statistics: {e}")
         return {}
 
-def get_attendance_today() -> List[Dict]:
-    """Get all attendance logs for today with room location and device info."""
+
+def get_attendance_today(organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> List[Dict]:
+    """Get all attendance logs for today with room location and device info, scoped by tenant."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            query = '''
                 SELECT a.id, u.name as user_name, a.detected_name, a.confidence, a.timestamp, a.source, a.user_id, u.department, a.location, a.device_id
                 FROM attendance a
                 JOIN users u ON a.user_id = u.id
                 WHERE date(a.timestamp) = date('now', 'localtime')
-                ORDER BY a.timestamp DESC
-            ''')
+            '''
+            params = []
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    query += " AND (a.organization_id = 'DEFAULT_ORG' OR a.organization_id IS NULL OR u.organization_id = 'DEFAULT_ORG' OR u.organization_id IS NULL)"
+                else:
+                    query += " AND (a.organization_id = ? OR u.organization_id = ?)"
+                    params.extend([organization_id, organization_id])
+            query += " ORDER BY a.timestamp DESC"
+            cursor.execute(query, params)
             rows = cursor.fetchall()
             
         return [{
@@ -1951,12 +2331,18 @@ def get_attendance_today() -> List[Dict]:
         return []
 
 
-def get_all_departments() -> List[str]:
+def get_all_departments(organization_id: Optional[str] = None) -> List[str]:
     """Get list of distinct departments from registered active users."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT department FROM users WHERE active = 1 AND department IS NOT NULL AND department != '' ORDER BY department ASC")
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT DISTINCT department FROM users WHERE active = 1 AND department IS NOT NULL AND department != '' AND (organization_id = ? OR organization_id IS NULL OR organization_id = '') ORDER BY department ASC", (organization_id,))
+                else:
+                    cursor.execute("SELECT DISTINCT department FROM users WHERE active = 1 AND department IS NOT NULL AND department != '' AND organization_id = ? ORDER BY department ASC", (organization_id,))
+            else:
+                cursor.execute("SELECT DISTINCT department FROM users WHERE active = 1 AND department IS NOT NULL AND department != '' ORDER BY department ASC")
             rows = cursor.fetchall()
             return [r[0] for r in rows]
     except Exception as e:
@@ -1977,6 +2363,7 @@ def get_detailed_attendance_report(
     camera_id: Optional[str] = None,
     late_time_threshold: str = "09:15:00",
     user_id: Optional[int] = None,
+    organization_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate comprehensive department-wise, shift-wise, staff-wise, and camera-wise attendance reports.
@@ -2097,6 +2484,12 @@ def get_detailed_attendance_report(
             if user_id is not None:
                 user_query += " AND u.id = ?"
                 user_params.append(int(user_id))
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    user_query += " AND (u.organization_id = 'DEFAULT_ORG' OR u.organization_id IS NULL)"
+                else:
+                    user_query += " AND u.organization_id = ?"
+                    user_params.append(organization_id)
 
             user_query += " ORDER BY u.department ASC, u.name ASC"
             cursor.execute(user_query, user_params)
@@ -2700,13 +3093,22 @@ def is_user_present_today(user_id: int, source: str | None = None) -> bool:
         return False
 
 
-def mark_user_absent_today(user_id: int, target_date: Optional[str] = None) -> bool:
-    """Manually mark a user absent today or on a specific date by removing logs and persisting the override."""
+def mark_user_absent_today(user_id: int, target_date: Optional[str] = None, organization_id: Optional[str] = None) -> bool:
+    """Manually mark a user absent today or on a specific date, enforcing tenant isolation."""
     try:
         if target_date == 'today':
             target_date = None
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT organization_id, branch_id FROM users WHERE id = ?", (user_id,))
+            u_row = cursor.fetchone()
+            if not u_row:
+                return False
+            user_org = u_row[0] or 'DEFAULT_ORG'
+            user_branch = u_row[1] or 'DEFAULT_BRANCH'
+            if organization_id and organization_id != 'all':
+                if organization_id != 'DEFAULT_ORG' and user_org != organization_id:
+                    return False
             if target_date:
                 cursor.execute('''
                     DELETE FROM attendance 
@@ -2715,9 +3117,9 @@ def mark_user_absent_today(user_id: int, target_date: Optional[str] = None) -> b
                 deleted_count = cursor.rowcount
 
                 cursor.execute('''
-                    INSERT OR REPLACE INTO manual_absent (user_id, date)
-                    VALUES (?, ?)
-                ''', (user_id, target_date))
+                    INSERT OR REPLACE INTO manual_absent (user_id, date, organization_id, branch_id)
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, target_date, user_org, user_branch))
             else:
                 cursor.execute('''
                     DELETE FROM attendance 
@@ -2726,8 +3128,8 @@ def mark_user_absent_today(user_id: int, target_date: Optional[str] = None) -> b
                 deleted_count = cursor.rowcount
 
                 cursor.execute('''
-                    INSERT OR REPLACE INTO manual_absent (user_id, date)
-                    VALUES (?, date('now', 'localtime'))
+                    INSERT OR REPLACE INTO manual_absent (user_id, date, organization_id, branch_id)
+                    VALUES (?, date('now', 'localtime'), user_org, user_branch)
                 ''', (user_id,))
             conn.commit()
         logger.info(f"✓ Manually marked user ID {user_id} absent for {target_date or 'today'} (removed {deleted_count} logs, recorded manual_absent)")
@@ -2821,12 +3223,12 @@ def mark_user_present_today(
     check_out_time: Optional[str] = None, 
     shift_id: Optional[int] = None,
     notes: str = "", 
-    marked_by: str = "Admin"
+    marked_by: str = "Admin",
+    organization_id: Optional[str] = None
 ) -> bool:
     """
-    Manually mark a user present today or on a target date, recording check-in and optional check-out.
-    Applies the specified or applicable shift (preserving historical shifts), validates checkout,
-    and calculates eligible overtime taking into account the shift checkout grace period.
+    Manually mark a user present today or on a target date, recording check-in and optional check-out,
+    enforcing tenant isolation and propagating organization_id & branch_id.
     """
     try:
         if check_in_time is not None and str(check_in_time).strip() == '':
@@ -2841,12 +3243,17 @@ def mark_user_present_today(
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             
-            # Verify user exists
-            cursor.execute('SELECT name, shift_id FROM users WHERE id = ?', (user_id,))
+            # Verify user exists and check tenant
+            cursor.execute('SELECT name, shift_id, organization_id, branch_id FROM users WHERE id = ?', (user_id,))
             user_row = cursor.fetchone()
             if not user_row:
                 return False
             name, user_default_shift_id = user_row[0], user_row[1]
+            user_org = user_row[2] or 'DEFAULT_ORG'
+            user_branch = user_row[3] or 'DEFAULT_BRANCH'
+            if organization_id and organization_id != 'all':
+                if organization_id != 'DEFAULT_ORG' and user_org != organization_id:
+                    return False
             
             # Clear manual absent
             cursor.execute('DELETE FROM manual_absent WHERE user_id = ? AND date = ?', (user_id, actual_date))
@@ -2913,16 +3320,16 @@ def mark_user_present_today(
             # Insert check-in log
             timestamp_val_in = f"{actual_date} {ci_clean}:00"
             cursor.execute(
-                "INSERT INTO attendance (user_id, detected_name, confidence, source, timestamp, notes, marked_by, shift_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, name, 1.0, 'manual', timestamp_val_in, notes, marked_by, shift_db_id)
+                "INSERT INTO attendance (user_id, detected_name, confidence, source, timestamp, notes, marked_by, shift_id, organization_id, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, name, 1.0, 'manual', timestamp_val_in, notes, marked_by, shift_db_id, user_org, user_branch)
             )
 
             # Insert check-out log if provided
             if co_clean:
                 timestamp_val_out = f"{actual_date} {co_clean}:00"
                 cursor.execute(
-                    "INSERT INTO attendance (user_id, detected_name, confidence, source, timestamp, notes, marked_by, shift_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (user_id, name, 1.0, 'manual', timestamp_val_out, notes, marked_by, shift_db_id)
+                    "INSERT INTO attendance (user_id, detected_name, confidence, source, timestamp, notes, marked_by, shift_id, organization_id, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, name, 1.0, 'manual', timestamp_val_out, notes, marked_by, shift_db_id, user_org, user_branch)
                 )
 
                 # Calculate OT
@@ -2937,8 +3344,8 @@ def mark_user_present_today(
                             cursor.execute("UPDATE overtime SET hours = ?, reason = ? WHERE id = ?", 
                                            (ot_hours, f"Manual attendance checkout {co_clean}", ot_id))
                     else:
-                        cursor.execute("INSERT INTO overtime (user_id, user_name, ot_date, hours, reason, status) VALUES (?, ?, ?, ?, ?, 'pending')",
-                                       (user_id, name, actual_date, ot_hours, f"Manual attendance checkout {co_clean}"))
+                        cursor.execute("INSERT INTO overtime (user_id, user_name, ot_date, hours, reason, status, organization_id, branch_id) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                                       (user_id, name, actual_date, ot_hours, f"Manual attendance checkout {co_clean}", user_org, user_branch))
                 else:
                     if ot_existing and (ot_existing[1] or 'pending').lower() == 'pending':
                         cursor.execute("DELETE FROM overtime WHERE id = ?", (ot_existing[0],))
@@ -2948,6 +3355,49 @@ def mark_user_present_today(
                 ot_existing = cursor.fetchone()
                 if ot_existing and (ot_existing[1] or 'pending').lower() == 'pending':
                     cursor.execute("DELETE FROM overtime WHERE id = ?", (ot_existing[0],))
+
+            # PHASE 2.3: Enqueue manual attendance into sync_outbox_queue
+            ev_in = f"ATT-{user_org}-{user_branch}-MAN-{user_id}-{actual_date}-IN"
+            enqueue_sync_outbox(
+                cursor=cursor,
+                organization_id=user_org,
+                branch_id=user_branch,
+                event_type="CHECK_IN",
+                payload={
+                    "user_id": user_id,
+                    "detected_name": name,
+                    "confidence": 1.0,
+                    "source": "manual",
+                    "timestamp": timestamp_val_in,
+                    "notes": notes,
+                    "marked_by": marked_by,
+                    "shift_id": shift_db_id,
+                    "organization_id": user_org,
+                    "branch_id": user_branch
+                },
+                event_id=ev_in
+            )
+            if co_clean:
+                ev_out = f"ATT-{user_org}-{user_branch}-MAN-{user_id}-{actual_date}-OUT"
+                enqueue_sync_outbox(
+                    cursor=cursor,
+                    organization_id=user_org,
+                    branch_id=user_branch,
+                    event_type="CHECK_OUT",
+                    payload={
+                        "user_id": user_id,
+                        "detected_name": name,
+                        "confidence": 1.0,
+                        "source": "manual",
+                        "timestamp": timestamp_val_out,
+                        "notes": notes,
+                        "marked_by": marked_by,
+                        "shift_id": shift_db_id,
+                        "organization_id": user_org,
+                        "branch_id": user_branch
+                    },
+                    event_id=ev_out
+                )
 
             conn.commit()
 
@@ -2990,11 +3440,16 @@ def clear_manual_absent_today(user_id: int) -> bool:
         return False
 
 
-def save_user_photo(user_id: int, photo_path: str) -> bool:
-    """Save the path of professional profile photo for a user."""
+def save_user_photo(user_id: int, photo_path: str, organization_id: Optional[str] = None) -> bool:
+    """Save the path of professional profile photo for a user, verifying tenant ownership."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id and organization_id != 'all':
+                cursor.execute("SELECT organization_id FROM users WHERE id = ?", (user_id,))
+                urow = cursor.fetchone()
+                if not urow or (urow[0] and urow[0] not in (organization_id, 'DEFAULT_ORG')):
+                    return False
             cursor.execute("UPDATE users SET photo_path = ? WHERE id = ?", (photo_path, user_id))
             updated = cursor.rowcount > 0
             conn.commit()
@@ -3004,11 +3459,16 @@ def save_user_photo(user_id: int, photo_path: str) -> bool:
         return False
 
 
-def get_user_photo(user_id: int) -> Optional[str]:
-    """Get professional profile photo path for a user."""
+def get_user_photo(user_id: int, organization_id: Optional[str] = None) -> Optional[str]:
+    """Get professional profile photo path for a user, verifying tenant ownership."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id and organization_id != 'all':
+                cursor.execute("SELECT organization_id FROM users WHERE id = ?", (user_id,))
+                urow = cursor.fetchone()
+                if not urow or (urow[0] and urow[0] not in (organization_id, 'DEFAULT_ORG')):
+                    return None
             cursor.execute("SELECT photo_path FROM users WHERE id = ?", (user_id,))
             row = cursor.fetchone()
         return row[0] if row and row[0] else None
@@ -3021,13 +3481,19 @@ def get_user_photo(user_id: int) -> Optional[str]:
 # HR / AUTH / LEAVE / OVERTIME / SALARY HELPERS
 # ============================================
 
-def get_user_by_id(user_id: int) -> Optional[Dict]:
-    """Retrieve full user profile by user_id."""
+def get_user_by_id(user_id: int, organization_id: Optional[str] = None) -> Optional[Dict]:
+    """Retrieve full user profile by user_id, optionally verifying organization_id."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT * FROM users WHERE id = ? AND (organization_id = 'DEFAULT_ORG' OR organization_id IS NULL)", (user_id,))
+                else:
+                    cursor.execute("SELECT * FROM users WHERE id = ? AND organization_id = ?", (user_id, organization_id))
+            else:
+                cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
             row = cursor.fetchone()
         return dict(row) if row else None
     except Exception as e:
@@ -3180,15 +3646,19 @@ def add_leave_request(
                     f"Cannot add leave request for user {user_id}: dates overlap active request #{conflict['id']}"
                 )
                 return None
+            cursor.execute("SELECT organization_id, branch_id FROM users WHERE id = ?", (user_id,))
+            u_row = cursor.fetchone()
+            u_org = (u_row[0] if u_row else None) or 'DEFAULT_ORG'
+            u_branch = (u_row[1] if u_row else None) or 'DEFAULT_BRANCH'
             cursor.execute(
                      '''INSERT INTO leave_requests (
                                 user_id, user_name, leave_type, leave_duration, start_date, end_date, reason,
                                 paid_days, unpaid_days, quota_days, paid_through_date, quota_through_date,
-                                half_leave_quota_type_id, half_leave_quota_charge
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                half_leave_quota_type_id, half_leave_quota_charge, organization_id, branch_id
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                          (user_id, user_name, leave_type, leave_duration, s_str, e_str, reason,
                       paid_days, unpaid_days, quota_days, paid_through_date, quota_through_date,
-                      half_leave_quota_type_id, int(bool(half_leave_quota_charge)))
+                      half_leave_quota_type_id, int(bool(half_leave_quota_charge)), u_org, u_branch)
             )
             conn.commit()
             return cursor.lastrowid
@@ -3208,12 +3678,16 @@ def add_leave_requests(user_id: int, user_name: str, requests: List[Tuple[str, s
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute('BEGIN IMMEDIATE')
+            cursor.execute("SELECT organization_id, branch_id FROM users WHERE id = ?", (user_id,))
+            u_row = cursor.fetchone()
+            u_org = (u_row[0] if u_row else None) or 'DEFAULT_ORG'
+            u_branch = (u_row[1] if u_row else None) or 'DEFAULT_BRANCH'
             ids = []
             for leave_type, start_date, end_date, reason in requests:
                 cursor.execute(
-                    '''INSERT INTO leave_requests (user_id, user_name, leave_type, start_date, end_date, reason)
-                       VALUES (?, ?, ?, ?, ?, ?)''',
-                    (user_id, user_name, leave_type, start_date, end_date, reason)
+                    '''INSERT INTO leave_requests (user_id, user_name, leave_type, start_date, end_date, reason, organization_id, branch_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (user_id, user_name, leave_type, start_date, end_date, reason, u_org, u_branch)
                 )
                 ids.append(cursor.lastrowid)
             conn.commit()
@@ -3223,8 +3697,8 @@ def add_leave_requests(user_id: int, user_name: str, requests: List[Tuple[str, s
         return None
 
 
-def get_leave_requests(user_id: Optional[int] = None, status: Optional[str] = None) -> List[Dict]:
-    """Get list of leave requests optionally filtered by user_id and status."""
+def get_leave_requests(user_id: Optional[int] = None, status: Optional[str] = None, organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> List[Dict]:
+    """Get list of leave requests optionally filtered by user_id, status, organization_id, and branch_id."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -3237,6 +3711,18 @@ def get_leave_requests(user_id: Optional[int] = None, status: Optional[str] = No
             if status:
                 query += " AND status = ?"
                 params.append(status)
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    query += " AND (organization_id = 'DEFAULT_ORG' OR organization_id IS NULL)"
+                else:
+                    query += " AND organization_id = ?"
+                    params.append(organization_id)
+            if branch_id and branch_id != 'all':
+                if branch_id == 'DEFAULT_BRANCH':
+                    query += " AND (branch_id = 'DEFAULT_BRANCH' OR branch_id IS NULL)"
+                else:
+                    query += " AND branch_id = ?"
+                    params.append(branch_id)
             query += " ORDER BY created_at DESC"
             cursor.execute(query, params)
             requests = [dict(r) for r in cursor.fetchall()]
@@ -3265,20 +3751,48 @@ def get_leave_requests(user_id: Optional[int] = None, status: Optional[str] = No
         return []
 
 
-def update_leave_status(leave_id: int, status: str = 'approved', approved_by: str = 'Admin') -> bool:
-    """Update status unless it would create overlapping active leave."""
+def get_leave_by_id(leave_id: int, organization_id: Optional[str] = None) -> Optional[Dict]:
+    """Retrieve single leave request by id with tenant scoping."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_id,))
+            row = cursor.fetchone()
+            if row:
+                d = dict(row)
+                if organization_id and organization_id != 'all':
+                    if organization_id == 'DEFAULT_ORG':
+                        if d.get('organization_id') not in ('DEFAULT_ORG', None):
+                            return None
+                    elif d.get('organization_id') != organization_id:
+                        return None
+                return d
+    except Exception as e:
+        logger.error(f"Get leave by id error: {e}")
+    return None
+
+
+def update_leave_status(leave_id: int, status: str = 'approved', approved_by: str = 'Admin', organization_id: Optional[str] = None) -> bool:
+    """Update status unless it would create overlapping active leave, verifying tenant authorization."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute('BEGIN IMMEDIATE')
             cursor.execute(
-                "SELECT user_id, start_date, end_date FROM leave_requests WHERE id = ?",
+                "SELECT user_id, start_date, end_date, organization_id FROM leave_requests WHERE id = ?",
                 (leave_id,)
             )
             leave = cursor.fetchone()
             if not leave:
                 return False
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    if leave['organization_id'] not in ('DEFAULT_ORG', None):
+                        return False
+                elif leave['organization_id'] != organization_id:
+                    return False
             if str(status or '').strip().lower() in ('pending', 'approved', 'partially_approved'):
                 conflict = _find_active_leave_overlap(
                     cursor, leave['user_id'], leave['start_date'], leave['end_date'], exclude_id=leave_id
@@ -3299,11 +3813,21 @@ def update_leave_status(leave_id: int, status: str = 'approved', approved_by: st
         return False
 
 
-def delete_leave_request(leave_id: int) -> bool:
-    """Delete a leave request."""
+def delete_leave_request(leave_id: int, organization_id: Optional[str] = None) -> bool:
+    """Delete a leave request, ensuring tenant authorization."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id and organization_id != 'all':
+                cursor.execute("SELECT organization_id FROM leave_requests WHERE id = ?", (leave_id,))
+                lr = cursor.fetchone()
+                if not lr:
+                    return False
+                if organization_id == 'DEFAULT_ORG':
+                    if lr[0] not in ('DEFAULT_ORG', None):
+                        return False
+                elif lr[0] != organization_id:
+                    return False
             cursor.execute("DELETE FROM leave_requests WHERE id = ?", (leave_id,))
             conn.commit()
             return cursor.rowcount > 0
@@ -3513,8 +4037,8 @@ def _leave_allowance_cycle_window(reference_date: datetime, allowance_period: st
     return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
 
 
-def get_leave_balances(year: int = 2026, user_id: Optional[int] = None) -> List[Dict]:
-    """Get employee leave balances for a year, auto-initializing rows if needed."""
+def get_leave_balances(year: int = 2026, user_id: Optional[int] = None, organization_id: Optional[str] = None) -> List[Dict]:
+    """Get employee leave balances for a year, auto-initializing rows if needed, scoped by tenant."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -3526,6 +4050,12 @@ def get_leave_balances(year: int = 2026, user_id: Optional[int] = None) -> List[
             if user_id:
                 user_query += " AND id = ?"
                 params.append(user_id)
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    user_query += " AND (organization_id = 'DEFAULT_ORG' OR organization_id IS NULL)"
+                else:
+                    user_query += " AND organization_id = ?"
+                    params.append(organization_id)
             cursor.execute(user_query, params)
             users = [dict(u) for u in cursor.fetchall()]
 
@@ -4267,7 +4797,7 @@ def delete_overtime(ot_id: int) -> bool:
         return False
 
 
-def get_all_salary_configs(active_only: bool = True, department: Optional[str] = None, search: Optional[str] = None) -> List[Dict]:
+def get_all_salary_configs(active_only: bool = True, department: Optional[str] = None, search: Optional[str] = None, organization_id: Optional[str] = None) -> List[Dict]:
     """Get salary configuration entries for all employees (joined with user details)."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -4275,6 +4805,9 @@ def get_all_salary_configs(active_only: bool = True, department: Optional[str] =
             cursor = conn.cursor()
             conditions = []
             params = []
+            if organization_id:
+                conditions.append("u.organization_id = ?")
+                params.append(organization_id)
             if active_only:
                 conditions.append("u.active = 1")
             if department and department.strip() and department.strip().lower() != 'all':
@@ -4394,13 +4927,18 @@ def reset_salary_config(user_id: int) -> bool:
         return False
 
 
-def get_salary_summary() -> Dict[str, Any]:
+def get_salary_summary(organization_id: Optional[str] = None) -> Dict[str, Any]:
     """Return summary KPI metrics across active employee salary structures."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("""
+            where_sql = "WHERE u.active = 1"
+            params = []
+            if organization_id:
+                where_sql += " AND u.organization_id = ?"
+                params.append(organization_id)
+            cursor.execute(f"""
                 SELECT 
                     COUNT(u.id) as total_employees,
                     SUM(CASE WHEN s.user_id IS NOT NULL THEN 1 ELSE 0 END) as configured_count,
@@ -4411,8 +4949,8 @@ def get_salary_summary() -> Dict[str, Any]:
                     AVG(COALESCE(s.basic_salary, u.salary, 0.0)) as avg_basic
                 FROM users u
                 LEFT JOIN salary_configs s ON u.id = s.user_id
-                WHERE u.active = 1
-            """)
+                {where_sql}
+            """, params)
             row = cursor.fetchone()
             if row:
                 return {
@@ -5200,7 +5738,7 @@ def _sanitize_orphan_payroll_records() -> int:
         return 0
 
 
-def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Optional[int] = None) -> Dict[str, Any] | list:
+def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Optional[int] = None, organization_id: str = 'DEFAULT_ORG', branch_id: Optional[str] = None) -> Dict[str, Any] | list:
     """Build an attendance-based monthly payroll preview without saving it.
 
     Supports the modern single-string contract (YYYY-MM) and a legacy compatibility
@@ -5222,7 +5760,7 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
         raise ValueError("Payroll month must use YYYY-MM format") from e
     if month_start.strftime("%Y-%m") != str(payroll_month):
         raise ValueError("Payroll month must use YYYY-MM format")
-    finalized_run = get_monthly_payroll(payroll_month)
+    finalized_run = get_monthly_payroll(payroll_month, organization_id=organization_id)
     if finalized_run:
         return finalized_run
 
@@ -5257,9 +5795,10 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
                    u.active
             FROM users u
             LEFT JOIN salary_configs sc ON sc.user_id = u.id
-            WHERE u.active = 1 OR (u.exit_date IS NOT NULL AND u.exit_date >= ?)
+            WHERE (u.active = 1 OR (u.exit_date IS NOT NULL AND u.exit_date >= ?))
+              AND (u.organization_id = ? OR (u.organization_id IS NULL AND ? = 'DEFAULT_ORG') OR (? = 'DEFAULT_ORG' AND u.organization_id = ''))
             ORDER BY u.department COLLATE NOCASE, u.name COLLATE NOCASE
-        ''', (month_start.isoformat(),))
+        ''', (month_start.isoformat(), organization_id, organization_id, organization_id))
         employees = [dict(row) for row in cursor.fetchall()]
 
         # Query approved overtime for this payroll month
@@ -5296,6 +5835,8 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
     report = get_detailed_attendance_report(
         start_date=month_start.isoformat(),
         end_date=month_end.isoformat(),
+        organization_id=organization_id,
+        branch_id=branch_id,
     )
     report_records = {record['user_id']: record for record in report.get('records', [])}
     missing_reports = [employee['employee_id'] for employee in employees
@@ -5523,8 +6064,8 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
         'total_net_salary': round(sum(row['net_salary'] for row in rows), 2),
         'records': rows,
     }
-    preview['payroll_run_id'] = _persist_draft_monthly_payroll(preview)
-    finalized_run = get_monthly_payroll(payroll_month)
+    preview['payroll_run_id'] = _persist_draft_monthly_payroll(preview, organization_id=organization_id, branch_id=branch_id)
+    finalized_run = get_monthly_payroll(payroll_month, organization_id=organization_id)
     if finalized_run:
         return finalized_run
     if month is not None and payroll_month.endswith(f"-{int(month):02d}"):
@@ -5532,7 +6073,7 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
     return preview
 
 
-def _insert_payroll_records(cursor: sqlite3.Cursor, run_id: int, rows: List[Dict[str, Any]], finalized: bool) -> None:
+def _insert_payroll_records(cursor: sqlite3.Cursor, run_id: int, rows: List[Dict[str, Any]], finalized: bool, organization_id: str = 'DEFAULT_ORG', branch_id: Optional[str] = None) -> None:
     record_status = 'Finalized' if finalized else None
     cursor.executemany('''
         INSERT INTO payroll_records (
@@ -5543,8 +6084,8 @@ def _insert_payroll_records(cursor: sqlite3.Cursor, run_id: int, rows: List[Dict
             unpaid_leave_deduction,
             payable_days, applied_rule_id, matched_rule,
             shift_details, calendar_details, deduction_type, deduction_percent,
-            fixed_amount, deduction_amount, net_salary, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            fixed_amount, deduction_amount, net_salary, status, organization_id, branch_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', [(
         run_id, row['employee_id'], row['employee_name'], row['department'], row['designation'],
         row.get('basic_salary', 0.0), row.get('allowances', 0.0), row.get('custom_deductions', 0.0),
@@ -5559,16 +6100,20 @@ def _insert_payroll_records(cursor: sqlite3.Cursor, run_id: int, rows: List[Dict
         row.get('matched_rule', ''), json.dumps(row.get('shift_details', [])),
         json.dumps(row.get('calendar_details', [])), row.get('deduction_type', 'percentage'),
         row.get('deduction_percent'), row.get('fixed_amount', 0), row.get('deduction_amount', 0),
-        row['net_salary'], record_status or row.get('status', 'Draft')
+        row['net_salary'], record_status or row.get('status', 'Draft'),
+        organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH'
     ) for row in rows])
 
 
-def _persist_draft_monthly_payroll(preview: Dict[str, Any]) -> int:
+def _persist_draft_monthly_payroll(preview: Dict[str, Any], organization_id: str = 'DEFAULT_ORG', branch_id: Optional[str] = None) -> int:
     _sanitize_orphan_payroll_records()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
-        cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ?", (preview['payroll_month'],))
+        if organization_id == 'DEFAULT_ORG':
+            cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (preview['payroll_month'], organization_id))
+        else:
+            cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ? AND organization_id = ?", (preview['payroll_month'], organization_id))
         existing = cursor.fetchone()
         if existing and existing[1] == 'Finalized':
             return existing[0]
@@ -5578,12 +6123,12 @@ def _persist_draft_monthly_payroll(preview: Dict[str, Any]) -> int:
                 UPDATE payroll_runs
                 SET period_start = ?, period_end = ?, employee_count = ?, total_basic_salary = ?,
                     total_allowances = ?, total_overtime = ?, total_deduction = ?, total_net_salary = ?,
-                    status = 'Draft', finalized_at = NULL
+                    status = 'Draft', finalized_at = NULL, organization_id = ?, branch_id = ?
                 WHERE id = ?
             ''', (
                 preview['period_start'], preview['period_end'], preview['employee_count'],
                 preview['total_basic_salary'], preview.get('total_allowances', 0.0), preview.get('total_overtime', 0.0),
-                preview['total_deduction'], preview['total_net_salary'], run_id
+                preview['total_deduction'], preview['total_net_salary'], organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH', run_id
             ))
             cursor.execute("DELETE FROM payroll_records WHERE payroll_run_id = ?", (run_id,))
         else:
@@ -5591,45 +6136,73 @@ def _persist_draft_monthly_payroll(preview: Dict[str, Any]) -> int:
                 INSERT INTO payroll_runs (
                     payroll_month, period_start, period_end, employee_count,
                     total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary,
-                    status, finalized_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL)
+                    status, finalized_at, organization_id, branch_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL, ?, ?)
             ''', (
                 preview['payroll_month'], preview['period_start'], preview['period_end'],
                 preview['employee_count'], preview['total_basic_salary'], preview.get('total_allowances', 0.0),
                 preview.get('total_overtime', 0.0), preview['total_deduction'],
-                preview['total_net_salary']
+                preview['total_net_salary'], organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH'
             ))
             run_id = cursor.lastrowid
         if run_id is None:
             raise RuntimeError("Failed to create payroll draft")
-        _insert_payroll_records(cursor, run_id, preview.get('records', []), finalized=False)
+        _insert_payroll_records(cursor, run_id, preview.get('records', []), finalized=False, organization_id=organization_id, branch_id=branch_id)
         conn.commit()
         return run_id
 
 
-def get_payroll_history(limit: int = 24) -> List[Dict[str, Any]]:
-    """List persisted monthly payroll runs without recalculating them."""
+def get_payroll_history(limit: int = 24, organization_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List persisted monthly payroll runs without recalculating them, filtered by tenant."""
     safe_limit = max(1, min(int(limit), 120))
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, payroll_month, period_start, period_end, employee_count,
-                   total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
-                   created_at, finalized_at
-            FROM payroll_runs
-            ORDER BY payroll_month DESC, id DESC
-            LIMIT ?
-        ''', (safe_limit,))
+        if organization_id:
+            if organization_id == 'DEFAULT_ORG':
+                cursor.execute('''
+                    SELECT id, payroll_month, period_start, period_end, employee_count,
+                           total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
+                           created_at, finalized_at, organization_id, branch_id
+                    FROM payroll_runs
+                    WHERE (organization_id = ? OR organization_id IS NULL OR organization_id = '')
+                    ORDER BY payroll_month DESC, id DESC
+                    LIMIT ?
+                ''', (organization_id, safe_limit))
+            else:
+                cursor.execute('''
+                    SELECT id, payroll_month, period_start, period_end, employee_count,
+                           total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
+                           created_at, finalized_at, organization_id, branch_id
+                    FROM payroll_runs
+                    WHERE organization_id = ?
+                    ORDER BY payroll_month DESC, id DESC
+                    LIMIT ?
+                ''', (organization_id, safe_limit))
+        else:
+            cursor.execute('''
+                SELECT id, payroll_month, period_start, period_end, employee_count,
+                       total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
+                       created_at, finalized_at, organization_id, branch_id
+                FROM payroll_runs
+                ORDER BY payroll_month DESC, id DESC
+                LIMIT ?
+            ''', (safe_limit,))
         return [dict(row) for row in cursor.fetchall()]
 
 
-def get_monthly_payroll(payroll_month: str) -> Optional[Dict[str, Any]]:
-    """Load a finalized payroll snapshot for a month, if one exists."""
+def get_monthly_payroll(payroll_month: str, organization_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Load a finalized payroll snapshot for a month, if one exists for the specified tenant."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized'", (payroll_month,))
+        if organization_id:
+            if organization_id == 'DEFAULT_ORG':
+                cursor.execute("SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized' AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (payroll_month, organization_id))
+            else:
+                cursor.execute("SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized' AND organization_id = ?", (payroll_month, organization_id))
+        else:
+            cursor.execute("SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized'", (payroll_month,))
         run = cursor.fetchone()
         if not run:
             return None
@@ -5654,8 +6227,8 @@ def get_monthly_payroll(payroll_month: str) -> Optional[Dict[str, Any]]:
     return result
 
 
-def finalize_monthly_payroll(preview: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Persist a reviewed payroll preview as an immutable monthly snapshot."""
+def finalize_monthly_payroll(preview: Dict[str, Any], organization_id: str = 'DEFAULT_ORG', branch_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Persist a reviewed payroll preview as an immutable monthly snapshot for tenant."""
     _sanitize_orphan_payroll_records()
     if any(row.get('shift_history_missing') for row in preview.get('records', [])):
         raise ValueError("Configure shift assignment history for every employee before finalizing payroll")
@@ -5668,7 +6241,10 @@ def finalize_monthly_payroll(preview: Dict[str, Any]) -> Optional[Dict[str, Any]
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ?", (preview['payroll_month'],))
+            if organization_id == 'DEFAULT_ORG':
+                cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (preview['payroll_month'], organization_id))
+            else:
+                cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ? AND organization_id = ?", (preview['payroll_month'], organization_id))
             existing = cursor.fetchone()
             if existing and existing[1] == 'Finalized':
                 return None
@@ -5678,12 +6254,12 @@ def finalize_monthly_payroll(preview: Dict[str, Any]) -> Optional[Dict[str, Any]
                     UPDATE payroll_runs
                     SET period_start = ?, period_end = ?, employee_count = ?, total_basic_salary = ?,
                         total_allowances = ?, total_overtime = ?, total_deduction = ?, total_net_salary = ?,
-                        status = 'Draft', finalized_at = NULL
+                        status = 'Draft', finalized_at = NULL, organization_id = ?, branch_id = ?
                     WHERE id = ?
                 ''', (
                     preview['period_start'], preview['period_end'], preview['employee_count'],
                     preview['total_basic_salary'], preview.get('total_allowances', 0.0), preview.get('total_overtime', 0.0),
-                    preview['total_deduction'], preview['total_net_salary'], run_id
+                    preview['total_deduction'], preview['total_net_salary'], organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH', run_id
                 ))
                 cursor.execute("DELETE FROM payroll_records WHERE payroll_run_id = ?", (run_id,))
             else:
@@ -5691,25 +6267,25 @@ def finalize_monthly_payroll(preview: Dict[str, Any]) -> Optional[Dict[str, Any]
                     INSERT INTO payroll_runs (
                         payroll_month, period_start, period_end, employee_count,
                         total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary,
-                        status, finalized_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL)
+                        status, finalized_at, organization_id, branch_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft', NULL, ?, ?)
                 ''', (
                     preview['payroll_month'], preview['period_start'], preview['period_end'],
                     preview['employee_count'], preview['total_basic_salary'], preview.get('total_allowances', 0.0),
                     preview.get('total_overtime', 0.0), preview['total_deduction'],
-                    preview['total_net_salary']
+                    preview['total_net_salary'], organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH'
                 ))
                 run_id = cursor.lastrowid
             if run_id is None:
                 raise RuntimeError("Failed to create payroll run")
-            _insert_payroll_records(cursor, run_id, preview.get('records', []), finalized=False)
+            _insert_payroll_records(cursor, run_id, preview.get('records', []), finalized=False, organization_id=organization_id, branch_id=branch_id)
             cursor.execute("UPDATE payroll_records SET status = 'Finalized' WHERE payroll_run_id = ?", (run_id,))
             cursor.execute('''
                 UPDATE payroll_runs SET status = 'Finalized', finalized_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (run_id,))
             conn.commit()
-        return get_monthly_payroll(preview['payroll_month'])
+        return get_monthly_payroll(preview['payroll_month'], organization_id=organization_id)
     except Exception as e:
         logger.error(f"Failed to finalize payroll for {preview.get('payroll_month')}: {e}")
         raise
@@ -5775,43 +6351,63 @@ def update_branch_settings(branch_name: str, city: str, company_name: str = '', 
 # DEPARTMENT MANAGEMENT
 # ============================================
 
-def get_all_departments_list(active_only: bool = False) -> List[Dict]:
-    """Retrieve all departments with registered employee counts and designation counts."""
+def get_all_departments_list(active_only: bool = False, organization_id: Optional[str] = None) -> List[Dict]:
+    """Retrieve all departments with registered employee counts and designation counts, scoped by organization."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            where_clause = "WHERE d.active = 1" if active_only else ""
+            conditions = []
+            params = []
+            if active_only:
+                conditions.append("d.active = 1")
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    conditions.append("(d.organization_id = ? OR d.organization_id IS NULL OR d.organization_id = '')")
+                else:
+                    conditions.append("d.organization_id = ?")
+                params.append(organization_id)
+            where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            
+            user_org_clause = ""
+            user_params = []
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    user_org_clause = "AND (u.organization_id = ? OR u.organization_id IS NULL OR u.organization_id = '')"
+                else:
+                    user_org_clause = "AND u.organization_id = ?"
+                user_params.append(organization_id)
+
             cursor.execute(f'''
-                SELECT d.id, d.name, d.code, d.description, d.active, d.created_at,
+                SELECT d.id, d.name, d.code, d.description, d.active, d.created_at, d.organization_id, d.branch_id,
                        COUNT(DISTINCT u.id) as staff_count,
                        COUNT(DISTINCT des.id) as designation_count
                 FROM departments d
-                LEFT JOIN users u ON u.department = d.name AND u.active = 1
+                LEFT JOIN users u ON u.department = d.name AND u.active = 1 {user_org_clause}
                 LEFT JOIN designations des ON des.department_id = d.id AND des.active = 1
                 {where_clause}
                 GROUP BY d.id
                 ORDER BY d.name ASC
-            ''')
+            ''', user_params + params)
             return [dict(r) for r in cursor.fetchall()]
     except Exception as e:
         logger.error(f"Failed to fetch departments list: {e}")
         raise
 
-def add_department(name: str, code: str = '', description: str = '') -> Optional[int]:
-    """Add a new department."""
+def add_department(name: str, code: str = '', description: str = '', organization_id: str = 'DEFAULT_ORG', branch_id: Optional[str] = None) -> Optional[int]:
+    """Add a new department scoped to organization."""
     if not name or not name.strip():
         return None
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO departments (name, code, description) VALUES (?, ?, ?)",
-                (name.strip(), code.strip(), description.strip())
+                "INSERT INTO departments (name, code, description, organization_id, branch_id) VALUES (?, ?, ?, ?, ?)",
+                (name.strip(), code.strip(), description.strip(), organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH')
             )
             conn.commit()
             dept_id = cursor.lastrowid
-            logger.info(f"✓ Department '{name}' created (ID: {dept_id})")
+            logger.info(f"✓ Department '{name}' created for org '{organization_id}' (ID: {dept_id})")
             return dept_id
     except sqlite3.IntegrityError:
         logger.warning(f"Department '{name}' already exists")
@@ -5820,14 +6416,23 @@ def add_department(name: str, code: str = '', description: str = '') -> Optional
         logger.error(f"Failed to add department: {e}")
         raise
 
-def update_department(dept_id: int, name: str, code: str = '', description: str = '', active: int = 1) -> bool:
-    """Update department information and sync assigned user records if department name changes."""
+def update_department(dept_id: int, name: str, code: str = '', description: str = '', active: int = 1, organization_id: Optional[str] = None) -> bool:
+    """Update department information with tenant check and sync assigned user records."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT name FROM departments WHERE id = ?", (dept_id,))
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT name FROM departments WHERE id = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (dept_id, organization_id))
+                else:
+                    cursor.execute("SELECT name FROM departments WHERE id = ? AND organization_id = ?", (dept_id, organization_id))
+            else:
+                cursor.execute("SELECT name FROM departments WHERE id = ?", (dept_id,))
             row = cursor.fetchone()
-            old_name = row[0] if row else None
+            if not row:
+                logger.warning(f"Department ID {dept_id} not found or tenant unauthorized")
+                return False
+            old_name = row[0]
             
             cursor.execute('''
                 UPDATE departments
@@ -5836,7 +6441,10 @@ def update_department(dept_id: int, name: str, code: str = '', description: str 
             ''', (name.strip(), code.strip(), description.strip(), active, dept_id))
             
             if old_name and old_name != name.strip():
-                cursor.execute("UPDATE users SET department = ? WHERE department = ?", (name.strip(), old_name))
+                if organization_id:
+                    cursor.execute("UPDATE users SET department = ? WHERE department = ? AND organization_id = ?", (name.strip(), old_name, organization_id))
+                else:
+                    cursor.execute("UPDATE users SET department = ? WHERE department = ?", (name.strip(), old_name))
                 
             conn.commit()
             logger.info(f"✓ Department ID {dept_id} updated: {name}")
@@ -5845,11 +6453,19 @@ def update_department(dept_id: int, name: str, code: str = '', description: str 
         logger.error(f"Failed to update department ID {dept_id}: {e}")
         return False
 
-def delete_department(dept_id: int) -> bool:
-    """Soft delete / disable department."""
+def delete_department(dept_id: int, organization_id: Optional[str] = None) -> bool:
+    """Soft delete / disable department with tenant check."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT id FROM departments WHERE id = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (dept_id, organization_id))
+                else:
+                    cursor.execute("SELECT id FROM departments WHERE id = ? AND organization_id = ?", (dept_id, organization_id))
+                if not cursor.fetchone():
+                    logger.warning(f"Department ID {dept_id} not found or tenant unauthorized")
+                    return False
             cursor.execute("UPDATE departments SET active = 0 WHERE id = ?", (dept_id,))
             conn.commit()
             logger.info(f"✓ Department ID {dept_id} disabled.")
@@ -5859,13 +6475,19 @@ def delete_department(dept_id: int) -> bool:
         return False
 
 
-def get_department(dept_id: int) -> Optional[Dict]:
-    """Retrieve single department by id."""
+def get_department(dept_id: int, organization_id: Optional[str] = None) -> Optional[Dict]:
+    """Retrieve single department by id with tenant check."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT id, name, code, description, active FROM departments WHERE id = ?", (dept_id,))
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT id, name, code, description, active, organization_id, branch_id FROM departments WHERE id = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (dept_id, organization_id))
+                else:
+                    cursor.execute("SELECT id, name, code, description, active, organization_id, branch_id FROM departments WHERE id = ? AND organization_id = ?", (dept_id, organization_id))
+            else:
+                cursor.execute("SELECT id, name, code, description, active, organization_id, branch_id FROM departments WHERE id = ?", (dept_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
     except Exception as e:
@@ -5877,14 +6499,15 @@ def get_department(dept_id: int) -> Optional[Dict]:
 # DESIGNATION MANAGEMENT
 # ============================================
 
-def get_designations(department_id: Optional[int] = None, department_name: Optional[str] = None, active_only: bool = False) -> List[Dict]:
-    """Retrieve designations filtered by department_id or department_name."""
+def get_designations(department_id: Optional[int] = None, department_name: Optional[str] = None, active_only: bool = False, organization_id: Optional[str] = None) -> List[Dict]:
+    """Retrieve designations filtered by department, active status, and organization."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             query = '''
                 SELECT des.id, des.department_id, des.title, des.description, des.active, des.created_at,
+                       des.organization_id, des.branch_id,
                        d.name as department_name
                 FROM designations des
                 JOIN departments d ON des.department_id = d.id
@@ -5899,6 +6522,12 @@ def get_designations(department_id: Optional[int] = None, department_name: Optio
                 params.append(department_name.strip())
             if active_only:
                 query += " AND des.active = 1 AND d.active = 1"
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    query += " AND (des.organization_id = ? OR des.organization_id IS NULL OR des.organization_id = '')"
+                else:
+                    query += " AND des.organization_id = ?"
+                params.append(organization_id)
             query += " ORDER BY des.title ASC"
             cursor.execute(query, params)
             return [dict(r) for r in cursor.fetchall()]
@@ -5906,8 +6535,8 @@ def get_designations(department_id: Optional[int] = None, department_name: Optio
         logger.error(f"Failed to fetch designations: {e}")
         return []
 
-def add_designation(department_id: int, title: str, description: str = '') -> Optional[int]:
-    """Add a new designation under a specific department."""
+def add_designation(department_id: int, title: str, description: str = '', organization_id: str = 'DEFAULT_ORG', branch_id: Optional[str] = None) -> Optional[int]:
+    """Add a new designation under a specific department, scoped by tenant."""
     if not title or not title.strip() or not department_id:
         return None
     try:
@@ -5915,8 +6544,8 @@ def add_designation(department_id: int, title: str, description: str = '') -> Op
             conn.execute("PRAGMA foreign_keys = ON")
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO designations (department_id, title, description) VALUES (?, ?, ?)",
-                (department_id, title.strip(), description.strip())
+                "INSERT INTO designations (department_id, title, description, organization_id, branch_id) VALUES (?, ?, ?, ?, ?)",
+                (department_id, title.strip(), description.strip(), organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH')
             )
             conn.commit()
             desig_id = cursor.lastrowid
@@ -5929,11 +6558,19 @@ def add_designation(department_id: int, title: str, description: str = '') -> Op
         logger.error(f"Failed to add designation: {e}")
         return None
 
-def update_designation(desig_id: int, title: str, description: str = '', active: int = 1) -> bool:
-    """Update designation title or active status."""
+def update_designation(desig_id: int, title: str, description: str = '', active: int = 1, organization_id: Optional[str] = None) -> bool:
+    """Update designation title or active status with tenant check."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT id FROM designations WHERE id = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (desig_id, organization_id))
+                else:
+                    cursor.execute("SELECT id FROM designations WHERE id = ? AND organization_id = ?", (desig_id, organization_id))
+                if not cursor.fetchone():
+                    logger.warning(f"Designation ID {desig_id} not found or tenant unauthorized")
+                    return False
             cursor.execute(
                 "UPDATE designations SET title = ?, description = ?, active = ? WHERE id = ?",
                 (title.strip(), description.strip(), active, desig_id)
@@ -5945,11 +6582,19 @@ def update_designation(desig_id: int, title: str, description: str = '', active:
         logger.error(f"Failed to update designation ID {desig_id}: {e}")
         return False
 
-def delete_designation(desig_id: int) -> bool:
-    """Soft delete / disable designation."""
+def delete_designation(desig_id: int, organization_id: Optional[str] = None) -> bool:
+    """Soft delete / disable designation with tenant check."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT id FROM designations WHERE id = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (desig_id, organization_id))
+                else:
+                    cursor.execute("SELECT id FROM designations WHERE id = ? AND organization_id = ?", (desig_id, organization_id))
+                if not cursor.fetchone():
+                    logger.warning(f"Designation ID {desig_id} not found or tenant unauthorized")
+                    return False
             cursor.execute("UPDATE designations SET active = 0 WHERE id = ?", (desig_id,))
             conn.commit()
             logger.info(f"✓ Designation ID {desig_id} disabled.")
@@ -5963,43 +6608,65 @@ def delete_designation(desig_id: int) -> bool:
 # DYNAMIC CAMERA MANAGEMENT
 # ============================================
 
-def get_all_cameras(active_only: bool = False) -> List[Dict]:
-    """Retrieve all configured camera streams."""
+def get_all_cameras(active_only: bool = False, organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> List[Dict]:
+    """Retrieve cameras filtered by active status, organization_id, and branch_id."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            where = "WHERE active = 1" if active_only else ""
-            cursor.execute(f"SELECT * FROM cameras {where} ORDER BY id ASC")
+            conditions = []
+            params = []
+            if active_only:
+                conditions.append("active = 1")
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    conditions.append("(organization_id = ? OR organization_id IS NULL OR organization_id = '')")
+                else:
+                    conditions.append("organization_id = ?")
+                params.append(organization_id)
+            if branch_id:
+                conditions.append("branch_id = ?")
+                params.append(branch_id)
+            where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            cursor.execute(f"SELECT * FROM cameras {where} ORDER BY id ASC", params)
             return [dict(r) for r in cursor.fetchall()]
     except Exception as e:
         logger.error(f"Failed to fetch cameras: {e}")
         return []
 
-def get_camera_by_id(camera_id: str) -> Optional[Dict]:
-    """Get single camera by camera_id string or integer DB id."""
+def get_camera_by_id(camera_id: str, organization_id: Optional[str] = None) -> Optional[Dict]:
+    """Get single camera by camera_id string or integer DB id, with optional tenant check."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM cameras WHERE camera_id = ? OR id = ?", (str(camera_id), str(camera_id)))
+            conditions = ["(camera_id = ? OR id = ?)"]
+            params = [str(camera_id), str(camera_id)]
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    conditions.append("(organization_id = ? OR organization_id IS NULL OR organization_id = '')")
+                else:
+                    conditions.append("organization_id = ?")
+                params.append(organization_id)
+            where = "WHERE " + " AND ".join(conditions)
+            cursor.execute(f"SELECT * FROM cameras {where}", params)
             row = cursor.fetchone()
             return dict(row) if row else None
     except Exception as e:
         logger.error(f"Failed to fetch camera {camera_id}: {e}")
         return None
 
-def add_camera(camera_id: str, name: str, room_name: str, camera_type: str = 'ip_camera', rtsp_url: str = '') -> Optional[int]:
-    """Add a new camera configuration."""
+def add_camera(camera_id: str, name: str, room_name: str, camera_type: str = 'ip_camera', rtsp_url: str = '', organization_id: str = 'DEFAULT_ORG', branch_id: Optional[str] = None) -> Optional[int]:
+    """Add a new camera configuration scoped to tenant organization and branch."""
     if not name or not camera_id or not room_name:
         return None
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                '''INSERT INTO cameras (camera_id, name, room_name, camera_type, rtsp_url, active)
-                   VALUES (?, ?, ?, ?, ?, 1)''',
-                (camera_id.strip(), name.strip(), room_name.strip(), camera_type.strip(), rtsp_url.strip())
+                '''INSERT INTO cameras (camera_id, name, room_name, camera_type, rtsp_url, active, organization_id, branch_id)
+                   VALUES (?, ?, ?, ?, ?, 1, ?, ?)''',
+                (camera_id.strip(), name.strip(), room_name.strip(), camera_type.strip(), rtsp_url.strip(), organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH')
             )
             conn.commit()
             cam_db_id = cursor.lastrowid
@@ -6012,11 +6679,19 @@ def add_camera(camera_id: str, name: str, room_name: str, camera_type: str = 'ip
         logger.error(f"Failed to add camera: {e}")
         return None
 
-def update_camera(cam_db_id: int, camera_id: str, name: str, room_name: str, camera_type: str = 'ip_camera', rtsp_url: str = '', active: int = 1) -> bool:
-    """Update camera configuration."""
+def update_camera(cam_db_id: int, camera_id: str, name: str, room_name: str, camera_type: str = 'ip_camera', rtsp_url: str = '', active: int = 1, organization_id: Optional[str] = None) -> bool:
+    """Update camera configuration with tenant check."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT id FROM cameras WHERE id = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (cam_db_id, organization_id))
+                else:
+                    cursor.execute("SELECT id FROM cameras WHERE id = ? AND organization_id = ?", (cam_db_id, organization_id))
+                if not cursor.fetchone():
+                    logger.warning(f"Camera ID {cam_db_id} not found or tenant unauthorized")
+                    return False
             cursor.execute(
                 '''UPDATE cameras
                    SET camera_id = ?, name = ?, room_name = ?, camera_type = ?, rtsp_url = ?, active = ?
@@ -6030,11 +6705,19 @@ def update_camera(cam_db_id: int, camera_id: str, name: str, room_name: str, cam
         logger.error(f"Failed to update camera DB ID {cam_db_id}: {e}")
         return False
 
-def delete_camera(cam_db_id: int) -> bool:
-    """Delete camera configuration."""
+def delete_camera(cam_db_id: int, organization_id: Optional[str] = None) -> bool:
+    """Delete camera configuration with tenant check."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            if organization_id:
+                if organization_id == 'DEFAULT_ORG':
+                    cursor.execute("SELECT id FROM cameras WHERE id = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (cam_db_id, organization_id))
+                else:
+                    cursor.execute("SELECT id FROM cameras WHERE id = ? AND organization_id = ?", (cam_db_id, organization_id))
+                if not cursor.fetchone():
+                    logger.warning(f"Camera ID {cam_db_id} not found or tenant unauthorized")
+                    return False
             cursor.execute("DELETE FROM cameras WHERE id = ?", (cam_db_id,))
             conn.commit()
             logger.info(f"✓ Camera DB ID {cam_db_id} deleted.")
@@ -6044,10 +6727,10 @@ def delete_camera(cam_db_id: int) -> bool:
         return False
 
 
-def get_camera_room_mappings(active_only: bool = True) -> Dict[str, Dict]:
+def get_camera_room_mappings(active_only: bool = True, organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict[str, Dict]:
     """Return {camera_id: {camera_name, room_name, camera_type, description}} built from the cameras table."""
     mappings = {}
-    for cam in get_all_cameras(active_only=active_only):
+    for cam in get_all_cameras(active_only=active_only, organization_id=organization_id, branch_id=branch_id):
         mappings[cam['camera_id']] = {
             'camera_name': cam['name'],
             'room_name': cam['room_name'],

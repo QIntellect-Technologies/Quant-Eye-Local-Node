@@ -15,7 +15,7 @@ import base64
 import threading
 import queue
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import sqlite3
 import urllib.request
 import urllib.error
@@ -166,7 +166,7 @@ def push_event_to_cloud_worker():
 threading.Thread(target=push_event_to_cloud_worker, daemon=True).start()
 
 
-def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: float, camera_id: str, camera_name: str, face_crop_b64: Optional[str] = None):
+def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: float, camera_id: str, camera_name: str, face_crop_b64: Optional[str] = None, timestamp: Optional[str] = None):
     """Enqueue immediate event for Cloud dispatch."""
     event_payload = {
         "organization_id": CONFIG.get("organization_id", "ORG-001"),
@@ -179,7 +179,7 @@ def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: floa
         "status": "Present",
         "source": f"node_cam_{camera_id}",
         "face_crop_base64": face_crop_b64,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": timestamp or datetime.now().isoformat()
     }
     try:
         cloud_event_queue.put_nowait(event_payload)
@@ -297,6 +297,40 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                         imported_count += 1
                     conn.commit()
                 logger.info(f"[PORTAL SYNC] Synced {imported_count} staff profiles from Cloud Portal for {org_id}")
+
+            # Also sync shifts from Cloud Portal so shift timings match Cloud 100%
+            try:
+                shifts_url = f"{portal_url}/api/shifts"
+                sreq = urllib.request.Request(shifts_url, headers={
+                    "User-Agent": "QuantEye-Node",
+                    "X-Client-Auth": "true",
+                    "X-Organization-Id": org_id,
+                    "X-Branch-Id": branch_id or "DEFAULT_BRANCH"
+                }, method="GET")
+                with urllib.request.urlopen(sreq, timeout=3.5) as sresp:
+                    if sresp.status == 200:
+                        sdata = json.loads(sresp.read().decode('utf-8'))
+                        cloud_shifts = sdata.get("shifts", [])
+                        with sqlite3.connect(db.DB_PATH) as sconn:
+                            scur = sconn.cursor()
+                            for cs in cloud_shifts:
+                                sid = cs.get("id")
+                                sname = cs.get("name", "Morning Shift")
+                                st = cs.get("start_time", "09:00")
+                                et = cs.get("end_time", "18:00")
+                                gp = cs.get("grace_period_minutes", 15)
+                                scur.execute("""
+                                    INSERT INTO shifts (id, name, start_time, end_time, grace_period_minutes)
+                                    VALUES (?, ?, ?, ?, ?)
+                                    ON CONFLICT(id) DO UPDATE SET
+                                        name = excluded.name,
+                                        start_time = excluded.start_time,
+                                        end_time = excluded.end_time,
+                                        grace_period_minutes = excluded.grace_period_minutes
+                                """, (sid, sname, st, et, gp))
+                            sconn.commit()
+            except Exception as se:
+                logger.debug(f"[PORTAL SYNC] Shift sync note: {se}")
     except Exception as pe:
         logger.warning(f"[PORTAL SYNC] Note querying portal users: {pe}")
 
@@ -420,6 +454,213 @@ def reload_face_cache():
 # Global lock to serialize InsightFace / ONNX Runtime C++ execution across cameras
 # Completely prevents multi-threaded ONNX Runtime memory corruption and C++ abort crashes
 AI_INFERENCE_LOCK = threading.Lock()
+
+# ==============================================================================
+# ORIGINAL LOCAL-DASHBOARD ATTENDANCE STATE ENGINE & LIVE TICKER UPSERT
+# ==============================================================================
+
+USER_ATTENDANCE_STATE = {}
+USER_ATTENDANCE_STATE_DATE = None
+attendance_state_lock = threading.Lock()
+
+
+def upsert_live_detection(uid: int, detection_entry: Optional[Dict] = None, **updates):
+    """
+    Keep ONE ticker row per employee: replace/refresh their entry and move it to the top.
+    Display only - never creates duplicate rows in the live attendance list.
+    """
+    global LATEST_DETECTIONS_FEED
+    with detections_lock:
+        existing = None
+        for i, det in enumerate(LATEST_DETECTIONS_FEED):
+            if det.get('user_id') == uid:
+                existing = LATEST_DETECTIONS_FEED.pop(i)
+                break
+        if detection_entry is not None:
+            entry = dict(detection_entry)
+            if existing and not entry.get('face_crop'):
+                entry['face_crop'] = existing.get('face_crop')
+        elif existing is not None:
+            entry = existing
+            entry.update({k: v for k, v in updates.items() if v is not None})
+        else:
+            return False
+        entry['timestamp'] = datetime.now().strftime("%I:%M:%S %p")
+        LATEST_DETECTIONS_FEED.insert(0, entry)
+        del LATEST_DETECTIONS_FEED[50:]
+        return True
+
+
+def process_user_attendance_event(user_id: int, name: str, confidence: float, source: str, location: str, camera_id: str, face_crop_b64: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Camera-Aware & Shift-Based State Sequence from original Local Dashboard:
+    
+    Rules Enforced:
+    1. Every employee evaluated against assigned camera permissions AND shift rules.
+    2. Check-In ONLY allowed on employee's authorized Check-In camera(s).
+    3. Check-Out ONLY allowed on employee's authorized Check-Out camera(s).
+    4. Repeated detections on Check-In cameras do NOT create duplicate records.
+    5. Check-Out NEVER opens before the shift end time (e.g. 06:00 PM).
+    6. Dispatches to Cloud ONCE upon Check-In and ONCE upon Check-Out.
+    """
+    global USER_ATTENDANCE_STATE, USER_ATTENDANCE_STATE_DATE
+    now = datetime.now()
+    today_str = now.strftime('%Y-%m-%d')
+
+    with attendance_state_lock:
+        if USER_ATTENDANCE_STATE_DATE != today_str:
+            USER_ATTENDANCE_STATE_DATE = today_str
+            USER_ATTENDANCE_STATE.clear()
+            try:
+                today_logs = db.get_attendance_today()
+                user_min_max = {}
+                for log in today_logs:
+                    uid = log.get('user_id')
+                    ts_str = str(log.get('timestamp') or '')
+                    try:
+                        ts_dt = datetime.strptime(ts_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        ts_dt = now
+                    if uid not in user_min_max:
+                        user_min_max[uid] = {'min': ts_dt, 'max': ts_dt}
+                    else:
+                        if ts_dt < user_min_max[uid]['min']:
+                            user_min_max[uid]['min'] = ts_dt
+                        if ts_dt > user_min_max[uid]['max']:
+                            user_min_max[uid]['max'] = ts_dt
+                
+                for uid, mm in user_min_max.items():
+                    USER_ATTENDANCE_STATE[uid] = {
+                        'checkin_time': mm['min'],
+                        'last_checkout_log': mm['max'] if mm['max'] != mm['min'] else None
+                    }
+            except Exception as e:
+                logger.error(f"Failed initializing USER_ATTENDANCE_STATE from DB: {e}")
+
+        user_state = USER_ATTENDANCE_STATE.get(user_id)
+
+        # -------------------------------------------------------------
+        # STATE 0: NOT CHECKED IN TODAY -> Check-In Camera & Shift Window
+        # -------------------------------------------------------------
+        if not user_state:
+            # Rule: Camera authorization check for Check-In
+            cam_allowed, cam_msg = db.check_user_camera_allowed(user_id, camera_id, 'checkin')
+            if not cam_allowed:
+                logger.info(f"[CAMERA CHECK-IN BLOCKED] Staff '{name}' (ID #{user_id}) on '{camera_id}': {cam_msg}")
+                return "REJECTED_CAMERA_UNAUTHORIZED", cam_msg
+
+            shift_allowed, shift_msg, retrieved_shift = db.check_user_shift_allowed(user_id, now)
+            effective_shift = retrieved_shift or {}
+            
+            if not shift_allowed:
+                logger.info(f"[SHIFT CHECK-IN BLOCKED] Staff '{name}' (ID #{user_id}): {shift_msg}")
+                return "REJECTED_OUTSIDE_SHIFT", shift_msg
+
+            # Valid check-in window and authorized camera -> Record Check-In
+            USER_ATTENDANCE_STATE[user_id] = {
+                'checkin_time': now,
+                'last_checkout_log': None
+            }
+            try:
+                db.log_attendance(
+                    user_id=user_id,
+                    detected_name=name,
+                    confidence=confidence,
+                    source=source,
+                    location=location,
+                    device_id=camera_id,
+                    attendance_time=now
+                )
+                logger.info(f"✓ [CHECK-IN LOGGED] Staff '{name}' (ID #{user_id}) on Camera '{camera_id}' ({location}) at {now.strftime('%I:%M:%S %p')} ({effective_shift.get('name', 'Shift')})")
+            except Exception as e:
+                logger.error(f"Error logging checkin: {e}")
+
+            # Send to Cloud ONCE upon Check-In
+            dispatch_attendance_event_to_cloud(
+                user_id=user_id,
+                name=name,
+                confidence=confidence,
+                camera_id=camera_id,
+                camera_name=location,
+                face_crop_b64=face_crop_b64,
+                timestamp=now.isoformat()
+            )
+            return "CHECKIN", f"Check-In recorded at {now.strftime('%I:%M %p')} on {location}"
+
+        # -------------------------------------------------------------
+        # STATE 1: ALREADY CHECKED IN TODAY -> Check-Out Validation
+        # -------------------------------------------------------------
+        checkin_time = user_state['checkin_time']
+        seconds_since_checkin = (now - checkin_time).total_seconds()
+        
+        # Initial check-in buffer: Detections within the first 60 seconds confirm initial Check-In
+        if seconds_since_checkin < 60:
+            return "CHECKIN_CONFIRMED", f"Check-In active ({int(seconds_since_checkin)}s after check-in)"
+
+        # Check user's assigned shift end time
+        _, _, user_shift = db.check_user_shift_allowed(user_id, now)
+        start_time_str = user_shift.get('start_time', '09:00') if user_shift else '09:00'
+        end_time_str = user_shift.get('end_time', '18:00') if user_shift else '18:00'
+
+        # STRICT: Check-Out opens EXACTLY at shift end time (e.g. 06:00 PM) - NEVER EARLIER.
+        is_checkout_window = False
+        try:
+            cur_secs = now.hour * 3600 + now.minute * 60 + now.second
+            e_parts = [int(p) for p in end_time_str.split(':')[:2]]
+            e_secs = e_parts[0] * 3600 + e_parts[1] * 60
+            s_parts = [int(p) for p in start_time_str.split(':')[:2]]
+            s_secs = s_parts[0] * 3600 + s_parts[1] * 60
+            if e_secs < s_secs:  # Overnight shift (e.g. 22:00 -> 06:00)
+                is_checkout_window = (e_secs <= cur_secs < s_secs)
+            else:
+                is_checkout_window = (cur_secs >= e_secs)
+        except Exception:
+            is_checkout_window = False
+
+        # If still within working shift hours before end time, employee is active/present (do not check out early!)
+        if not is_checkout_window:
+            return "PRESENT_ACTIVE", f"Staff '{name}' is active on shift (Check-In: {checkin_time.strftime('%I:%M %p')})"
+
+        # Check-Out Event: Verify camera authorization for Check-Out
+        cam_allowed, cam_msg = db.check_user_camera_allowed(user_id, camera_id, 'checkout')
+        if not cam_allowed:
+            logger.info(f"[CAMERA CHECK-OUT BLOCKED] Staff '{name}' (ID #{user_id}) on Camera '{camera_id}': {cam_msg}")
+            return "REJECTED_CAMERA_UNAUTHORIZED", cam_msg
+
+        last_checkout_log = user_state.get('last_checkout_log')
+        # Check-Out is recorded ONCE per day (first detection after shift end) and never updated again
+        if last_checkout_log is None:
+            user_state['last_checkout_log'] = now
+            try:
+                db.log_attendance(
+                    user_id=user_id,
+                    detected_name=name,
+                    confidence=confidence,
+                    source=source,
+                    location=location,
+                    device_id=camera_id,
+                    checkout_camera_id=camera_id,
+                    checkout_location=location,
+                    attendance_time=now
+                )
+                logger.info(f"✓ [CHECK-OUT LOGGED] Staff '{name}' (ID #{user_id}) Check-Out on Camera '{camera_id}' ({location}) updated to {now.strftime('%I:%M:%S %p')} (Check-In was {checkin_time.strftime('%I:%M:%S %p')})")
+            except Exception as e:
+                logger.error(f"Error logging checkout: {e}")
+
+            # Send to Cloud ONCE upon Check-Out
+            dispatch_attendance_event_to_cloud(
+                user_id=user_id,
+                name=name,
+                confidence=confidence,
+                camera_id=camera_id,
+                camera_name=location,
+                face_crop_b64=face_crop_b64,
+                timestamp=now.isoformat()
+            )
+            return "CHECKOUT", f"Check-Out recorded at {now.strftime('%I:%M %p')} on {location}"
+
+        return "ATTENDANCE_COMPLETED", "Attendance active and completed for assigned shift"
+
 
 class NodeCameraReader:
     def __init__(self, camera_id: str, camera_name: str, rtsp_source: Any):
@@ -563,57 +804,40 @@ class NodeCameraReader:
                             name = meta['name']
                             conf = best_sim
 
-                            # Throttle check: Log & Push to Cloud once per 5 seconds per user
-                            last_t = self.last_logged.get(user_id, 0)
-                            if (now - last_t) >= 5.0:
-                                self.last_logged[user_id] = now
-                                
-                                # Crop face thumbnail
-                                face_crop_b64 = None
-                                try:
-                                    h, w = frame.shape[:2]
-                                    crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                                    if crop.size > 0:
-                                        crop_resized = cv2.resize(crop, (80, 80))
-                                        _, buf = cv2.imencode('.jpg', crop_resized, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                                        face_crop_b64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
-                                except Exception:
-                                    pass
+                            # Crop face thumbnail for live ticker snapshot
+                            face_crop_b64 = None
+                            try:
+                                h, w = frame.shape[:2]
+                                crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                                if crop.size > 0:
+                                    crop_resized = cv2.resize(crop, (80, 80))
+                                    _, buf = cv2.imencode('.jpg', crop_resized, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                                    face_crop_b64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
+                            except Exception:
+                                pass
 
-                                # Push immediately to Cloud!
-                                dispatch_attendance_event_to_cloud(
+                            # 1. Update single-row live ticker (no duplicates, no confidence badge)
+                            upsert_live_detection(user_id, {
+                                "name": name,
+                                "user_id": user_id,
+                                "camera_name": self.camera_name,
+                                "face_crop": face_crop_b64,
+                                "timestamp": datetime.now().strftime("%I:%M:%S %p")
+                            })
+
+                            # 2. Evaluate attendance against shift & camera via Local-Dashboard's state sequence (throttled every 5s)
+                            last_eval = self.last_logged.get(user_id, 0)
+                            if (now - last_eval) >= 5.0:
+                                self.last_logged[user_id] = now
+                                action_status, action_msg = process_user_attendance_event(
                                     user_id=user_id,
                                     name=name,
                                     confidence=conf,
+                                    source=f"node_cam_{self.camera_id}",
+                                    location=self.camera_name,
                                     camera_id=self.camera_id,
-                                    camera_name=self.camera_name,
                                     face_crop_b64=face_crop_b64
                                 )
-
-                                # Log attendance locally with shift & grace validation
-                                try:
-                                    db.log_attendance(
-                                        user_id=user_id,
-                                        detected_name=name,
-                                        confidence=conf,
-                                        source='camera',
-                                        location=self.camera_name
-                                    )
-                                except Exception as le:
-                                    logger.debug(f"Local attendance note: {le}")
-
-                                # Update Node's live detection ticker
-                                with detections_lock:
-                                    LATEST_DETECTIONS_FEED.insert(0, {
-                                        "user_id": user_id,
-                                        "name": name,
-                                        "confidence": int(conf * 100),
-                                        "camera_name": self.camera_name,
-                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                        "face_crop": face_crop_b64
-                                    })
-                                    if len(LATEST_DETECTIONS_FEED) > 50:
-                                        LATEST_DETECTIONS_FEED.pop()
 
                     current_detections.append({
                         "bbox": [x1, y1, x2, y2],
@@ -630,32 +854,14 @@ class NodeCameraReader:
                 AI_INFERENCE_LOCK.release()
 
     def get_annotated_frame(self):
+        """
+        Original Local-Dashboard behavior:
+        Return pure, pristine video stream directly without any bounding boxes or drawn overlays.
+        """
         with self.lock:
             if self.latest_frame is None:
                 return False, None
-            frame = self.latest_frame.copy()
-            detections = list(self.latest_detections)
-
-        # Draw real-time bounding boxes and smooth badges
-        for d in detections:
-            bbox = d.get('bbox')
-            if not bbox or len(bbox) != 4:
-                continue
-            x1, y1, x2, y2 = bbox
-            name = d.get('name', 'Unknown')
-            conf = d.get('confidence', 0.0)
-            is_match = name != "Unknown"
-            # Emerald green for recognized staff, vibrant orange/cyan for verifying
-            color = (0, 220, 110) if is_match else (0, 140, 255)
-
-            # Draw rounded box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            label = f"{name} ({int(conf * 100)}%)" if is_match else "Verifying..."
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(frame, (x1, max(0, y1 - 24)), (x1 + tw + 12, y1), color, -1)
-            cv2.putText(frame, label, (x1 + 6, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-
-        return True, frame
+            return True, self.latest_frame.copy()
 
     def release(self):
         self.running = False
