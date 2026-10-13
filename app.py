@@ -1542,10 +1542,10 @@ def api_node_train_video():
             temp_path = tf.name
             video_file.save(temp_path)
 
-        # Call InsightFace video processor
+        # Call video face biometric processor
         enroll_res = fp.process_enrollment_video(temp_path, max_frames=120)
         if not enroll_res or not enroll_res.get('success') or not enroll_res.get('embeddings'):
-            err = enroll_res.get('error') or "No valid face embeddings could be extracted from video. Ensure good lighting and face visibility."
+            err = enroll_res.get('error') or "No clear face detected in the video. Please ensure face is well-lit, centered, and visible."
             return jsonify({"success": False, "error": err}), 400
 
         embeddings = enroll_res['embeddings']
@@ -1565,13 +1565,13 @@ def api_node_train_video():
 
         # Instantly refresh in-memory face matching matrix
         reload_face_cache()
-        logger.info(f"[VIDEO ENROLL SUCCESS] Enrolled {saved_count} face embeddings for user {user_id}")
+        logger.info(f"[BIOMETRIC ENROLL SUCCESS] Enrolled biometric profile for user {user_id} ({saved_count} frames)")
 
         return jsonify({
             "success": True,
-            "message": f"Successfully trained {saved_count} face embeddings! Face recognition is now active for this staff member.",
+            "message": "Staff face biometric profile registered successfully! Live recognition is now active for this member.",
             "user_id": user_id,
-            "embeddings_count": saved_count
+            "frames_registered": saved_count
         }), 200
 
     except Exception as e:

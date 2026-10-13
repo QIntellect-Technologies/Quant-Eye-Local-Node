@@ -6,7 +6,7 @@
   <title>Live AI Attendance | QIntellect Technologies</title>
   <!-- Google Fonts: Outfit & JetBrains Mono -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
   <!-- FontAwesome 6 -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -44,8 +44,24 @@
       display: flex;
     }
 
+    /* Hide scrollbars across sidebar and feeds */
+    .sidebar,
+    .live-compact-feed,
+    .live-compact-list {
+      scrollbar-width: none !important;
+      -ms-overflow-style: none !important;
+    }
+
+    .sidebar::-webkit-scrollbar,
+    .live-compact-feed::-webkit-scrollbar,
+    .live-compact-list::-webkit-scrollbar {
+      display: none !important;
+      width: 0 !important;
+      height: 0 !important;
+    }
+
     /* =========================================================================
-       PERSISTENT SIDEBAR NAVIGATION (ALWAYS VISIBLE)
+       PERSISTENT SIDEBAR NAVIGATION (ALWAYS VISIBLE & NO SCROLLBAR)
        ========================================================================= */
     .sidebar {
       width: var(--sidebar-width);
@@ -61,6 +77,7 @@
       z-index: 100;
       box-shadow: 6px 0 24px rgba(15, 23, 42, 0.04);
       user-select: none;
+      overflow: hidden;
     }
 
     .sidebar-brand {
@@ -102,6 +119,7 @@
       flex-direction: column;
       gap: 6px;
       flex: 1;
+      overflow: hidden;
     }
 
     .menu-item {
@@ -201,7 +219,6 @@
       transition: all 0.25s ease;
     }
 
-    /* Global Application Header */
     .app-global-header {
       background: #ffffff;
       border: 1px solid var(--border-color);
@@ -290,7 +307,6 @@
       color: #0284c7;
     }
 
-    /* Header Action Buttons */
     .btn-header-action {
       border: none;
       outline: none;
@@ -373,7 +389,7 @@
     }
 
     /* =========================================================================
-       PAGE 1: LIVE AI ATTENDANCE (EXACT CCTV GRID & ACTIVITY FEED)
+       PAGE 1: LIVE AI ATTENDANCE
        ========================================================================= */
     .live-toolbar {
       display: flex;
@@ -455,7 +471,7 @@
       color: #ffffff;
     }
 
-    /* Main CCTV Stage Layout (Left: Grid, Right: Compact Feed) */
+    /* Main CCTV Stage Layout */
     .cctv-layout {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 300px;
@@ -474,6 +490,36 @@
       flex-direction: column;
       gap: 10px;
       min-width: 0;
+    }
+
+    /* Empty Camera Notification Card */
+    .cctv-empty-card {
+      background: #020617;
+      border-radius: 12px;
+      border: 1px solid #1e293b;
+      padding: 60px 20px;
+      text-align: center;
+      color: #94a3b8;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    }
+
+    .cctv-empty-card i {
+      font-size: 2.8rem;
+      margin-bottom: 12px;
+      display: block;
+      color: #38bdf8;
+    }
+
+    .cctv-empty-card h5 {
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 6px;
+    }
+
+    .cctv-empty-card p {
+      font-size: 0.85rem;
+      color: #94a3b8;
+      margin: 0;
     }
 
     /* Single Camera View Container */
@@ -615,7 +661,7 @@
       display: block;
     }
 
-    /* Compact Attendance Activity Feed */
+    /* Compact Attendance Activity Feed (PAGINATED & NO SCROLLBAR) */
     .live-compact-feed {
       background: #ffffff;
       border: 1px solid var(--border-color);
@@ -650,11 +696,11 @@
 
     .live-compact-list {
       flex: 1;
-      overflow-y: auto;
+      overflow: hidden;
       padding: 10px;
       display: flex;
       flex-direction: column;
-      gap: 7px;
+      gap: 6px;
     }
 
     .compact-attend-card {
@@ -662,10 +708,10 @@
       border: 1px solid #e2e8f0;
       border-left: 3.5px solid #10b981;
       border-radius: 8px;
-      padding: 8px 10px;
+      padding: 7px 10px;
       display: flex;
       flex-direction: column;
-      gap: 3px;
+      gap: 2px;
       transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
 
@@ -693,7 +739,7 @@
       justify-content: space-between;
       font-size: 0.72rem;
       color: #64748b;
-      margin-top: 2px;
+      margin-top: 1px;
     }
 
     .compact-attend-time {
@@ -706,7 +752,7 @@
     }
 
     /* =========================================================================
-       PAGE 2: STAFF TRAINING QUEUE (ONLY PENDING STAFF)
+       PAGE 2: STAFF FACE REGISTRATION (PENDING QUEUE)
        ========================================================================= */
     .stats-summary-grid {
       display: grid;
@@ -919,6 +965,7 @@
       border-top: 1px solid #e2e8f0;
       display: flex;
       align-items: center;
+      justify-content: space-end;
       justify-content: flex-end;
       gap: 10px;
     }
@@ -968,7 +1015,7 @@
   <div id="toastContainer" class="app-toast-container"></div>
 
   <!-- =========================================================================
-       PERSISTENT SIDEBAR NAVIGATION (ALWAYS VISIBLE)
+       PERSISTENT SIDEBAR NAVIGATION (ALWAYS VISIBLE & NO SCROLLBAR)
        ========================================================================= -->
   <aside class="sidebar">
     <div class="sidebar-brand">
@@ -986,7 +1033,7 @@
       </li>
       <li id="menuItemTraining" class="menu-item" onclick="switchPage('training-view', this)">
         <i class="fa-solid fa-user-graduate"></i>
-        <span>Staff Training</span>
+        <span>Staff Registration</span>
         <span id="sidebarPendingBadge" class="sidebar-counter-badge">0</span>
       </li>
     </ul>
@@ -996,7 +1043,7 @@
         <span class="pulse-dot"></span>
         <span>Local AI Engine Active</span>
       </div>
-      <div>Port: 5005 &bull; InsightFace 512D</div>
+      <div>QuantEye Vision &bull; System Online</div>
     </div>
   </aside>
 
@@ -1090,6 +1137,13 @@
       <div class="cctv-layout">
         <!-- Main Monitoring Stage -->
         <div class="cctv-main-monitoring">
+          <!-- Empty Camera State (Shown when 0 cameras configured) -->
+          <div id="emptyCameraState" class="cctv-empty-card" style="display: none;">
+            <i class="fa-solid fa-video-slash"></i>
+            <h5>No Active Cameras Configured</h5>
+            <p>No cameras are currently assigned to this branch in Cloud. Add a camera in Cloud Camera Management or click Restart to sync.</p>
+          </div>
+
           <!-- Single Camera View Container -->
           <div id="singleCameraContainer" style="display: none;">
             <div class="cctv-screen-wrapper" id="singleCamWrapper">
@@ -1116,7 +1170,7 @@
           </div>
         </div>
 
-        <!-- Right Side: Compact Attendance Activity Feed -->
+        <!-- Right Side: Compact Attendance Activity Feed (No scrollbar, paginated 10 per page) -->
         <div class="live-compact-feed">
           <div class="live-compact-header">
             <div class="live-compact-title">
@@ -1154,13 +1208,13 @@
     </div>
 
     <!-- =======================================================================
-         PAGE 2: STAFF TRAINING QUEUE (ONLY PENDING STAFF)
+         PAGE 2: STAFF FACE REGISTRATION (PENDING QUEUE)
          ======================================================================= -->
     <div id="training-view" class="page-view">
       <div class="page-header">
         <div>
-          <h1><i class="fa-solid fa-user-graduate" style="color:#0284c7;"></i> Staff Face Training Queue</h1>
-          <p class="page-subtitle">Real-time queue of staff registered from Cloud awaiting local AI face enrollment.</p>
+          <h1><i class="fa-solid fa-user-graduate" style="color:#0284c7;"></i> Staff Face Registration</h1>
+          <p class="page-subtitle">Real-time queue of staff registered from Cloud awaiting biometric face registration.</p>
         </div>
         <div>
           <button type="button" class="btn btn-sm btn-outline-primary" onclick="loadPendingStaffQueue(true)" style="padding:6px 14px; font-weight:700; border-radius:8px;">
@@ -1177,7 +1231,7 @@
           </div>
           <div class="stat-card-info">
             <h3 id="statPendingCount" style="color:#d97706;">0</h3>
-            <p>Pending Training</p>
+            <p>Pending Registration</p>
           </div>
         </div>
 
@@ -1196,8 +1250,8 @@
             <i class="fa-solid fa-brain"></i>
           </div>
           <div class="stat-card-info">
-            <h3 style="color:#10b981;">512D</h3>
-            <p>InsightFace Vector Engine</p>
+            <h3 style="color:#10b981;">Active</h3>
+            <p>AI Face Recognition</p>
           </div>
         </div>
       </div>
@@ -1242,12 +1296,12 @@
   </main>
 
   <!-- =========================================================================
-       MODAL: VIDEO FACE TRAINING
+       MODAL: STAFF FACE REGISTRATION
        ========================================================================= -->
   <div id="videoTrainModal" class="app-modal-backdrop">
     <div class="app-modal-card">
       <div class="app-modal-header">
-        <h4><i class="fa-solid fa-video" style="color:#0284c7; margin-right:6px;"></i> Enroll Face Video</h4>
+        <h4><i class="fa-solid fa-video" style="color:#0284c7; margin-right:6px;"></i> Register Staff Face</h4>
         <button type="button" class="btn-close" onclick="closeVideoTrainModal()"></button>
       </div>
       <div class="app-modal-body">
@@ -1270,7 +1324,7 @@
         <!-- Progress Indicator -->
         <div id="trainProgressContainer" style="display:none; margin-top:14px;">
           <div style="display:flex; justify-content:space-between; font-size:0.78rem; font-weight:700; color:#0284c7; margin-bottom:6px;">
-            <span id="trainProgressText">Extracting face frames & computing 512D vectors...</span>
+            <span id="trainProgressText">Analyzing facial biometrics & registering profile...</span>
             <span id="trainProgressPct">--%</span>
           </div>
           <div class="progress" style="height:8px; border-radius:6px; background:#e2e8f0;">
@@ -1281,7 +1335,7 @@
       <div class="app-modal-footer">
         <button type="button" class="btn btn-sm btn-light" onclick="closeVideoTrainModal()" style="font-weight:700;">Cancel</button>
         <button type="button" class="btn btn-sm btn-primary" id="btnSubmitVideoTraining" onclick="submitVideoTraining()" style="font-weight:700; background:#0284c7; border:none; padding:7px 16px;">
-          <i class="fa-solid fa-brain"></i> Start AI Training
+          <i class="fa-solid fa-brain"></i> Register Face Biometrics
         </button>
       </div>
     </div>
@@ -1331,13 +1385,14 @@
   <script>
     // State
     let allCameras = [];
+    let lastCameraKey = '';
     let currentLayout = 'grid';
     let selectedCameraId = null;
     let detectionsFeed = [];
     let tickerCurrentPage = 1;
     const tickerPageSize = 10;
     let pendingStaffList = [];
-    let activeTrainingUserId = null;
+    let activeRegistrationUserId = null;
 
     // Toast helper
     function showToast(message, type = 'success') {
@@ -1367,7 +1422,7 @@
       const titleEl = document.getElementById('headerCurrentPageTitle');
       if (pageId === 'live-view' && titleEl) titleEl.textContent = 'Live AI Attendance';
       if (pageId === 'training-view' && titleEl) {
-        titleEl.textContent = 'Staff Training Queue';
+        titleEl.textContent = 'Staff Face Registration';
         loadPendingStaffQueue();
       }
     }
@@ -1382,22 +1437,47 @@
           textEl.textContent = data.shift.display || `${data.shift.name} (${data.shift.formatted})`;
         }
       } catch (e) {
-        console.debug('Shift fetch error:', e);
+        console.debug('Shift fetch note:', e);
       }
     }
 
-    // Camera Management & Grid Rendering
+    // Real-Time Camera Management & Auto-Sync
     async function loadCameras() {
       try {
         const res = await fetch('/api/node/cameras');
         const data = await res.json();
         if (data.success && Array.isArray(data.cameras)) {
-          allCameras = data.cameras;
-          renderCameraTabs();
-          renderCameraGrid();
+          const newKey = data.cameras.map(c => `${c.id}:${c.name}`).sort().join('|');
+          if (newKey !== lastCameraKey) {
+            lastCameraKey = newKey;
+            allCameras = data.cameras;
+            renderCameraTabs();
+
+            const emptyEl = document.getElementById('emptyCameraState');
+            const singleWrap = document.getElementById('singleCameraContainer');
+            const gridWrap = document.getElementById('multiCameraGridContainer');
+
+            if (allCameras.length === 0) {
+              if (emptyEl) emptyEl.style.display = 'block';
+              if (singleWrap) singleWrap.style.display = 'none';
+              if (gridWrap) gridWrap.style.display = 'none';
+              selectedCameraId = null;
+            } else {
+              if (emptyEl) emptyEl.style.display = 'none';
+              if (currentLayout === 'single') {
+                if (!allCameras.some(c => c.id === selectedCameraId)) {
+                  selectSingleCamera(allCameras[0].id, allCameras[0].name);
+                } else {
+                  setLiveCameraLayout('single');
+                }
+              } else {
+                setLiveCameraLayout('grid');
+              }
+            }
+          }
         }
       } catch (e) {
-        console.error('Error loading cameras:', e);
+        console.debug('Cameras polling note:', e);
       }
     }
 
@@ -1437,8 +1517,18 @@
       currentLayout = layout;
       const btnSingle = document.getElementById('btnLayoutSingle');
       const btnGrid = document.getElementById('btnLayoutGrid');
+      const emptyEl = document.getElementById('emptyCameraState');
       const singleBox = document.getElementById('singleCameraContainer');
       const gridBox = document.getElementById('multiCameraGridContainer');
+
+      if (allCameras.length === 0) {
+        if (emptyEl) emptyEl.style.display = 'block';
+        if (singleBox) singleBox.style.display = 'none';
+        if (gridBox) gridBox.style.display = 'none';
+        return;
+      }
+
+      if (emptyEl) emptyEl.style.display = 'none';
 
       if (layout === 'single') {
         if (btnSingle) btnSingle.classList.add('active');
@@ -1446,9 +1536,9 @@
         if (singleBox) singleBox.style.display = 'block';
         if (gridBox) gridBox.style.display = 'none';
 
-        if (allCameras.length > 0 && !selectedCameraId) {
+        if (!selectedCameraId || !allCameras.some(c => c.id === selectedCameraId)) {
           selectSingleCamera(allCameras[0].id, allCameras[0].name);
-        } else if (selectedCameraId) {
+        } else {
           const img = document.getElementById('streamView');
           if (img) img.src = `/stream/${selectedCameraId}`;
         }
@@ -1465,13 +1555,7 @@
       const grid = document.getElementById('liveMultiGrid');
       if (!grid) return;
       if (allCameras.length === 0) {
-        grid.innerHTML = `
-          <div style="grid-column: 1 / -1; text-align: center; color: #94a3b8; padding: 50px 20px;">
-            <i class="fa-solid fa-video-slash" style="font-size: 2.5rem; margin-bottom: 12px; display: block; color: #38bdf8;"></i>
-            <h5 style="font-weight: 700; color: #f1f5f9;">No Active Cameras Configured</h5>
-            <p style="font-size: 0.85rem;">Add cameras in Cloud Portal or click Restart to sync.</p>
-          </div>
-        `;
+        grid.innerHTML = '';
         return;
       }
 
@@ -1519,23 +1603,31 @@
     async function restartAndSyncCameras() {
       const btn = document.getElementById('headerRestartBtn');
       if (btn) btn.classList.add('loading');
-      showToast('Restarting camera streams & fetching latest Cloud settings...', 'success');
+      showToast('Syncing real-time camera settings from Cloud...', 'success');
 
       try {
         const res = await fetch('/api/node/cameras/refresh', { method: 'POST' });
         const data = await res.json();
         if (data.success) {
           allCameras = data.cameras || [];
+          lastCameraKey = allCameras.map(c => `${c.id}:${c.name}`).sort().join('|');
           renderCameraTabs();
-          if (currentLayout === 'single') {
-            if (allCameras.length > 0) {
-              selectSingleCamera(allCameras[0].id, allCameras[0].name);
-            }
+          const emptyEl = document.getElementById('emptyCameraState');
+
+          if (allCameras.length === 0) {
+            if (emptyEl) emptyEl.style.display = 'block';
+            document.getElementById('singleCameraContainer').style.display = 'none';
+            document.getElementById('multiCameraGridContainer').style.display = 'none';
           } else {
-            renderCameraGrid();
+            if (emptyEl) emptyEl.style.display = 'none';
+            if (currentLayout === 'single') {
+              selectSingleCamera(allCameras[0].id, allCameras[0].name);
+            } else {
+              renderCameraGrid();
+            }
           }
           loadActiveShiftTiming();
-          showToast(`Successfully refreshed ${allCameras.length} cameras!`, 'success');
+          showToast(`Camera synchronization complete! (${allCameras.length} active)`, 'success');
         } else {
           showToast(data.error || 'Failed to refresh cameras', 'error');
         }
@@ -1558,7 +1650,7 @@
           if (badge) badge.textContent = `Total: ${detectionsFeed.length}`;
         }
       } catch (e) {
-        console.debug('Detections polling error:', e);
+        console.debug('Detections polling note:', e);
       }
     }
 
@@ -1631,7 +1723,7 @@
     }
 
     // =========================================================================
-    // PAGE 2: PENDING STAFF QUEUE & VIDEO TRAINING
+    // PAGE 2: PENDING STAFF QUEUE & BIOMETRIC REGISTRATION
     // =========================================================================
     async function loadPendingStaffQueue(forceSync = false) {
       const tbody = document.getElementById('pendingTableBody');
@@ -1656,7 +1748,7 @@
           if (statTot) statTot.textContent = totalCount;
 
           renderPendingStaffRows();
-          if (forceSync) showToast(`Synced profiles! ${pendingCount} staff pending training.`, 'success');
+          if (forceSync) showToast(`Synced profiles! ${pendingCount} staff pending registration.`, 'success');
         }
       } catch (e) {
         console.error('Error loading pending queue:', e);
@@ -1685,8 +1777,8 @@
             <tr>
               <td colspan="7" style="text-align:center; padding:40px; color:#10b981;">
                 <i class="fa-solid fa-circle-check" style="font-size:2.5rem; margin-bottom:10px; display:block;"></i>
-                <h5 style="font-weight:800; color:#0f172a; margin-bottom:4px;">All Staff Face Enrollments Complete!</h5>
-                <p style="font-size:0.84rem; color:#64748b; margin:0;">No staff members are currently pending training. Live AI recognition is active for all registered employees.</p>
+                <h5 style="font-weight:800; color:#0f172a; margin-bottom:4px;">All Staff Biometric Registrations Complete!</h5>
+                <p style="font-size:0.84rem; color:#64748b; margin:0;">No staff members are currently pending registration. Live AI recognition is active for all registered employees.</p>
               </td>
             </tr>
           `;
@@ -1720,10 +1812,10 @@
             <td><span style="font-weight:600; color:#2563eb;">${s.department || 'General'}</span></td>
             <td>${s.position || 'Staff Member'}</td>
             <td><code style="background:#f1f5f9; padding:2px 6px; border-radius:4px; color:#0f172a;">${s.employee_code}</code></td>
-            <td><span class="badge-pending"><i class="fa-solid fa-hourglass-half"></i> Pending Training</span></td>
+            <td><span class="badge-pending"><i class="fa-solid fa-hourglass-half"></i> Pending Registration</span></td>
             <td style="text-align:right;">
               <button type="button" class="btn-train-action" onclick="openVideoTrainModal(${s.id}, '${safeName}', '${safeDept}', '${safePos}')">
-                <i class="fa-solid fa-video"></i> Train Face
+                <i class="fa-solid fa-video"></i> Register Face
               </button>
             </td>
           </tr>
@@ -1737,7 +1829,7 @@
     }
 
     function openVideoTrainModal(userId, name, dept, pos) {
-      activeTrainingUserId = userId;
+      activeRegistrationUserId = userId;
       document.getElementById('trainModalStaffName').textContent = name;
       document.getElementById('trainModalStaffSub').textContent = `ID #${userId} • Dept: ${dept} • ${pos}`;
       document.getElementById('trainVideoFileInput').value = '';
@@ -1747,7 +1839,7 @@
 
     function closeVideoTrainModal() {
       document.getElementById('videoTrainModal').style.display = 'none';
-      activeTrainingUserId = null;
+      activeRegistrationUserId = null;
     }
 
     async function submitVideoTraining() {
@@ -1759,7 +1851,7 @@
 
       const file = fileInput.files[0];
       const formData = new FormData();
-      formData.append('user_id', activeTrainingUserId);
+      formData.append('user_id', activeRegistrationUserId);
       formData.append('video', file);
 
       const progContainer = document.getElementById('trainProgressContainer');
@@ -1774,11 +1866,11 @@
         });
         const data = await res.json();
         if (data.success) {
-          showToast(`Face enrolled successfully! ${data.embeddings_count} frames extracted.`, 'success');
+          showToast(data.message || 'Staff face registered successfully!', 'success');
           closeVideoTrainModal();
           loadPendingStaffQueue();
         } else {
-          showToast(data.error || 'Training failed', 'error');
+          showToast(data.error || 'Registration failed', 'error');
         }
       } catch (e) {
         showToast('Server connection error: ' + e.message, 'error');
@@ -1852,14 +1944,15 @@
       }
     });
 
-    // Initial Load & Intervals
+    // Initial Load & Real-Time Sync Intervals
     window.addEventListener('DOMContentLoaded', () => {
       loadCameras();
       loadActiveShiftTiming();
       loadPendingStaffQueue();
       pollLiveDetections();
 
-      // Periodic Polls
+      // Fast Real-Time Polls (Auto-syncs changes without manual refresh)
+      setInterval(loadCameras, 1500);
       setInterval(pollLiveDetections, 1500);
       setInterval(loadActiveShiftTiming, 30000);
       setInterval(() => loadPendingStaffQueue(false), 20000);
