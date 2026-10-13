@@ -116,24 +116,48 @@ detections_lock = threading.Lock()
 cloud_event_queue = queue.Queue(maxsize=1000)
 
 def push_event_to_cloud_worker():
-    """Background worker continuously flushing recognized attendance events to Cloud."""
+    """Background worker continuously flushing recognized attendance events to Cloud Portal & Main Dashboard."""
     while True:
         try:
             event = cloud_event_queue.get()
             cloud_url = f"{CONFIG.get('cloud_url', 'http://127.0.0.1:5100').rstrip('/')}/api/sync/attendance-event"
+            portal_url = f"{CONFIG.get('client_portal_url', 'https://quanteye-ai-attendence-production.up.railway.app').rstrip('/')}/api/sync/attendance-event"
             req_data = json.dumps(event).encode('utf-8')
-            req = urllib.request.Request(
-                cloud_url,
-                data=req_data,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
+
+            # 1. Deliver to Cloud Client Portal
             try:
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                preq = urllib.request.Request(
+                    portal_url,
+                    data=req_data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "QuantEye-Node",
+                        "X-Client-Auth": "true",
+                        "X-Organization-Id": str(event.get("organization_id", "")),
+                        "X-Branch-Id": str(event.get("branch_id", ""))
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(preq, timeout=3.5) as presp:
+                    if presp.status in (200, 201):
+                        logger.info(f"[ATTENDANCE SYNC OK] Live attendance for '{event.get('name')}' delivered to Cloud Portal.")
+            except Exception as pe:
+                logger.debug(f"[PORTAL ATTENDANCE NOTE] {pe}")
+
+            # 2. Deliver to Cloud Main Dashboard
+            try:
+                req = urllib.request.Request(
+                    cloud_url,
+                    data=req_data,
+                    headers={"Content-Type": "application/json", "User-Agent": "QuantEye-Node"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=3.5) as resp:
                     if resp.status in (200, 201):
-                        logger.info(f"[CLOUD SYNC OK] Event for '{event.get('name')}' delivered to Cloud.")
+                        logger.info(f"[CLOUD SYNC OK] Event for '{event.get('name')}' delivered to Main Cloud.")
             except Exception as ce:
-                logger.warning(f"[CLOUD SYNC OFFLINE] Could not deliver event to Cloud ({ce}). Event will retry/buffered.")
+                logger.debug(f"[MAIN CLOUD NOTE] {ce}")
+
         except Exception as e:
             logger.error(f"Error in push_event_to_cloud_worker: {e}")
         finally:
@@ -545,6 +569,18 @@ class NodeCameraReader:
                                     face_crop_b64=face_crop_b64
                                 )
 
+                                # Log attendance locally with shift & grace validation
+                                try:
+                                    db.log_attendance(
+                                        user_id=user_id,
+                                        detected_name=name,
+                                        confidence=conf,
+                                        source='camera',
+                                        location=self.camera_name
+                                    )
+                                except Exception as le:
+                                    logger.debug(f"Local attendance note: {le}")
+
                                 # Update Node's live detection ticker
                                 with detections_lock:
                                     LATEST_DETECTIONS_FEED.insert(0, {
@@ -592,19 +628,16 @@ class NodeCameraReader:
 
 def init_camera_streams():
     """Fetch camera list from Cloud if online, otherwise use local config."""
-    global ACTIVE_CAMERA_READERS
 def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]:
     """
-    Fetch and combine all camera streams configured across:
-    1. Cloud Main Dashboard (/api/branches/{branch_id}/cameras)
-    2. Client Portal Cloud (/api/cameras?active_only=true)
-    3. Preserves valid existing cameras in config_node.json
-    Preserves all cameras by their unique camera_id without dropping distinct cameras that share RTSP sources.
+    Fetch all camera streams strictly configured for this organization & branch.
+    If cameras were deleted on Cloud, returns empty list [] to clear local streams immediately.
     """
     cloud_url = CONFIG.get('cloud_url', 'https://quanteye-main-dashboard-production.up.railway.app').rstrip('/')
     portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
 
     collected_cams: Dict[str, Dict[str, Any]] = {}
+    query_successful = False
 
     def _add_cam(c: Any):
         if not c or not isinstance(c, dict):
@@ -619,10 +652,6 @@ def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]
         if primary_id in collected_cams:
             return
 
-        # If primary_id is an integer (e.g. from portal) but has matching camera_id already collected, merge
-        if cam_id and any(existing.get("camera_id") == cam_id for existing in collected_cams.values()):
-            return
-
         c_copy = dict(c)
         c_copy["id"] = primary_id
         c_copy["camera_id"] = primary_id
@@ -631,26 +660,19 @@ def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]
         c_copy["rtsp_url"] = url
         collected_cams[primary_id] = c_copy
 
-    # 1. Fetch from Cloud Main Dashboard
-    if org_id and branch_id:
-        try:
-            cloud_cams_url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={urllib.parse.quote(org_id)}"
-            req = urllib.request.Request(cloud_cams_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode('utf-8'))
-                    for c in data.get("cameras", []):
-                        _add_cam(c)
-        except Exception as ce:
-            logger.debug(f"[CLOUD SYNC] Main cloud camera query note: {ce}")
-
-    # 2. Fetch from Client Portal Cloud (branch & org filtered)
+    # 1. Fetch from Client Portal Cloud (branch & org filtered)
     if org_id and branch_id:
         try:
             req_url = f"{portal_url}/api/cameras?active_only=true&organization_id={urllib.parse.quote(org_id)}&branch_id={urllib.parse.quote(branch_id)}"
-            req = urllib.request.Request(req_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
+            req = urllib.request.Request(req_url, headers={
+                "User-Agent": "QuantEye-Node",
+                "X-Client-Auth": "true",
+                "X-Organization-Id": org_id,
+                "X-Branch-Id": branch_id
+            }, method="GET")
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
                 if resp.status == 200:
+                    query_successful = True
                     p_cams = json.loads(resp.read().decode('utf-8'))
                     if isinstance(p_cams, list):
                         for c in p_cams:
@@ -658,27 +680,27 @@ def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]
         except Exception as pe:
             logger.debug(f"[PORTAL SYNC] Client portal camera query note: {pe}")
 
-    # 3. If no tenant cameras found in Portal yet, also check general Portal cameras
-    if not collected_cams:
+    # 2. Fetch from Cloud Main Dashboard
+    if org_id and branch_id:
         try:
-            req_url = f"{portal_url}/api/cameras?active_only=true"
-            req = urllib.request.Request(req_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
+            cloud_cams_url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={urllib.parse.quote(org_id)}"
+            req = urllib.request.Request(cloud_cams_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
                 if resp.status == 200:
-                    p_cams = json.loads(resp.read().decode('utf-8'))
-                    if isinstance(p_cams, list):
-                        for c in p_cams:
-                            c_org = c.get("organization_id")
-                            c_br = c.get("branch_id")
-                            if (not c_org or c_org in (org_id, 'DEFAULT_ORG')) and (not c_br or c_br in (branch_id, 'DEFAULT_BRANCH')):
-                                _add_cam(c)
-        except Exception as pe2:
-            logger.debug(f"[PORTAL SYNC] Portal general cameras note: {pe2}")
+                    query_successful = True
+                    data = json.loads(resp.read().decode('utf-8'))
+                    for c in data.get("cameras", []):
+                        _add_cam(c)
+        except Exception as ce:
+            logger.debug(f"[CLOUD SYNC] Main cloud camera query note: {ce}")
 
-    # 4. If remote endpoints were temporarily unreachable, preserve existing local cameras
-    if not collected_cams:
-        for c in CONFIG.get("cameras", []):
-            _add_cam(c)
+    # If remote queries succeeded, return the exact live camera list (even if empty [])
+    if query_successful:
+        return list(collected_cams.values())
+
+    # Only if network was completely offline, fallback to existing local config
+    for c in CONFIG.get("cameras", []):
+        _add_cam(c)
 
     return list(collected_cams.values())
 
@@ -690,15 +712,14 @@ def init_camera_streams():
     branch_id = CONFIG.get("branch_id")
 
     cloud_cams = fetch_all_cloud_cameras(org_id, branch_id)
-    if cloud_cams:
-        CONFIG["cameras"] = cloud_cams
-        try:
-            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                json.dump(CONFIG, f, indent=2)
-        except Exception:
-            pass
+    CONFIG["cameras"] = cloud_cams
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=2)
+    except Exception:
+        pass
 
-    cameras_to_use = CONFIG.get("cameras", [])
+    cameras_to_use = cloud_cams
 
     with readers_lock:
         valid_cams = {}
@@ -711,7 +732,7 @@ def init_camera_streams():
                 continue
             valid_cams[cid] = (cname, source)
 
-        # 1. Stop and remove only stale cameras
+        # 1. Stop and remove stale / deleted cameras
         stale_cids = [cid for cid in list(ACTIVE_CAMERA_READERS.keys()) if cid not in valid_cams]
         for cid in stale_cids:
             reader = ACTIVE_CAMERA_READERS.pop(cid, None)
@@ -751,12 +772,11 @@ def _background_camera_sync_loop():
             branch_id = CONFIG.get("branch_id")
             if org_id and branch_id:
                 cams = fetch_all_cloud_cameras(org_id, branch_id)
-                if cams:
-                    cam_hash = json.dumps([(c.get("id") or c.get("camera_id"), c.get("rtsp_url")) for c in cams], sort_keys=True)
-                    if _last_cloud_cam_hash is not None and cam_hash != _last_cloud_cam_hash:
-                        logger.info(f"[REAL-TIME SYNC] Cloud camera changes detected ({len(cams)} cameras). Reloading streams...")
-                        init_camera_streams()
-                    _last_cloud_cam_hash = cam_hash
+                cam_hash = json.dumps([(c.get("id") or c.get("camera_id"), c.get("rtsp_url")) for c in cams], sort_keys=True)
+                if _last_cloud_cam_hash is not None and cam_hash != _last_cloud_cam_hash:
+                    logger.info(f"[REAL-TIME SYNC] Cloud camera changes detected ({len(cams)} cameras). Reloading streams...")
+                    init_camera_streams()
+                _last_cloud_cam_hash = cam_hash
         except Exception:
             pass
 

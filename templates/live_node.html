@@ -1788,12 +1788,56 @@
         return;
       }
 
+    const activeTrainingStaff = new Map();
+
+    function renderPendingStaffRows() {
+      const tbody = document.getElementById('pendingTableBody');
+      if (!tbody) return;
+
+      const q = (document.getElementById('pendingSearchInput')?.value || '').toLowerCase().trim();
+      const filtered = pendingStaffList.filter(s => {
+        if (!q) return true;
+        return (s.name || '').toLowerCase().includes(q) ||
+               (s.department || '').toLowerCase().includes(q) ||
+               (s.employee_code || '').toLowerCase().includes(q) ||
+               String(s.id).includes(q);
+      });
+
+      const countEl = document.getElementById('pendingShowingCount');
+      if (countEl) countEl.textContent = filtered.length;
+
+      if (filtered.length === 0) {
+        if (pendingStaffList.length === 0) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="7" style="text-align:center; padding:40px; color:#10b981;">
+                <i class="fa-solid fa-circle-check" style="font-size:2.5rem; margin-bottom:10px; display:block;"></i>
+                <h5 style="font-weight:800; color:#0f172a; margin-bottom:4px;">All Staff Biometric Registrations Complete!</h5>
+                <p style="font-size:0.84rem; color:#64748b; margin:0;">No staff members are currently pending registration. Live AI recognition is active for all registered employees.</p>
+              </td>
+            </tr>
+          `;
+        } else {
+          tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:24px; color:#64748b;">No matching staff found for "${q}".</td></tr>`;
+        }
+        return;
+      }
+
       let html = '';
       filtered.forEach(s => {
         const initial = s.name ? s.name.charAt(0).toUpperCase() : '?';
         const safeName = (s.name || '').replace(/'/g, "\\'");
         const safeDept = (s.department || '').replace(/'/g, "\\'");
         const safePos = (s.position || '').replace(/'/g, "\\'");
+        const isTraining = activeTrainingStaff.has(s.id);
+
+        const statusBadge = isTraining
+          ? `<span style="display:inline-flex; align-items:center; gap:6px; background:#eff6ff; color:#2563eb; padding:4px 10px; border-radius:12px; font-weight:700; font-size:0.75rem; border:1px solid #bfdbfe;"><i class="fa-solid fa-circle-notch fa-spin"></i> Training in progress...</span>`
+          : `<span class="badge-pending"><i class="fa-solid fa-hourglass-half"></i> Pending Registration</span>`;
+
+        const actionBtn = isTraining
+          ? `<button type="button" class="btn-train-action" disabled style="opacity:0.65; cursor:not-allowed; background:#94a3b8;"><i class="fa-solid fa-spinner fa-spin"></i> Processing...</button>`
+          : `<button type="button" class="btn-train-action" onclick="openVideoTrainModal(${s.id}, '${safeName}', '${safeDept}', '${safePos}')"><i class="fa-solid fa-video"></i> Register Face</button>`;
 
         html += `
           <tr>
@@ -1812,11 +1856,9 @@
             <td><span style="font-weight:600; color:#2563eb;">${s.department || 'General'}</span></td>
             <td>${s.position || 'Staff Member'}</td>
             <td><code style="background:#f1f5f9; padding:2px 6px; border-radius:4px; color:#0f172a;">${s.employee_code}</code></td>
-            <td><span class="badge-pending"><i class="fa-solid fa-hourglass-half"></i> Pending Registration</span></td>
+            <td>${statusBadge}</td>
             <td style="text-align:right;">
-              <button type="button" class="btn-train-action" onclick="openVideoTrainModal(${s.id}, '${safeName}', '${safeDept}', '${safePos}')">
-                <i class="fa-solid fa-video"></i> Register Face
-              </button>
+              ${actionBtn}
             </td>
           </tr>
         `;
@@ -1850,14 +1892,19 @@
       }
 
       const file = fileInput.files[0];
+      const userId = activeRegistrationUserId;
+      const staffName = document.getElementById('trainModalStaffName')?.textContent || `User #${userId}`;
       const formData = new FormData();
-      formData.append('user_id', activeRegistrationUserId);
+      formData.append('user_id', userId);
       formData.append('video', file);
 
-      const progContainer = document.getElementById('trainProgressContainer');
-      const submitBtn = document.getElementById('btnSubmitVideoTraining');
-      progContainer.style.display = 'block';
-      submitBtn.disabled = true;
+      // Register into background training map
+      activeTrainingStaff.set(userId, staffName);
+
+      // Close modal immediately so user can work uninterrupted in background
+      closeVideoTrainModal();
+      renderPendingStaffRows();
+      showToast(`Facial biometric registration running in background for ${staffName}...`, 'info');
 
       try {
         const res = await fetch('/api/node/train-video', {
@@ -1865,18 +1912,18 @@
           body: formData
         });
         const data = await res.json();
+        activeTrainingStaff.delete(userId);
         if (data.success) {
-          showToast(data.message || 'Staff face registered successfully!', 'success');
-          closeVideoTrainModal();
+          showToast(`🎉 Biometric Training Complete for ${staffName}! Live recognition active.`, 'success');
           loadPendingStaffQueue();
         } else {
-          showToast(data.error || 'Registration failed', 'error');
+          showToast(`Training failed for ${staffName}: ${data.error || 'Registration failed'}`, 'error');
+          renderPendingStaffRows();
         }
       } catch (e) {
-        showToast('Server connection error: ' + e.message, 'error');
-      } finally {
-        submitBtn.disabled = false;
-        progContainer.style.display = 'none';
+        activeTrainingStaff.delete(userId);
+        showToast(`Server connection error for ${staffName}: ${e.message}`, 'error');
+        renderPendingStaffRows();
       }
     }
 
