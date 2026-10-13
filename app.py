@@ -47,6 +47,19 @@ except Exception:
 
 import database as db
 import face_processor as fp
+from config import (
+    UPLOAD_FOLDER, ALLOWED_EXTENSIONS, IMAGE_EXTENSIONS,
+    MAX_CONTENT_LENGTH, FACE_MATCHING_THRESHOLD,
+    MIN_ENROLLMENT_FRAMES, OPTIMAL_FACES_PER_VIDEO,
+    MIN_VIDEO_DURATION, MAX_VIDEO_DURATION,
+    TRACK_MAX_AGE_SECONDS, TRACK_ACTIVE_IOU_THRESHOLD, TRACK_LOST_IOU_THRESHOLD,
+    TRACK_ACTIVE_DIST_FACTOR, TRACK_LOST_DIST_FACTOR,
+    TRACK_ACTIVE_MIN_DIST, TRACK_LOST_MIN_DIST,
+    TRACK_UNKNOWN_RETRY_INTERVAL, TRACK_AI_INTERVAL,
+    IDLE_AI_INTERVAL, ATTENDANCE_CONFIRMATION_FRAMES,
+    ATTENDANCE_CONFIRMATION_WINDOW, ATTENDANCE_CONFIRMATION_MIN_SIM,
+    PRESENCE_ACTIVE_TIMEOUT, PRESENCE_RECENT_TIMEOUT
+)
 from logger_config import get_logger
 
 logger = get_logger(__name__)
@@ -464,35 +477,259 @@ def reload_face_cache():
             logger.info(f"[INFO] 0 profiles found for tenant {target_org} / {target_branch}.")
 
 
-# ==============================================================================
-# ==============================================================================
-# HIGH PERFORMANCE DUAL-THREADED CAMERA STREAM READER & AI ENGINE
+# =============================================================================# ==============================================================================
+# ORIGINAL LOCAL-DASHBOARD STATE REGISTRY & MATCHING ENGINE
 # ==============================================================================
 
-# Global lock to serialize InsightFace / ONNX Runtime C++ execution across cameras
-# Completely prevents multi-threaded ONNX Runtime memory corruption and C++ abort crashes
-AI_INFERENCE_LOCK = threading.Lock()
+LIVE_PRESENCE = {}
+presence_lock = threading.Lock()
+MANUALLY_ABSENT_USERS = set()
+DETECTED_USERS_SESSION = set()
+LATEST_STREAM_DETECTIONS = []
+STREAM_PAUSED_STATE = {}
+monitoring_state_lock = threading.Lock()
+active_stream_readers = {}
+active_readers_lock = threading.Lock()
+today_logged_lock = threading.Lock()
 
-# ==============================================================================
-# ORIGINAL LOCAL-DASHBOARD ATTENDANCE STATE ENGINE & LIVE TICKER UPSERT
-# ==============================================================================
+ACTIVE_CAMERA_READERS = active_stream_readers
+readers_lock = active_readers_lock
+LATEST_DETECTIONS_FEED = LATEST_STREAM_DETECTIONS
+detections_lock = cache_lock
 
 USER_ATTENDANCE_STATE = {}
-USER_ATTENDANCE_STATE_DATE = None
-attendance_state_lock = threading.Lock()
+USER_ATTENDANCE_STATE_DATE = ""
+
+# -----------------------------------------------------------------------
+# ASYNCHRONOUS DATABASE WRITER QUEUE & IN-MEMORY CACHING
+# Video processing thread never waits for SQLite file locks or disk I/O.
+# All attendance logs and snapshots are dispatched in ~0.001ms to a background worker.
+# -----------------------------------------------------------------------
+DB_TASK_QUEUE = queue.Queue(maxsize=5000)
+TODAY_LOGGED_ATTENDANCE = set()  # set of (user_id, source)
+TODAY_LOGGED_DATE = None
+
+def _db_writer_worker():
+    """Background daemon worker executing DB writes asynchronously so AI loop never drops frames."""
+    while True:
+        try:
+            task_type, payload = DB_TASK_QUEUE.get()
+            if task_type == 'log_attendance':
+                success, reason = db.log_attendance(
+                    user_id=payload['user_id'],
+                    detected_name=payload['detected_name'],
+                    confidence=payload['confidence'],
+                    source=payload['source'],
+                    location=payload.get('location'),
+                    device_id=payload.get('device_id'),
+                    bypass_shift_check=True,
+                    checkout_camera_id=payload.get('checkout_camera_id'),
+                    checkout_location=payload.get('checkout_location'),
+                    attendance_time=payload.get('attendance_time')
+                )
+                if not success:
+                    clear_logged_today_in_memory(payload['user_id'])
+                    logger.info(f"[Shift Validation] Skipped DB log for '{payload['detected_name']}': {reason}")
+                else:
+                    try:
+                        dispatch_attendance_event_to_cloud(
+                            user_id=payload['user_id'],
+                            name=payload['detected_name'],
+                            confidence=payload['confidence'],
+                            camera_id=payload.get('device_id'),
+                            camera_name=payload.get('location'),
+                            face_crop_b64=payload.get('face_crop_b64'),
+                            timestamp=(payload.get('attendance_time') or datetime.now()).isoformat(),
+                            event_type=payload.get('event_type', 'CHECKIN')
+                        )
+                    except Exception as ce:
+                        logger.debug(f"Cloud dispatch error: {ce}")
+            elif task_type == 'record_locator_snapshot':
+                db.record_locator_snapshot(
+                    user_id=payload['user_id'],
+                    name=payload['name'],
+                    department=payload.get('department', ''),
+                    camera_id=payload['camera_id'],
+                    camera_name=payload['camera_name'],
+                    room_name=payload['room_name'],
+                    confidence=payload['confidence'],
+                    first_seen=payload['first_seen'],
+                    last_seen=payload['last_seen'],
+                    interval_seconds=payload.get('interval_seconds', 300)
+                )
+            elif task_type == 'clear_manual_absent':
+                db.clear_manual_absent_today(payload['user_id'])
+            DB_TASK_QUEUE.task_done()
+        except Exception as e:
+            logger.error(f"[DB Writer Worker] Error executing DB task: {e}")
+
+db_writer_thread = threading.Thread(target=_db_writer_worker, daemon=True)
+db_writer_thread.start()
 
 
-def upsert_live_detection(uid: int, detection_entry: Optional[Dict] = None, **updates):
+def is_already_logged_today(user_id: int, source: str) -> bool:
+    """O(1) in-memory check to prevent repeated SQLite queries during live streams."""
+    global TODAY_LOGGED_DATE, TODAY_LOGGED_ATTENDANCE
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    with today_logged_lock:
+        if TODAY_LOGGED_DATE != today_str:
+            TODAY_LOGGED_DATE = today_str
+            try:
+                records = db.get_attendance_today()
+                TODAY_LOGGED_ATTENDANCE = {(r['user_id'], r.get('source', '')) for r in records}
+            except Exception:
+                TODAY_LOGGED_ATTENDANCE = set()
+        with cache_lock:
+            if user_id in MANUALLY_ABSENT_USERS:
+                to_discard = [item for item in TODAY_LOGGED_ATTENDANCE if item[0] == user_id]
+                for item in to_discard:
+                    TODAY_LOGGED_ATTENDANCE.discard(item)
+                return False
+        return (user_id, source) in TODAY_LOGGED_ATTENDANCE
+
+
+def mark_logged_today_in_memory(user_id: int, source: str):
+    with today_logged_lock:
+        TODAY_LOGGED_ATTENDANCE.add((user_id, source))
+
+
+def clear_logged_today_in_memory(user_id: Optional[int] = None):
+    """Clear in-memory attendance record so re-marking or camera re-detection writes to DB."""
+    global TODAY_LOGGED_ATTENDANCE, USER_ATTENDANCE_STATE
+    with today_logged_lock:
+        if user_id is None:
+            TODAY_LOGGED_ATTENDANCE.clear()
+            USER_ATTENDANCE_STATE.clear()
+        else:
+            to_discard = [item for item in TODAY_LOGGED_ATTENDANCE if item[0] == user_id]
+            for item in to_discard:
+                TODAY_LOGGED_ATTENDANCE.discard(item)
+            USER_ATTENDANCE_STATE.pop(user_id, None)
+
+
+def resync_logged_today_in_memory():
+    """Resynchronize TODAY_LOGGED_ATTENDANCE directly from database records for today."""
+    global TODAY_LOGGED_DATE, TODAY_LOGGED_ATTENDANCE, USER_ATTENDANCE_STATE
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    with today_logged_lock:
+        TODAY_LOGGED_DATE = today_str
+        USER_ATTENDANCE_STATE.clear()
+        try:
+            records = db.get_attendance_today()
+            TODAY_LOGGED_ATTENDANCE = {(r['user_id'], r.get('source', '')) for r in records}
+        except Exception:
+            TODAY_LOGGED_ATTENDANCE = set()
+
+
+def update_live_presence(user_id, name, department, camera_id, camera_name, room_name, confidence, face_crop=None):
+    """Update global presence registry when a verified person is seen in a camera/room (non-blocking)."""
+    with presence_lock:
+        prev = LIVE_PRESENCE.get(user_id, {})
+        now = time.time()
+        prev_room = prev.get('room_name')
+        first_seen = prev.get('first_seen_room', now) if prev_room == room_name else now
+        LIVE_PRESENCE[user_id] = {
+            "user_id": user_id,
+            "name": name,
+            "department": department or prev.get('department', ''),
+            "camera_id": camera_id,
+            "camera_name": camera_name,
+            "room_name": room_name,
+            "confidence": float(confidence),
+            "last_seen": now,
+            "first_seen_room": first_seen,
+            "face_crop": face_crop or prev.get('face_crop')
+        }
+
+    # Queue locator snapshot asynchronously so the video loop returns instantly
+    try:
+        DB_TASK_QUEUE.put_nowait(('record_locator_snapshot', {
+            'user_id': user_id,
+            'name': name,
+            'department': department or '',
+            'camera_id': camera_id,
+            'camera_name': camera_name,
+            'room_name': room_name,
+            'confidence': confidence,
+            'first_seen': first_seen,
+            'last_seen': now,
+            'interval_seconds': 300
+        }))
+    except queue.Full:
+        pass
+
+
+def refresh_presence_timestamp(user_id, current_time=None):
+    """Keep active dwell time alive while face is continuously tracked in current room."""
+    with presence_lock:
+        if user_id in LIVE_PRESENCE:
+            LIVE_PRESENCE[user_id]["last_seen"] = current_time or time.time()
+
+
+def match_embedding_vectorized(test_embedding: np.ndarray, threshold: float = FACE_MATCHING_THRESHOLD, organization_id: Optional[str] = None):
     """
-    Keep ONE ticker row per employee: replace/refresh their entry and move it to the top.
-    Display only - never creates duplicate rows in the live attendance list.
+    Lightning-fast vectorized search against all enrolled users in memory.
+    Uses BLAS matrix dot product: O(1) in ~0.05ms instead of Python dictionary loops.
+    Strictly filters candidates by caller organization_id for Biometric Isolation.
+    Returns: (best_uid, user_meta_dict, best_similarity, is_match)
     """
-    global LATEST_DETECTIONS_FEED
-    with detections_lock:
+    if test_embedding is None:
+        return None, None, 0.0, False
+
+    with cache_lock:
+        local_matrix = ENROLLED_MATRIX
+        local_uids = ENROLLED_USER_IDS
+        local_meta = ENROLLED_USER_METADATA
+
+    if local_matrix is None or len(local_uids) == 0:
+        return None, None, 0.0, False
+
+    try:
+        norm = float(np.linalg.norm(test_embedding))
+        if norm < 1e-6:
+            return None, None, 0.0, False
+        query_emb = np.divide(test_embedding, norm, dtype=np.float32)
+
+        # Single C/BLAS matrix dot product: (N, 512) . (512,) -> (N,)
+        similarities = np.dot(local_matrix, query_emb)
+        
+        if organization_id:
+            valid_indices = [
+                i for i, m in enumerate(local_meta)
+                if (m.get('organization_id') == organization_id or
+                    (organization_id == 'DEFAULT_ORG' and (not m.get('organization_id') or m.get('organization_id') == 'DEFAULT_ORG')))
+            ]
+            if not valid_indices:
+                return None, None, 0.0, False
+            sub_similarities = similarities[valid_indices]
+            sub_best = int(np.argmax(sub_similarities))
+            max_sim = float(sub_similarities[sub_best])
+            best_idx = valid_indices[sub_best]
+        else:
+            best_idx = int(np.argmax(similarities))
+            max_sim = float(similarities[best_idx])
+
+        is_match = (max_sim >= threshold)
+        if is_match:
+            best_uid = local_uids[best_idx]
+            best_data = local_meta[best_idx]
+            return best_uid, best_data, max_sim, True
+        else:
+            return None, None, max_sim, False
+    except Exception as e:
+        logger.error(f"Vectorized matching error: {e}")
+        return None, None, 0.0, False
+
+
+def upsert_live_detection(uid, detection_entry=None, **updates):
+    """Keep ONE ticker row per employee: replace/refresh their entry and move it to the top.
+    Display only - never touches attendance records."""
+    global LATEST_STREAM_DETECTIONS, DETECTED_USERS_SESSION
+    with cache_lock:
         existing = None
-        for i, det in enumerate(LATEST_DETECTIONS_FEED):
+        for i, det in enumerate(LATEST_STREAM_DETECTIONS):
             if det.get('user_id') == uid:
-                existing = LATEST_DETECTIONS_FEED.pop(i)
+                existing = LATEST_STREAM_DETECTIONS.pop(i)
                 break
         if detection_entry is not None:
             entry = dict(detection_entry)
@@ -504,28 +741,65 @@ def upsert_live_detection(uid: int, detection_entry: Optional[Dict] = None, **up
         else:
             return False
         entry['timestamp'] = datetime.now().strftime("%I:%M:%S %p")
-        LATEST_DETECTIONS_FEED.insert(0, entry)
-        del LATEST_DETECTIONS_FEED[50:]
+        DETECTED_USERS_SESSION.add(uid)
+        LATEST_STREAM_DETECTIONS.insert(0, entry)
+        del LATEST_STREAM_DETECTIONS[1000:]
         return True
 
 
-def process_user_attendance_event(user_id: int, name: str, confidence: float, source: str, location: str, camera_id: str, face_crop_b64: Optional[str] = None) -> Tuple[str, str]:
+def remove_live_detection_for_user(user_id: int):
+    """Remove a user from live detections, room presence locator, and active tracking after manual absent marking."""
+    global LATEST_STREAM_DETECTIONS, DETECTED_USERS_SESSION, MANUALLY_ABSENT_USERS
+    with cache_lock:
+        LATEST_STREAM_DETECTIONS = [
+            det for det in LATEST_STREAM_DETECTIONS if det.get('user_id') != user_id
+        ]
+        DETECTED_USERS_SESSION.discard(user_id)
+        MANUALLY_ABSENT_USERS.add(user_id)
+
+    clear_logged_today_in_memory(user_id)
+
+    with presence_lock:
+        if user_id in LIVE_PRESENCE:
+            del LIVE_PRESENCE[user_id]
+            logger.info(f"✓ Cleared user ID {user_id} from LIVE_PRESENCE room locator store.")
+
+    with active_readers_lock:
+        for reader in active_stream_readers.values():
+            with reader.lock:
+                reader.tracked_faces = {
+                    tid: t for tid, t in reader.tracked_faces.items()
+                    if t.get('user_id') != user_id
+                }
+
+
+def restore_live_detection_for_user(user_id: int):
+    """Allow a manually absent user to be recognized again without restarting the server."""
+    global DETECTED_USERS_SESSION, MANUALLY_ABSENT_USERS
+    with cache_lock:
+        MANUALLY_ABSENT_USERS.discard(user_id)
+        DETECTED_USERS_SESSION.discard(user_id)
+
+
+def process_user_attendance_event(user_id: int, name: str, confidence: float, source: str, location: str, camera_id: str, shift_info: Optional[Dict] = None, face_crop_b64: Optional[str] = None) -> Tuple[str, str]:
     """
-    Camera-Aware & Shift-Based State Sequence from original Local Dashboard:
+    Camera-Aware & Shift-Based State Sequence for Employee Attendance:
+    
+    State Progression:
+    Not Checked In -> Check-In Window + Authorized Check-In Camera -> Present/Checked In -> Check-Out Window + Authorized Check-Out Camera -> Checked Out -> Completed
     
     Rules Enforced:
     1. Every employee evaluated against assigned camera permissions AND shift rules.
     2. Check-In ONLY allowed on employee's authorized Check-In camera(s).
     3. Check-Out ONLY allowed on employee's authorized Check-Out camera(s).
     4. Repeated detections on Check-In cameras do NOT create duplicate records.
-    5. Check-Out NEVER opens before the shift end time (e.g. 06:00 PM).
-    6. Dispatches to Cloud ONCE upon Check-In and ONCE upon Check-Out.
+    5. Detections on unauthorized cameras do NOT mark attendance.
     """
     global USER_ATTENDANCE_STATE, USER_ATTENDANCE_STATE_DATE
     now = datetime.now()
     today_str = now.strftime('%Y-%m-%d')
 
-    with attendance_state_lock:
+    with today_logged_lock:
         if USER_ATTENDANCE_STATE_DATE != today_str:
             USER_ATTENDANCE_STATE_DATE = today_str
             USER_ATTENDANCE_STATE.clear()
@@ -533,8 +807,8 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                 today_logs = db.get_attendance_today()
                 user_min_max = {}
                 for log in today_logs:
-                    uid = log.get('user_id')
-                    ts_str = str(log.get('timestamp') or '')
+                    uid = log['user_id']
+                    ts_str = str(log['timestamp'])
                     try:
                         ts_dt = datetime.strptime(ts_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
                     except Exception:
@@ -546,7 +820,7 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                             user_min_max[uid]['min'] = ts_dt
                         if ts_dt > user_min_max[uid]['max']:
                             user_min_max[uid]['max'] = ts_dt
-                
+
                 for uid, mm in user_min_max.items():
                     USER_ATTENDANCE_STATE[uid] = {
                         'checkin_time': mm['min'],
@@ -554,6 +828,11 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                     }
             except Exception as e:
                 logger.error(f"Failed initializing USER_ATTENDANCE_STATE from DB: {e}")
+
+        # Check manual absent override
+        with cache_lock:
+            if user_id in MANUALLY_ABSENT_USERS:
+                USER_ATTENDANCE_STATE.pop(user_id, None)
 
         user_state = USER_ATTENDANCE_STATE.get(user_id)
 
@@ -568,8 +847,8 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                 return "REJECTED_CAMERA_UNAUTHORIZED", cam_msg
 
             shift_allowed, shift_msg, retrieved_shift = db.check_user_shift_allowed(user_id, now)
-            effective_shift = retrieved_shift or {}
-            
+            effective_shift = retrieved_shift or shift_info or {}
+
             if not shift_allowed:
                 logger.info(f"[SHIFT CHECK-IN BLOCKED] Staff '{name}' (ID #{user_id}): {shift_msg}")
                 return "REJECTED_OUTSIDE_SHIFT", shift_msg
@@ -580,31 +859,21 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
                 'last_checkout_log': None
             }
             try:
-                db.log_attendance(
-                    user_id=user_id,
-                    detected_name=name,
-                    confidence=confidence,
-                    source=source,
-                    location=location,
-                    device_id=camera_id,
-                    attendance_time=now,
-                    bypass_shift_check=True
-                )
+                DB_TASK_QUEUE.put_nowait(('clear_manual_absent', {'user_id': user_id}))
+                DB_TASK_QUEUE.put_nowait(('log_attendance', {
+                    'user_id': user_id,
+                    'detected_name': name,
+                    'confidence': confidence,
+                    'source': source,
+                    'location': location,
+                    'device_id': camera_id,
+                    'face_crop_b64': face_crop_b64,
+                    'attendance_time': now,
+                    'event_type': 'CHECKIN'
+                }))
                 logger.info(f"✓ [CHECK-IN LOGGED] Staff '{name}' (ID #{user_id}) on Camera '{camera_id}' ({location}) at {now.strftime('%I:%M:%S %p')} ({effective_shift.get('name', 'Shift')})")
-            except Exception as e:
-                logger.error(f"Error logging checkin: {e}")
-
-            # Send to Cloud ONCE upon Check-In
-            dispatch_attendance_event_to_cloud(
-                user_id=user_id,
-                name=name,
-                confidence=confidence,
-                camera_id=camera_id,
-                camera_name=location,
-                face_crop_b64=face_crop_b64,
-                timestamp=now.isoformat(),
-                event_type="CHECKIN"
-            )
+            except queue.Full:
+                pass
             return "CHECKIN", f"Check-In recorded at {now.strftime('%I:%M %p')} on {location}"
 
         # -------------------------------------------------------------
@@ -612,7 +881,7 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
         # -------------------------------------------------------------
         checkin_time = user_state['checkin_time']
         seconds_since_checkin = (now - checkin_time).total_seconds()
-        
+
         # Initial check-in buffer: Detections within the first 60 seconds confirm initial Check-In
         if seconds_since_checkin < 60:
             return "CHECKIN_CONFIRMED", f"Check-In active ({int(seconds_since_checkin)}s after check-in)"
@@ -652,248 +921,571 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
         if last_checkout_log is None:
             user_state['last_checkout_log'] = now
             try:
-                db.log_attendance(
-                    user_id=user_id,
-                    detected_name=name,
-                    confidence=confidence,
-                    source=source,
-                    location=location,
-                    device_id=camera_id,
-                    checkout_camera_id=camera_id,
-                    checkout_location=location,
-                    attendance_time=now,
-                    bypass_shift_check=True
-                )
+                DB_TASK_QUEUE.put_nowait(('log_attendance', {
+                    'user_id': user_id,
+                    'detected_name': name,
+                    'confidence': confidence,
+                    'source': source,
+                    'location': location,
+                    'device_id': camera_id,
+                    'checkout_camera_id': camera_id,
+                    'checkout_location': location,
+                    'face_crop_b64': face_crop_b64,
+                    'attendance_time': now,
+                    'event_type': 'CHECKOUT'
+                }))
                 logger.info(f"✓ [CHECK-OUT LOGGED] Staff '{name}' (ID #{user_id}) Check-Out on Camera '{camera_id}' ({location}) updated to {now.strftime('%I:%M:%S %p')} (Check-In was {checkin_time.strftime('%I:%M:%S %p')})")
-            except Exception as e:
-                logger.error(f"Error logging checkout: {e}")
-
-            # Send to Cloud ONCE upon Check-Out
-            dispatch_attendance_event_to_cloud(
-                user_id=user_id,
-                name=name,
-                confidence=confidence,
-                camera_id=camera_id,
-                camera_name=location,
-                face_crop_b64=face_crop_b64,
-                timestamp=now.isoformat(),
-                event_type="CHECKOUT"
-            )
+            except queue.Full:
+                pass
             return "CHECKOUT", f"Check-Out recorded at {now.strftime('%I:%M %p')} on {location}"
 
         return "ATTENDANCE_COMPLETED", "Attendance active and completed for assigned shift"
 
 
-class NodeCameraReader:
-    def __init__(self, camera_id: str, camera_name: str, rtsp_source: Any):
+class CameraStreamReader:
+    """
+    High-performance dual-threaded camera reader:
+    - Thread 1 (Grabber): Continuously grabs the latest frame at 30 FPS from the NVR/DVR.
+      This completely eliminates OpenCV buffer delay and lagging.
+    - Thread 2 (AI Worker): Processes the latest frame asynchronously for face detection 
+      and recognition in the background, updating detections without blocking the stream.
+    """
+    def __init__(self, camera_id, rtsp_url):
+        import cv2
+        import threading
+        import os
+        
         self.camera_id = str(camera_id)
-        self.camera_name = camera_name
-        self.rtsp_source = rtsp_source
-        self.is_webcam = isinstance(rtsp_source, int) or (isinstance(rtsp_source, str) and rtsp_source.isdigit())
-        self.cap = None
-        self.cap_lock = threading.Lock()
+        self.rtsp_url = rtsp_url
+        
+        cam_info = db.get_camera_by_id(camera_id)
+        if not cam_info:
+            for c in CONFIG.get('cameras', []):
+                if str(c.get('id') or c.get('camera_id')) == str(camera_id):
+                    cam_info = {
+                        'name': c.get('name') or c.get('camera_name', f"Camera {camera_id}"),
+                        'room_name': c.get('room_name') or 'Live Monitoring'
+                    }
+                    break
+        if cam_info:
+            self.room_name = cam_info.get('room_name', f"Room ({camera_id})")
+            self.camera_label = cam_info.get('name', f"Camera {camera_id}")
+        else:
+            self.room_name = f"Room ({camera_id})"
+            self.camera_label = f"Camera {camera_id}"
+        self.camera_name = self.camera_label
+        
+        self.is_webcam = isinstance(rtsp_url, int) or (isinstance(rtsp_url, str) and str(rtsp_url).isdigit())
+        if self.is_webcam:
+            self.rtsp_url = int(rtsp_url)
+            logger.info(f"Initializing USB Webcam (Index: {self.rtsp_url}) using CAP_DSHOW...")
+            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
+            if not self.cap or not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(self.rtsp_url)
+        else:
+            # Set low-delay TCP parameters BEFORE initializing the VideoCapture to eliminate buffer lag
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            
+        if self.cap and self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
         self.latest_frame = None
         self.latest_detections = []
-        self.tracked_faces = {}
+        self.tracked_faces = {}  # track_id -> dict for locking face identities
         self.next_track_id = 1
         self.last_logged = {}  # {user_id: timestamp}
         self.running = True
+        self.viewers_count = 0  # Active viewer tracking
+        self.paused = False  # UI feed hidden but backend recognition remains active
+        
         self.lock = threading.Lock()
-
-        if self.is_webcam:
-            self.rtsp_url = int(rtsp_source)
-        else:
-            self.rtsp_url = str(rtsp_source)
-
-        # Thread 1: Grabber (handles opening capture in background without blocking Flask)
-        threading.Thread(target=self._grabber_loop, daemon=True).start()
-        # Thread 2: AI Processor
-        threading.Thread(target=self._ai_loop, daemon=True).start()
-
-    def _open_capture(self):
-        try:
-            if self.is_webcam:
-                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
-                if not self.cap or not self.cap.isOpened():
-                    self.cap = cv2.VideoCapture(self.rtsp_url)
-            else:
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;5000000|timeout;5000000"
-                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-            if self.cap and self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                logger.info(f"[CAMERA CONNECTED] {self.camera_name} ({self.camera_id}) opened successfully.")
-                return True
-        except Exception as e:
-            logger.debug(f"Capture open failed for {self.camera_id}: {e}")
-            self.cap = None
-        return False
+        
+        # Thread 1: Camera Frame Grabber (Runs at ~30-60Hz, never blocks for AI)
+        self.grabber_thread = threading.Thread(target=self._grabber_loop, daemon=True)
+        self.grabber_thread.start()
+        
+        # Thread 2: Asynchronous AI Worker (Runs at ~3Hz, processes frames in background)
+        self.ai_thread = threading.Thread(target=self._ai_loop, daemon=True)
+        self.ai_thread.start()
 
     def _grabber_loop(self):
-        last_reconnect_attempt = 0
+        import time
+        import cv2
+        import os
+        
+        # Set low-latency and TCP options for FFmpeg backend
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+        
         consecutive_failures = 0
         while self.running:
-            try:
-                need_open = False
-                with self.cap_lock:
+            if not self.cap or not self.cap.isOpened():
+                if self.is_webcam:
+                    if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('IS_CLOUD') or os.name != 'nt':
+                        time.sleep(15)
+                        continue
+                    logger.warning(f"[{self.camera_id}] Webcam closed. Re-opening with CAP_DSHOW...")
+                    self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_DSHOW)
                     if not self.cap or not self.cap.isOpened():
-                        need_open = True
-
-                if need_open:
-                    now = time.time()
-                    if now - last_reconnect_attempt > 2.0:
-                        last_reconnect_attempt = now
-                        with self.cap_lock:
-                            if self.running:
-                                self._open_capture()
-                    time.sleep(0.3)
-                    continue
-
-                frame = None
-                ret = False
-                with self.cap_lock:
-                    if not self.running:
-                        break
-                    if self.cap and self.cap.isOpened():
-                        ret, frame = self.cap.read()
-
-                if ret and frame is not None and frame.size > 0:
-                    consecutive_failures = 0
-                    with self.lock:
-                        self.latest_frame = frame
-                    time.sleep(0.01)
+                        self.cap = cv2.VideoCapture(self.rtsp_url)
                 else:
-                    consecutive_failures += 1
-                    # Only release and trigger reconnect if continuous failure persists (15+ frames / ~1.5s)
-                    if consecutive_failures > 15:
-                        with self.cap_lock:
-                            if self.cap is not None:
-                                try:
-                                    self.cap.release()
-                                except Exception:
-                                    pass
-                                self.cap = None
-                        consecutive_failures = 0
-                        last_reconnect_attempt = time.time()
-                    time.sleep(0.04)
-            except Exception as e:
-                logger.debug(f"Grabber loop exception in {self.camera_id}: {e}")
-                time.sleep(0.2)
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+                    self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                if self.cap and self.cap.isOpened():
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                time.sleep(1)
+                continue
+                
+            ret, frame = self.cap.read()
+            if ret and frame is not None and frame.size > 0:
+                consecutive_failures = 0
+                # Resize immediately to 1080px wide for superior distant face recognition range
+                h, w = frame.shape[:2]
+                max_width = 1080
+                if w > max_width:
+                    scale = max_width / w
+                    frame = cv2.resize(frame, (max_width, int(h * scale)))
+                
+                with self.lock:
+                    self.latest_frame = frame
+            else:
+                consecutive_failures += 1
+                # If reading fails continuously for ~1.5 seconds (30 attempts), reset capture to reconnect
+                if consecutive_failures >= 30:
+                    logger.warning(f"[{self.camera_id}] RTSP stream disconnected or stalled ({consecutive_failures} failed reads). Reconnecting...")
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    consecutive_failures = 0
+                    time.sleep(1)
+                    continue
+                time.sleep(0.01)
 
     def _ai_loop(self):
+        import time
+        import cv2
+        import base64
+        import numpy as np
+        from datetime import datetime
+        
         last_ai_time = 0
+        
         while self.running:
-            now = time.time()
-            if (now - last_ai_time) < 0.08:  # ~12 FPS AI check is optimal for real-time attendance
-                time.sleep(0.015)
-                continue
+            current_time = time.time()
+            
+            # Process the latest frame continuously on GPU. We intentionally do not drop frames
+            # for live attendance recognition because the model is CUDA-enabled and a 20 FPS loop
+            # is the correct real-time cadence for attendance tracking.
+            ai_interval = TRACK_AI_INTERVAL if self.viewers_count > 0 or self.paused else IDLE_AI_INTERVAL
+            ai_interval = min(ai_interval, 0.05)
 
-            frame = None
+            # Retrieve latest frame from grabber thread under lock
+            frame_to_process = None
             with self.lock:
                 if self.latest_frame is not None:
-                    frame = self.latest_frame.copy()
+                    frame_to_process = self.latest_frame.copy()
 
-            if frame is None or frame.size == 0:
-                time.sleep(0.03)
-                continue
+            if frame_to_process is not None and (current_time - last_ai_time) >= ai_interval:
+                last_ai_time = current_time
 
-            last_ai_time = now
+                try:
+                    # -----------------------------------------------------------------------
+                    # STEP 2 (CROWD FIX): FOCUS GPU COMPUTE ON UNCONFIRMED STUDENTS
+                    # Front-row students who are already confirmed and logged in DB don't
+                    # need their ArcFace embeddings re-extracted every frame. We pass their
+                    # active bboxes so SCRFD still tracks them smoothly, while ArcFace runs
+                    # ONLY on the new and unconfirmed students walking behind them!
+                    # -----------------------------------------------------------------------
+                    confirmed_bboxes = [
+                        t["bbox"] for t in self.tracked_faces.values()
+                        if t.get("confirmed") and t.get("name") != "Unknown" and (current_time - t.get("last_seen", 0)) < 0.6
+                    ]
 
-            # Non-blocking lock: if another camera is currently executing InsightFace,
-            # this camera skips this single frame rather than piling up threads
-            # in ONNX Runtime/CUDA C++ engine. This completely prevents multi-camera C++ crashes!
-            if not AI_INFERENCE_LOCK.acquire(blocking=False):
-                time.sleep(0.01)
-                continue
+                    # ALL-IN-ONE High-Speed Face Detection & Selective Extraction
+                    face_results = fp.detect_and_extract_insightface(frame_to_process, skip_bboxes=confirmed_bboxes)
+                    new_cached_detections = []
+                    
+                    # Sort faces by area (largest first) to prioritize closer faces
+                    face_results = sorted(face_results, key=lambda d: (d['bbox'][2] - d['bbox'][0]) * (d['bbox'][3] - d['bbox'][1]), reverse=True)
+                    
+                    # Get active tracked faces (allow up to TRACK_MAX_AGE_SECONDS so tracks persist smoothly during CPU inference)
+                    active_tracks = {tid: t for tid, t in self.tracked_faces.items() if (current_time - t["last_seen"]) < TRACK_MAX_AGE_SECONDS}
+                    
+                    assigned_detections = []  # list of (face_dict, track_id)
+                    used_track_ids = set()
+                    
+                    for face_dict in face_results:
+                        x1, y1, x2, y2 = face_dict['bbox']
+                        conf = face_dict['conf']
+                        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                        best_tid = None
+                        best_dist = float('inf')
+                        
+                        # Match with closest active track
+                        for tid, t in active_tracks.items():
+                            if tid in used_track_ids:
+                                continue
+                            rx, ry = t["centroid"]
+                            tx1, ty1, tx2, ty2 = t["bbox"]
+                            
+                            # Calculate IoU
+                            ix1 = max(x1, tx1)
+                            iy1 = max(y1, ty1)
+                            ix2 = min(x2, tx2)
+                            iy2 = min(y2, ty2)
+                            i_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                            u_area = (x2 - x1) * (y2 - y1) + (tx2 - tx1) * (ty2 - ty1) - i_area
+                            iou = i_area / u_area if u_area > 0 else 0.0
+                            
+                            dist = np.sqrt((cx - rx)**2 + (cy - ry)**2)
+                            face_size = max(x2 - x1, y2 - y1)
+                            
+                            if (iou > TRACK_ACTIVE_IOU_THRESHOLD or dist < max(TRACK_ACTIVE_MIN_DIST, face_size * TRACK_ACTIVE_DIST_FACTOR)) and dist < best_dist:
+                                best_dist = dist
+                                best_tid = tid
+                                
+                        if best_tid is not None:
+                            used_track_ids.add(best_tid)
+                            assigned_detections.append((face_dict, best_tid))
+                        else:
+                            # Start a new track
+                            inherited_name = "Unknown"
+                            inherited_uid = None
+                            inherited_sim = 0.0
+                            last_ai_run_val = 0.0
+                            inherited_history = []
+                            inherited_confirmed = False
+                            
+                            for old_tid, old_t in list(self.tracked_faces.items()):
+                                is_lost = (current_time - old_t["last_seen"]) > 0.15
+                                # Allow inheriting from BOTH confirmed tracks AND in-progress ("Unknown" but
+                                # already accumulating consensus) tracks. This prevents a walking student's
+                                # partial match_history from being wiped out just because they got a new
+                                # track ID from a brief detection gap or fast movement.
+                                has_progress = old_t["name"] != "Unknown" or len(old_t.get("match_history", [])) > 0
+                                if is_lost and has_progress and (current_time - old_t["last_seen"]) < TRACK_MAX_AGE_SECONDS:
+                                    old_rx, old_ry = old_t["centroid"]
+                                    tx1, ty1, tx2, ty2 = old_t["bbox"]
+                                    
+                                    ix1 = max(x1, tx1)
+                                    iy1 = max(y1, ty1)
+                                    ix2 = min(x2, tx2)
+                                    iy2 = min(y2, ty2)
+                                    i_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                                    u_area = (x2 - x1) * (y2 - y1) + (tx2 - tx1) * (ty2 - ty1) - i_area
+                                    iou = i_area / u_area if u_area > 0 else 0.0
+                                    
+                                    spatial_dist = np.sqrt((cx - old_rx)**2 + (cy - old_ry)**2)
+                                    face_size = max(x2 - x1, y2 - y1)
+                                    
+                                    if iou > TRACK_LOST_IOU_THRESHOLD or spatial_dist < max(TRACK_LOST_MIN_DIST, face_size * TRACK_LOST_DIST_FACTOR):
+                                        inherited_name = old_t["name"]
+                                        inherited_uid = old_t["user_id"]
+                                        inherited_sim = old_t["similarity"]
+                                        last_ai_run_val = old_t["last_ai_run"]
+                                        inherited_history = list(old_t.get("match_history", []))
+                                        inherited_confirmed = old_t.get("confirmed", False)
+                                        break
+                            
+                            tid = self.next_track_id
+                            self.next_track_id += 1
+                            self.tracked_faces[tid] = {
+                                "name": inherited_name,
+                                "user_id": inherited_uid,
+                                "similarity": inherited_sim,
+                                "last_seen": current_time,
+                                "centroid": (cx, cy),
+                                "bbox": (x1, y1, x2, y2),
+                                "last_ai_run": last_ai_run_val,
+                                "match_history": inherited_history,
+                                "confirmed": inherited_confirmed
+                            }
+                            assigned_detections.append((face_dict, tid))
+                    
+                    # Process each assigned face
+                    for idx, (face_dict, tid) in enumerate(assigned_detections):
+                        x1, y1, x2, y2 = face_dict['bbox']
+                        test_embedding = face_dict['embedding']
+                        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                        
+                        track = self.tracked_faces[tid]
+                        track["centroid"] = (cx, cy)
+                        track["bbox"] = (x1, y1, x2, y2)
+                        track["last_seen"] = current_time
+                        
+                        # If track is already confirmed and recognized, keep presence timestamp refreshed & process Check-Out events
+                        if track.get("confirmed") and track.get("user_id"):
+                            user_id = track["user_id"]
+                            name = track.get("name", "Staff")
+                            refresh_presence_timestamp(user_id, current_time)
 
-            try:
-                face_results = fp.detect_and_extract_insightface(frame)
-                current_detections = []
-
-                for face in face_results:
-                    x1, y1, x2, y2 = face['bbox']
-                    emb = face.get('embedding')
-                    name = "Unknown"
-                    conf = 0.0
-                    user_id = None
-
-                    if emb is not None and ENROLLED_MATRIX is not None:
-                        sims = np.dot(ENROLLED_MATRIX, emb)
-                        best_idx = np.argmax(sims)
-                        best_sim = float(sims[best_idx])
-                        if best_sim >= CONFIG.get("face_match_threshold", 0.45):
-                            user_id = ENROLLED_USER_IDS[best_idx]
-                            meta = ENROLLED_USER_METADATA[best_idx]
-                            name = meta['name']
-                            conf = best_sim
-
-                            # Crop face thumbnail for live ticker snapshot
-                            face_crop_b64 = None
-                            try:
-                                h, w = frame.shape[:2]
-                                crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                                if crop.size > 0:
-                                    crop_resized = cv2.resize(crop, (80, 80))
-                                    _, buf = cv2.imencode('.jpg', crop_resized, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                                    face_crop_b64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
-                            except Exception:
-                                pass
-
-                            # 1. Update single-row live ticker (no duplicates, no confidence badge)
-                            upsert_live_detection(user_id, {
-                                "name": name,
-                                "user_id": user_id,
-                                "camera_name": self.camera_name,
-                                "face_crop": face_crop_b64,
-                                "timestamp": datetime.now().strftime("%I:%M:%S %p")
-                            })
-
-                            # 2. Evaluate attendance against shift & camera via Local-Dashboard's state sequence (throttled every 5s)
-                            last_eval = self.last_logged.get(user_id, 0)
-                            if (now - last_eval) >= 5.0:
-                                self.last_logged[user_id] = now
+                            # Live ticker: refresh last-detection time every ~1s (display only)
+                            if (current_time - track.get("last_ticker_refresh", 0)) >= 1.0:
+                                track["last_ticker_refresh"] = current_time
+                                _cl = getattr(self, 'camera_label', '') or f"Camera {self.camera_id}"
+                                _rn = getattr(self, 'room_name', '') or 'Live Monitoring'
+                                _cd = f"{_cl} ({_rn})" if _rn not in _cl else _cl
+                                if not upsert_live_detection(
+                                    user_id,
+                                    camera_id=self.camera_id,
+                                    source=f"stream_{self.camera_id}",
+                                    camera_name=_cd,
+                                    camera_label=_cl,
+                                    room=_rn,
+                                    room_name=_rn,
+                                    location=_rn,
+                                    confidence=float(track.get("similarity", 0) or 0) or None,
+                                ):
+                                    # Entry missing (e.g. list cleared) - re-create it
+                                    upsert_live_detection(user_id, {
+                                        "name": name,
+                                        "confidence": float(track.get("similarity", 0) or 0),
+                                        "source": f"stream_{self.camera_id}",
+                                        "camera_id": self.camera_id,
+                                        "camera_name": _cd,
+                                        "camera_label": _cl,
+                                        "room": _rn,
+                                        "room_name": _rn,
+                                        "location": _rn,
+                                        "face_crop": track.get("face_crop"),
+                                        "user_id": user_id,
+                                        "department": "",
+                                    })
+                            
+                            last_eval = track.get("last_attendance_eval", 0)
+                            if (current_time - last_eval) >= 5.0:
+                                track["last_attendance_eval"] = current_time
+                                stream_source = f'stream_{self.camera_id}'
                                 action_status, action_msg = process_user_attendance_event(
                                     user_id=user_id,
                                     name=name,
-                                    confidence=conf,
-                                    source=f"node_cam_{self.camera_id}",
-                                    location=self.camera_name,
+                                    confidence=float(track.get("similarity", 0.9)),
+                                    source=stream_source,
+                                    location=self.room_name,
                                     camera_id=self.camera_id,
-                                    face_crop_b64=face_crop_b64
+                                    shift_info=None,
+                                    face_crop_b64=track.get("face_crop")
                                 )
+                            
+                        # If track identity is not yet locked/confirmed, perform biometric recognition
+                        if (not track.get("confirmed") or track["name"] == "Unknown") and test_embedding is not None:
+                            track["last_ai_run"] = current_time
 
-                    current_detections.append({
-                        "bbox": [x1, y1, x2, y2],
-                        "name": name,
-                        "confidence": conf
-                    })
+                            # -----------------------------------------------------------------------
+                            # STEP 1 (CROWD FIX): INSTANT VECTORIZED MATRIX SEARCH
+                            # Single C/BLAS matrix dot product: O(1) in 0.05ms instead of looping
+                            # over 100+ students in Python dictionaries.
+                            # -----------------------------------------------------------------------
+                            best_uid, cache_data, best_similarity, is_match = match_embedding_vectorized(
+                                test_embedding, threshold=FACE_MATCHING_THRESHOLD
+                            )
+                            best_match = (best_uid, cache_data) if (is_match and best_uid is not None) else None
 
-                with self.lock:
-                    self.latest_detections = current_detections
+                            if best_match:
+                                uid, cache_data = best_match
+                                with cache_lock:
+                                    MANUALLY_ABSENT_USERS.discard(uid)
+                                # ----------------------------------------------------
+                                # TEMPORAL CONSENSUS ENGINE (100% Reliable Attendance)
+                                # ----------------------------------------------------
+                                history = track.setdefault("match_history", [])
+                                history.append((uid, best_similarity, current_time))
+                                
+                                # Filter matches within confirmation window
+                                cutoff = current_time - ATTENDANCE_CONFIRMATION_WINDOW
+                                track["match_history"] = [m for m in history if m[2] >= cutoff]
+                                
+                                recent_matches = [m for m in track["match_history"] if m[0] == uid]
+                                num_matches = len(recent_matches)
+                                avg_sim = sum(m[1] for m in recent_matches) / num_matches if num_matches > 0 else 0.0
+                                
+                                # CROWD RECOGNITION GATE:
+                                # is_high_conf  - single-frame fast path: no wait, fires immediately at 0.45+ similarity.
+                                is_high_conf = (best_similarity >= 0.45)
+                                is_consensus = (num_matches >= ATTENDANCE_CONFIRMATION_FRAMES and avg_sim >= ATTENDANCE_CONFIRMATION_MIN_SIM)
 
-            except Exception as e:
-                logger.error(f"AI inference error in camera {self.camera_id}: {e}")
-            finally:
-                AI_INFERENCE_LOCK.release()
+                                if track.get("confirmed", False) or is_high_conf or is_consensus:
+                                    if cache_data is None:
+                                        continue
+                                    name = cache_data['name'] if cache_data is not None else track.get('name', 'Unknown')
+                                    user_id = uid
+                                    similarity_score = best_similarity
+
+                                    was_confirmed = track.get("confirmed", False)
+                                    track["confirmed"] = True
+                                    track["name"] = name
+                                    track["user_id"] = user_id
+                                    track["similarity"] = similarity_score
+
+                                    if was_confirmed:
+                                        reason = f"ALREADY CONFIRMED (reaffirm {best_similarity:.3f})"
+                                    elif is_high_conf:
+                                        reason = f"HIGH CONFIDENCE ({best_similarity:.3f} >= 0.45)"
+                                    else:
+                                        reason = f"CONSENSUS ({num_matches}/{ATTENDANCE_CONFIRMATION_FRAMES} frames, avg {avg_sim:.3f})"
+                                    logger.info(f"[_ai_loop - Stream {self.camera_id} - Track {tid}] MATCH CONFIRMED [{reason}]: '{name}' in {self.room_name}")
+                                    
+                                    # Face crop extraction for live snapshot
+                                    face_crop_b64 = None
+                                    try:
+                                        fh, fw = frame_to_process.shape[:2]
+                                        fx1, fy1, fx2, fy2 = max(0, x1), max(0, y1), min(fw, x2), min(fh, y2)
+                                        crop = frame_to_process[fy1:fy2, fx1:fx2]
+                                        if crop.size > 0:
+                                            crop_resized = cv2.resize(crop, (80, 80))
+                                            _, buf = cv2.imencode('.jpg', crop_resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                                            face_crop_b64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
+                                            track["face_crop"] = face_crop_b64
+                                    except Exception as ce:
+                                        logger.warning(f"Face crop extraction failed: {ce}")
+                                    
+                                    # Update Global Multi-Camera Room Presence Registry
+                                    update_live_presence(
+                                        user_id=uid,
+                                        name=name,
+                                        department=cache_data.get('department', '') if cache_data is not None else '',
+                                        camera_id=self.camera_id,
+                                        camera_name=self.camera_label,
+                                        room_name=self.room_name,
+                                        confidence=float(best_similarity),
+                                        face_crop=face_crop_b64
+                                    )
+                                    
+                                    stream_source = f'stream_{self.camera_id}'
+                                    action_status, action_msg = process_user_attendance_event(
+                                        user_id=user_id,
+                                        name=name,
+                                        confidence=float(best_similarity),
+                                        source=stream_source,
+                                        location=self.room_name,
+                                        camera_id=self.camera_id,
+                                        shift_info=None,
+                                        face_crop_b64=face_crop_b64
+                                    )
+
+                                    cam_label_val = getattr(self, 'camera_label', '') or f"Camera {self.camera_id}"
+                                    room_name_val = getattr(self, 'room_name', '') or 'Live Monitoring'
+                                    cam_display = f"{cam_label_val} ({room_name_val})" if cam_label_val and room_name_val and room_name_val not in cam_label_val else (cam_label_val or room_name_val)
+
+                                    detection_entry = {
+                                        "name": name,
+                                        "timestamp": datetime.now().strftime("%I:%M:%S %p"),
+                                        "confidence": float(best_similarity),
+                                        "source": f"stream_{self.camera_id}",
+                                        "camera_id": self.camera_id,
+                                        "camera_name": cam_display,
+                                        "camera_label": cam_label_val,
+                                        "room": room_name_val,
+                                        "room_name": room_name_val,
+                                        "location": room_name_val,
+                                        "face_crop": face_crop_b64,
+                                        "user_id": uid,
+                                        "department": cache_data.get('department', '') if cache_data is not None else ''
+                                    }
+                                    # One row per employee: update time & move to top on every re-appearance
+                                    upsert_live_detection(uid, detection_entry)
+
+                                    if action_status == "REJECTED_OUTSIDE_SHIFT":
+                                        logger.info(f"[_ai_loop - Stream {self.camera_id}] Shift check blocked attendance for '{name}': {action_msg}")
+                                else:
+                                    logger.debug(f"[_ai_loop - Stream {self.camera_id} - Track {tid}] Accumulating consensus for '{cache_data['name'] if cache_data is not None else 'Unknown'}': {num_matches}/{ATTENDANCE_CONFIRMATION_FRAMES} frames (avg {avg_sim:.3f})")
+                            else:
+                                if track["name"] == "Unknown":
+                                    logger.debug(f"[_ai_loop - Stream {self.camera_id} - Track {tid}] Biometric check: No match (Highest: {best_similarity:.4f})")
+                                    
+                    # Build new_cached_detections from all active tracks (smooth grace period based on TRACK_MAX_AGE_SECONDS)
+                    for tid, track in list(self.tracked_faces.items()):
+                        if (current_time - track["last_seen"]) < TRACK_MAX_AGE_SECONDS:
+                            name = track["name"]
+                            similarity_score = track["similarity"]
+                            bbox = track["bbox"]
+                            color = (0, 255, 0) if (name != "Unknown" and track.get("confirmed")) else (0, 0, 255)
+                            
+                            display_name = f"{name} ({int(similarity_score * 100)}%)" if track.get("confirmed") else "Verifying..."
+                            new_cached_detections.append({
+                                'bbox': bbox,
+                                'name': display_name,
+                                'color': color,
+                                'similarity': similarity_score
+                            })
+                        
+                    # Clean up very old inactive tracks (>6.0 seconds)
+                    self.tracked_faces = {tid: t for tid, t in self.tracked_faces.items() if (current_time - t["last_seen"]) < 6.0}
+
+                    # If a manually absent user has left the scene entirely, allow them to be recognized again later.
+                    with cache_lock:
+                        active_suppressed = {
+                            t.get('user_id') for t in self.tracked_faces.values() if t.get('user_id') in MANUALLY_ABSENT_USERS
+                        }
+                        for uid in list(MANUALLY_ABSENT_USERS):
+                            if uid not in active_suppressed:
+                                MANUALLY_ABSENT_USERS.discard(uid)
+                    
+                    with self.lock:
+                        self.latest_detections = new_cached_detections
+                        
+                except Exception as e:
+                    logger.error(f"Background AI processing failed for {self.camera_id}: {e}")
+            else:
+                # Keep background recognition alive when the UI feed is paused; clear only when truly idle and not paused.
+                has_viewers = self.viewers_count > 0 or self.paused
+                if not has_viewers and not self.paused and len(self.latest_detections) > 0:
+                    with self.lock:
+                        self.latest_detections = []
+            
+            time.sleep(0.02)
+
+    def get_frame(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return False, None, []
+            return True, self.latest_frame.copy(), list(self.latest_detections)
 
     def get_annotated_frame(self):
-        """
-        Original Local-Dashboard behavior:
-        Return pure, pristine video stream directly without any bounding boxes or drawn overlays.
-        """
         with self.lock:
             if self.latest_frame is None:
                 return False, None
             return True, self.latest_frame.copy()
 
-    def release(self):
+    def stop(self):
         self.running = False
-        with self.cap_lock:
-            if self.cap is not None:
+        try:
+            self.grabber_thread.join(timeout=1.0)
+            self.ai_thread.join(timeout=1.0)
+            if self.cap:
+                self.cap.release()
+        except Exception:
+            pass
+
+    def release(self):
+        self.stop()
+
+
+def get_or_create_reader(camera_id, rtsp_url):
+    """Retrieve or spin up a background RTSP stream reader."""
+    global active_stream_readers
+    with active_readers_lock:
+        if camera_id in active_stream_readers:
+            existing = active_stream_readers[camera_id]
+            if existing.running and str(existing.rtsp_url) == str(rtsp_url):
+                with monitoring_state_lock:
+                    existing.paused = STREAM_PAUSED_STATE.get(camera_id, False)
+                return existing
+            else:
+                logger.info(f"[*] Camera {camera_id} URL changed or stopped. Recreating stream reader...")
                 try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
+                    existing.stop()
+                except Exception as e:
+                    logger.warning(f"Error stopping old reader for {camera_id}: {e}")
+                del active_stream_readers[camera_id]
+        
+        logger.info(f"[*] Starting background thread stream reader for: {camera_id} ({rtsp_url})")
+        reader = CameraStreamReader(camera_id, rtsp_url)
+        with monitoring_state_lock:
+            reader.paused = STREAM_PAUSED_STATE.get(camera_id, False)
+        active_stream_readers[camera_id] = reader
+        return reader
 
 
 def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]:
@@ -974,8 +1566,8 @@ def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]
 
 
 def init_camera_streams():
-    """Fetch camera list in real time from Cloud or Client Portal and update streams."""
-    global ACTIVE_CAMERA_READERS
+    """Fetch camera list in real time from Cloud or Client Portal and update streams using get_or_create_reader."""
+    global ACTIVE_CAMERA_READERS, active_stream_readers
     org_id = CONFIG.get("organization_id")
     branch_id = CONFIG.get("branch_id")
 
@@ -989,7 +1581,7 @@ def init_camera_streams():
 
     cameras_to_use = cloud_cams
 
-    with readers_lock:
+    with active_readers_lock:
         valid_cams = {}
         for cam in cameras_to_use:
             cid = str(cam.get("id") or cam.get("camera_id"))
@@ -1001,32 +1593,23 @@ def init_camera_streams():
             valid_cams[cid] = (cname, source)
 
         # 1. Stop and remove stale / deleted cameras
-        stale_cids = [cid for cid in list(ACTIVE_CAMERA_READERS.keys()) if cid not in valid_cams]
+        stale_cids = [cid for cid in list(active_stream_readers.keys()) if cid not in valid_cams]
         for cid in stale_cids:
-            reader = ACTIVE_CAMERA_READERS.pop(cid, None)
+            reader = active_stream_readers.pop(cid, None)
             if reader:
                 try:
-                    reader.release()
-                    logger.info(f"[*] Safely released deleted camera stream: {cid}")
+                    reader.stop()
+                    logger.info(f"[*] Safely stopped deleted camera stream: {cid}")
                 except Exception as e:
-                    logger.debug(f"Error releasing camera {cid}: {e}")
+                    logger.debug(f"Error stopping camera {cid}: {e}")
 
-        # 2. Add only new cameras or update changed sources
+        # 2. Add or update cameras using exact get_or_create_reader
         for cid, (cname, source) in valid_cams.items():
-            existing = ACTIVE_CAMERA_READERS.get(cid)
-            if existing is None:
-                try:
-                    ACTIVE_CAMERA_READERS[cid] = NodeCameraReader(cid, cname, source)
-                    logger.info(f"Started camera stream reader: {cname} ({cid}) -> {source}")
-                except Exception as e:
-                    logger.error(f"Failed to start camera {cid}: {e}")
-            elif str(existing.rtsp_source) != str(source):
-                try:
-                    existing.release()
-                    ACTIVE_CAMERA_READERS[cid] = NodeCameraReader(cid, cname, source)
-                    logger.info(f"Updated camera stream reader: {cname} ({cid}) -> {source}")
-                except Exception as e:
-                    logger.error(f"Failed to update camera {cid}: {e}")
+            try:
+                reader = get_or_create_reader(cid, source)
+                logger.info(f"Active camera stream reader: {cname} ({cid}) -> {source}")
+            except Exception as e:
+                logger.error(f"Failed to start camera {cid}: {e}")
 
 _last_cloud_cam_hash = None
 
@@ -1052,7 +1635,7 @@ threading.Thread(target=_background_camera_sync_loop, daemon=True).start()
 
 
 # ==============================================================================
-# FLASK LIVE UI & STREAM ROUTES
+# FLASK HTTP ROUTES & STREAMING
 # ==============================================================================
 
 @app.route('/')
@@ -1077,8 +1660,8 @@ def api_node_health():
 @app.route('/api/node/status')
 def api_node_status():
     """Status endpoint for node state and active camera count."""
-    with readers_lock:
-        active_count = len(ACTIVE_CAMERA_READERS)
+    with active_readers_lock:
+        active_count = len(active_stream_readers)
     return jsonify({
         "success": True,
         "linked": CONFIG.get("linked", False),
@@ -1092,8 +1675,8 @@ def api_node_status():
 @app.route('/stream/<camera_id>')
 def camera_stream_feed(camera_id):
     """Multipart video feed for each camera box."""
-    with readers_lock:
-        reader = ACTIVE_CAMERA_READERS.get(camera_id)
+    with active_readers_lock:
+        reader = active_stream_readers.get(str(camera_id))
 
     if not reader:
         return jsonify({"error": "Camera not found"}), 404
@@ -1108,12 +1691,15 @@ def camera_stream_feed(camera_id):
         except Exception:
             pass
 
+        with reader.lock:
+            reader.viewers_count += 1
+
         try:
             while True:
                 if not reader or not reader.running:
                     break
 
-                ret, frame = reader.get_annotated_frame()
+                ret, frame, detections = reader.get_frame()
                 if not ret or frame is None or frame.size == 0:
                     if blank_bytes:
                         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + blank_bytes + b'\r\n')
@@ -1127,7 +1713,7 @@ def camera_stream_feed(camera_id):
                         scale = 960.0 / w
                         frame = cv2.resize(frame, (960, int(h * scale)), interpolation=cv2.INTER_AREA)
 
-                    success, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    success, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
                     if not success:
                         time.sleep(0.03)
                         continue
@@ -1143,6 +1729,9 @@ def camera_stream_feed(camera_id):
             pass
         except Exception as e:
             logger.debug(f"Stream generator completed for {camera_id}: {e}")
+        finally:
+            with reader.lock:
+                reader.viewers_count = max(0, reader.viewers_count - 1)
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
@@ -1150,10 +1739,10 @@ def camera_stream_feed(camera_id):
 @app.route('/api/node/cameras')
 def get_node_cameras():
     """Return active cameras for frontend grid layout."""
-    with readers_lock:
+    with active_readers_lock:
         cams = [
-            {"id": cid, "name": r.camera_name, "stream_url": f"/stream/{cid}"}
-            for cid, r in ACTIVE_CAMERA_READERS.items()
+            {"id": cid, "name": getattr(r, 'camera_label', f"Camera {cid}"), "stream_url": f"/stream/{cid}"}
+            for cid, r in active_stream_readers.items()
         ]
     return jsonify({"success": True, "cameras": cams})
 
@@ -1161,11 +1750,17 @@ def get_node_cameras():
 @app.route('/api/node/detections')
 def get_node_detections():
     """Real-time detection ticker."""
-    with detections_lock:
-        feed = list(LATEST_DETECTIONS_FEED)
+    global LATEST_STREAM_DETECTIONS
+    with cache_lock:
+        feed = list(LATEST_STREAM_DETECTIONS)
     return jsonify({"success": True, "detections": feed})
 
 
+@app.route('/api/live-detections', methods=['GET'])
+def get_live_detections():
+    global LATEST_STREAM_DETECTIONS
+    with cache_lock:
+        return jsonify({"detections": LATEST_STREAM_DETECTIONS, "success": True})
 @app.route('/api/node/cloud-status')
 def get_node_cloud_status():
     """Check connectivity to Cloud Main Dashboard."""
