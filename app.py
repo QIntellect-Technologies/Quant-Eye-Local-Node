@@ -195,6 +195,8 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
     """
     Sync client employees from Cloud Portal and Main Cloud for this organization & branch.
     Ensures newly registered staff from Cloud Staff Directory immediately appear locally.
+    Crucially: If staff are deleted from Cloud (or count is 0), immediately deletes local
+    user records and cached face embeddings so local matches Cloud 100%.
     """
     if not org_id:
         return 0
@@ -202,6 +204,7 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
     cloud_clean = cloud_url.rstrip('/') if cloud_url else "https://quanteye-main-dashboard-production.up.railway.app"
     portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
     imported_count = 0
+    portal_queried_successfully = False
 
     # 1. Fetch staff members directly from Cloud Client Portal (/api/users)
     try:
@@ -216,6 +219,8 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
                 users = data.get("users", [])
+                portal_queried_successfully = True
+                
                 with sqlite3.connect(db.DB_PATH) as conn:
                     cur = conn.cursor()
                     try: cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
@@ -227,6 +232,43 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                     try: cur.execute("ALTER TABLE users ADD COLUMN position TEXT")
                     except Exception: pass
 
+                    cloud_ids = [int(u.get("id")) for u in users if u.get("id") is not None]
+
+                    if not cloud_ids:
+                        # Cloud has 0 staff for this organization -> purge all local staff and embeddings
+                        cur.execute("""
+                            DELETE FROM embeddings 
+                            WHERE user_id IN (
+                                SELECT id FROM users 
+                                WHERE organization_id = ? OR organization_id IS NULL OR organization_id = '' OR organization_id = 'DEFAULT_ORG'
+                            )
+                        """, (org_id,))
+                        cur.execute("""
+                            DELETE FROM users 
+                            WHERE organization_id = ? OR organization_id IS NULL OR organization_id = '' OR organization_id = 'DEFAULT_ORG'
+                        """, (org_id,))
+                        conn.commit()
+                        logger.info(f"[PORTAL SYNC] Cloud has 0 staff profiles. Cleared all local users & embeddings for {org_id}.")
+                        reload_face_cache()
+                        return 0
+
+                    # Cloud has active staff -> delete any local staff who no longer exist in Cloud
+                    placeholders = ','.join('?' for _ in cloud_ids)
+                    cur.execute(f"""
+                        DELETE FROM embeddings 
+                        WHERE user_id IN (
+                            SELECT id FROM users 
+                            WHERE (organization_id = ? OR organization_id IS NULL OR organization_id = '' OR organization_id = 'DEFAULT_ORG')
+                              AND id NOT IN ({placeholders})
+                        )
+                    """, [org_id] + cloud_ids)
+                    cur.execute(f"""
+                        DELETE FROM users 
+                        WHERE (organization_id = ? OR organization_id IS NULL OR organization_id = '' OR organization_id = 'DEFAULT_ORG')
+                          AND id NOT IN ({placeholders})
+                    """, [org_id] + cloud_ids)
+
+                    # Upsert active staff from Cloud
                     for u in users:
                         u_id = u.get("id")
                         u_name = (u.get("name") or f"User-{u_id}").strip()
@@ -239,7 +281,6 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                         u_branch = u.get("branch_id") or branch_id or "DEFAULT_BRANCH"
                         u_active = int(u.get("active", 1))
 
-                        # Check if user already exists by ID or Name
                         cur.execute("SELECT id FROM users WHERE id = ? OR name = ?", (u_id, u_name))
                         row = cur.fetchone()
                         if row:
@@ -259,7 +300,11 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
     except Exception as pe:
         logger.warning(f"[PORTAL SYNC] Note querying portal users: {pe}")
 
-    # 2. Also fetch branch employees directly from Main Cloud API
+    # If Cloud Portal query succeeded, do not run secondary or local fallback!
+    if portal_queried_successfully:
+        return imported_count
+
+    # 2. Secondary fallback: Fetch branch employees from Main Cloud API
     if branch_id:
         try:
             req_url = f"{cloud_clean}/api/branches/{branch_id}/employees?organization_id={org_id}"
@@ -270,11 +315,6 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                     employees = data.get("employees", [])
                     with sqlite3.connect(db.DB_PATH) as conn:
                         cur = conn.cursor()
-                        try: cur.execute("ALTER TABLE users ADD COLUMN organization_id TEXT")
-                        except Exception: pass
-                        try: cur.execute("ALTER TABLE users ADD COLUMN branch_id TEXT")
-                        except Exception: pass
-
                         for emp in employees:
                             emp_name = (emp.get("name") or "Employee").strip()
                             emp_code = emp.get("employee_code") or f"EMP-{emp.get('id')}"
@@ -300,25 +340,6 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                         conn.commit()
         except Exception as ce:
             logger.debug(f"[CLOUD SYNC] Note querying cloud employees: {ce}")
-
-    # 3. Fallback to local DB if available and imported_count == 0
-    try:
-        master_db = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Local-Dashboard", "attendance.db"))
-        if os.path.exists(master_db) and imported_count == 0:
-            with sqlite3.connect(master_db) as mconn, sqlite3.connect(db.DB_PATH) as conn:
-                mcur = mconn.cursor()
-                cur = conn.cursor()
-                mcur.execute("SELECT id, name, email, department, active, organization_id, branch_id FROM users WHERE organization_id = ?", (org_id,))
-                musers = mcur.fetchall()
-                for u in musers:
-                    cur.execute("""
-                        INSERT OR REPLACE INTO users (id, name, email, department, active, organization_id, branch_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, u)
-                conn.commit()
-                imported_count = len(musers)
-    except Exception as le:
-        logger.warning(f"Could not sync from local database: {le}")
 
     return imported_count
 
@@ -1644,11 +1665,22 @@ def api_node_train_video():
 
         # Sync registered embeddings to Cloud Portal so Staff Directory marks Training: Complete
         def _sync_embeddings_to_cloud(uid, embs, src_name):
+            p_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
+            # 1. Downsample embeddings to top 10 representative vectors to prevent network timeouts
+            sub_embs = []
+            if embs:
+                step = max(1, len(embs) // 10)
+                for i in range(0, len(embs), step):
+                    e = embs[i]
+                    sub_embs.append(e.tolist() if isinstance(e, np.ndarray) else list(e))
+                    if len(sub_embs) >= 10:
+                        break
+
+            # 2. Push to sync-embeddings endpoint
             try:
-                p_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
                 sync_ep = f"{p_url}/api/users/{uid}/sync-embeddings"
                 post_payload = json.dumps({
-                    "embeddings": [e.tolist() if isinstance(e, np.ndarray) else list(e) for e in embs],
+                    "embeddings": sub_embs,
                     "source": src_name
                 }).encode('utf-8')
                 s_req = urllib.request.Request(sync_ep, data=post_payload, headers={
@@ -1658,11 +1690,27 @@ def api_node_train_video():
                     "X-Organization-Id": CONFIG.get("organization_id", ""),
                     "X-Branch-Id": CONFIG.get("branch_id", "")
                 }, method="POST")
-                with urllib.request.urlopen(s_req, timeout=5.0) as s_resp:
+                with urllib.request.urlopen(s_req, timeout=15.0) as s_resp:
                     if s_resp.status == 200:
                         logger.info(f"[CLOUD SYNC] Synced biometric profile to Cloud Portal for user {uid}")
             except Exception as se:
                 logger.warning(f"[CLOUD SYNC] Note syncing biometric profile to Cloud Portal: {se}")
+
+            # 3. Direct mark-trained call guarantees Cloud DB marks Training Complete even on high network latency
+            try:
+                mark_ep = f"{p_url}/api/users/{uid}/mark-trained"
+                m_req = urllib.request.Request(mark_ep, data=b"{}", headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "QuantEye-Node",
+                    "X-Client-Auth": "true",
+                    "X-Organization-Id": CONFIG.get("organization_id", ""),
+                    "X-Branch-Id": CONFIG.get("branch_id", "")
+                }, method="POST")
+                with urllib.request.urlopen(m_req, timeout=10.0) as m_resp:
+                    if m_resp.status == 200:
+                        logger.info(f"[CLOUD SYNC] Successfully confirmed Training Complete on Cloud Portal for user {uid}")
+            except Exception as me:
+                logger.debug(f"[CLOUD SYNC] Note calling mark-trained: {me}")
 
         threading.Thread(target=_sync_embeddings_to_cloud, args=(user_id, embeddings, f"video_enroll_{video_file.filename}"), daemon=True).start()
 

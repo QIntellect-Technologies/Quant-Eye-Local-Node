@@ -1738,6 +1738,7 @@
           pendingStaffList = data.pending || [];
           const pendingCount = data.pending_count || 0;
           const totalCount = data.total_count || 0;
+          const enrolledCount = Math.max(0, totalCount - pendingCount);
 
           // Update Counter Badges
           const sbBadge = document.getElementById('sidebarPendingBadge');
@@ -1747,6 +1748,17 @@
           const statTot = document.getElementById('statTotalStaffCount');
           if (statTot) statTot.textContent = totalCount;
 
+          const statAi = document.getElementById('statAiActiveCount');
+          if (statAi) {
+            if (totalCount === 0 || enrolledCount === 0) {
+              statAi.textContent = '0 Active';
+              statAi.style.color = '#94a3b8';
+            } else {
+              statAi.textContent = `${enrolledCount} Active`;
+              statAi.style.color = '#10b981';
+            }
+          }
+
           renderPendingStaffRows();
           if (forceSync) showToast(`Synced profiles! ${pendingCount} staff pending registration.`, 'success');
         }
@@ -1754,39 +1766,6 @@
         console.error('Error loading pending queue:', e);
       }
     }
-
-    function renderPendingStaffRows() {
-      const tbody = document.getElementById('pendingTableBody');
-      if (!tbody) return;
-
-      const q = (document.getElementById('pendingSearchInput')?.value || '').toLowerCase().trim();
-      const filtered = pendingStaffList.filter(s => {
-        if (!q) return true;
-        return (s.name || '').toLowerCase().includes(q) ||
-               (s.department || '').toLowerCase().includes(q) ||
-               (s.employee_code || '').toLowerCase().includes(q) ||
-               String(s.id).includes(q);
-      });
-
-      const countEl = document.getElementById('pendingShowingCount');
-      if (countEl) countEl.textContent = filtered.length;
-
-      if (filtered.length === 0) {
-        if (pendingStaffList.length === 0) {
-          tbody.innerHTML = `
-            <tr>
-              <td colspan="7" style="text-align:center; padding:40px; color:#10b981;">
-                <i class="fa-solid fa-circle-check" style="font-size:2.5rem; margin-bottom:10px; display:block;"></i>
-                <h5 style="font-weight:800; color:#0f172a; margin-bottom:4px;">All Staff Biometric Registrations Complete!</h5>
-                <p style="font-size:0.84rem; color:#64748b; margin:0;">No staff members are currently pending registration. Live AI recognition is active for all registered employees.</p>
-              </td>
-            </tr>
-          `;
-        } else {
-          tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:24px; color:#64748b;">No matching staff found for "${q}".</td></tr>`;
-        }
-        return;
-      }
 
     const activeTrainingStaff = new Map();
 

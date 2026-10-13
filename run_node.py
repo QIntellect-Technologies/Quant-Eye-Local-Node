@@ -21,26 +21,13 @@ def main():
     url = f"http://127.0.0.1:{port}"
     
     def open_browser():
-        time.sleep(2.0)
+        time.sleep(0.8)
         print(f"[OK] Opening Live AI Attendance Window at {url}")
         try:
-            # Try launching in app mode (clean dedicated window without browser URL bar)
-            chrome_paths = [
-                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
-            ]
-            launched = False
-            for p in chrome_paths:
-                if os.path.exists(p):
-                    subprocess.Popen([p, f"--app={url}"])
-                    launched = True
-                    break
-            if not launched:
-                webbrowser.open(url)
-        except Exception:
+            # Use native default browser for instant non-blocking load
             webbrowser.open(url)
+        except Exception:
+            pass
 
     threading.Thread(target=open_browser, daemon=True).start()
     start_client_node(port=port)
