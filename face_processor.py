@@ -6,10 +6,9 @@ import numpy.typing as npt
 import insightface
 from pathlib import Path
 from typing import Any, List, Tuple, Optional, Dict
-from ultralytics import YOLO
 from logger_config import get_logger
 from config import (
-    YOLO_MODEL, INSIGHTFACE_MODEL, MODELS_DIR,
+    INSIGHTFACE_MODEL, MODELS_DIR,
     FACE_DETECTION_CONFIDENCE, FACE_QUALITY_THRESHOLD,
     ANTI_SPOOFING_ENABLED, ENABLE_GPU
 )

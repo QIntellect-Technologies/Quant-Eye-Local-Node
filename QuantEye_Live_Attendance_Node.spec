@@ -12,8 +12,7 @@ a = Analysis(
         ('templates', 'templates'),
         ('static', 'static'),
         ('models', 'models'),
-        ('config_node.json', '.'),
-        ('attendance.db', '.')
+        ('config_node.json', '.')
     ],
     hiddenimports=[
         'cv2',
@@ -29,6 +28,22 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        'torch',
+        'torchvision',
+        'torchaudio',
+        'ultralytics',
+        'catboost',
+        'polars',
+        '_polars_runtime_32',
+        'pyarrow',
+        'llvmlite',
+        'numba',
+        'faiss',
+        'faiss_cpu',
+        'boto3',
+        'botocore',
+        'pandas',
+        'plotly',
         'tensorflow',
         'keras',
         'tensorboard',
@@ -36,8 +51,6 @@ a = Analysis(
         'diffusers',
         'sentencepiece',
         'transformers',
-        'torchaudio',
-        'torchvision',
         'nltk',
         'spacy',
         'yt_dlp',
@@ -49,6 +62,21 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+# --- Size optimisation for portable client builds -------------------------
+# The CUDA stack (cuBLAS/cuFFT + ORT CUDA provider, ~1.3 GB) cannot run on a
+# client PC anyway without a system-wide CUDA 11 + full cuDNN 8 install, so
+# ONNX Runtime falls back to CPU. Strip it, plus the duplicate model zip.
+_CUDA_DLL_PREFIXES = ('cublas', 'cufft', 'cudart', 'cudnn', 'curand', 'cusparse',
+                      'cusolver', 'nvrtc', 'nvinfer', 'nvonnxparser')
+_CUDA_EXACT = ('onnxruntime_providers_cuda.dll', 'onnxruntime_providers_tensorrt.dll')
+
+def _is_cuda_bin(dest):
+    name = os.path.basename(dest).lower()
+    return name in _CUDA_EXACT or name.startswith(_CUDA_DLL_PREFIXES)
+
+a.binaries = [b for b in a.binaries if not _is_cuda_bin(b[0])]
+a.datas = [d for d in a.datas if not d[0].replace('\\', '/').lower().endswith('buffalo_l.zip')]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
