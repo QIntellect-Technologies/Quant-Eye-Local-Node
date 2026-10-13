@@ -113,10 +113,10 @@ EMBEDDING_CACHE = {}
 ENROLLED_MATRIX = None
 ENROLLED_USER_IDS = []
 ENROLLED_USER_METADATA = []
-cache_lock = threading.Lock()
+cache_lock = threading.RLock()
 
 ACTIVE_CAMERA_READERS: Dict[str, Any] = {}
-readers_lock = threading.Lock()
+readers_lock = threading.RLock()
 
 LATEST_DETECTIONS_FEED: List[Dict[str, Any]] = []
 detections_lock = threading.Lock()
@@ -487,10 +487,10 @@ MANUALLY_ABSENT_USERS = set()
 DETECTED_USERS_SESSION = set()
 LATEST_STREAM_DETECTIONS = []
 STREAM_PAUSED_STATE = {}
-monitoring_state_lock = threading.Lock()
+monitoring_state_lock = threading.RLock()
 active_stream_readers = {}
-active_readers_lock = threading.Lock()
-today_logged_lock = threading.Lock()
+active_readers_lock = threading.RLock()
+today_logged_lock = threading.RLock()
 
 ACTIVE_CAMERA_READERS = active_stream_readers
 readers_lock = active_readers_lock
@@ -1581,19 +1581,19 @@ def init_camera_streams():
 
     cameras_to_use = cloud_cams
 
-    with active_readers_lock:
-        valid_cams = {}
-        for cam in cameras_to_use:
-            cid = str(cam.get("id") or cam.get("camera_id"))
-            cname = cam.get("name") or cam.get("camera_name", f"Camera {cid}")
-            raw_source = cam.get("rtsp_url")
-            source = "" if raw_source is None else str(raw_source).strip()
-            cam_type = str(cam.get("camera_type", "rtsp")).lower()
-            if not source or (source == "0" and cam_type != "webcam"):
-                continue
-            valid_cams[cid] = (cname, source)
+    valid_cams = {}
+    for cam in cameras_to_use:
+        cid = str(cam.get("id") or cam.get("camera_id"))
+        cname = cam.get("name") or cam.get("camera_name", f"Camera {cid}")
+        raw_source = cam.get("rtsp_url")
+        source = "" if raw_source is None else str(raw_source).strip()
+        cam_type = str(cam.get("camera_type", "rtsp")).lower()
+        if not source or (source == "0" and cam_type != "webcam"):
+            continue
+        valid_cams[cid] = (cname, source)
 
-        # 1. Stop and remove stale / deleted cameras
+    # 1. Stop and remove stale / deleted cameras under lock
+    with active_readers_lock:
         stale_cids = [cid for cid in list(active_stream_readers.keys()) if cid not in valid_cams]
         for cid in stale_cids:
             reader = active_stream_readers.pop(cid, None)
@@ -1604,13 +1604,13 @@ def init_camera_streams():
                 except Exception as e:
                     logger.debug(f"Error stopping camera {cid}: {e}")
 
-        # 2. Add or update cameras using exact get_or_create_reader
-        for cid, (cname, source) in valid_cams.items():
-            try:
-                reader = get_or_create_reader(cid, source)
-                logger.info(f"Active camera stream reader: {cname} ({cid}) -> {source}")
-            except Exception as e:
-                logger.error(f"Failed to start camera {cid}: {e}")
+    # 2. Add or update cameras using exact get_or_create_reader (outside lock, handles its own lock and hardware capture)
+    for cid, (cname, source) in valid_cams.items():
+        try:
+            reader = get_or_create_reader(cid, source)
+            logger.info(f"Active camera stream reader: {cname} ({cid}) -> {source}")
+        except Exception as e:
+            logger.error(f"Failed to start camera {cid}: {e}")
 
 _last_cloud_cam_hash = None
 
@@ -1738,13 +1738,22 @@ def camera_stream_feed(camera_id):
 
 
 @app.route('/api/node/cameras')
+@app.route('/api/cameras')
 def get_node_cameras():
     """Return active cameras for frontend grid layout."""
+    cams = []
     with active_readers_lock:
-        cams = [
-            {"id": cid, "name": getattr(r, 'camera_label', f"Camera {cid}"), "stream_url": f"/stream/{cid}"}
-            for cid, r in active_stream_readers.items()
-        ]
+        for cid, r in active_stream_readers.items():
+            cname = getattr(r, 'camera_label', None) or getattr(r, 'camera_name', f"Camera {cid}")
+            cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
+
+    # If stream readers are still connecting in background, provide configured cameras immediately
+    if not cams:
+        for c in CONFIG.get("cameras", []):
+            cid = str(c.get("id") or c.get("camera_id"))
+            cname = c.get("name") or c.get("camera_name", f"Camera {cid}")
+            cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
+
     return jsonify({"success": True, "cameras": cams})
 
 
@@ -2056,11 +2065,16 @@ def api_node_cameras_refresh():
     """Dynamically re-pull cloud camera settings and reload local streams."""
     try:
         init_camera_streams()
+        cams = []
         with readers_lock:
-            cams = [
-                {"id": cid, "name": r.camera_name, "stream_url": f"/stream/{cid}"}
-                for cid, r in ACTIVE_CAMERA_READERS.items()
-            ]
+            for cid, r in ACTIVE_CAMERA_READERS.items():
+                cname = getattr(r, 'camera_label', None) or getattr(r, 'camera_name', f"Camera {cid}")
+                cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
+        if not cams:
+            for c in CONFIG.get("cameras", []):
+                cid = str(c.get("id") or c.get("camera_id"))
+                cname = c.get("name") or c.get("camera_name", f"Camera {cid}")
+                cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
         return jsonify({
             "success": True,
             "message": f"Successfully re-synced {len(cams)} cameras from Cloud",
