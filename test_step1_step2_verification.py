@@ -499,7 +499,8 @@ class TestStep1And2ClientNode(unittest.TestCase):
         for field, expected in clean_config.items():
             self.assertEqual(example_config[field], expected)
 
-        dist_dir = os.path.join(client_node_dir, "dist")
+        # Existing dist folders may contain a client's persisted activation state.
+        dist_dir = os.path.join(client_node_dir, "dist", "camera_sync_build")
         for package_name in (
             "QuantEye_Client_Node_CPU",
             "QuantEye_Client_Node_GPU",
