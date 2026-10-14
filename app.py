@@ -1611,8 +1611,6 @@ def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]
     If cameras were deleted on Cloud, returns empty list [] to clear local streams immediately.
     """
     cloud_url = CONFIG.get('cloud_url', 'https://quanteye-main-dashboard-production.up.railway.app').rstrip('/')
-    portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
-
     collected_cams: Dict[str, Dict[str, Any]] = {}
     query_successful = False
 
@@ -1637,39 +1635,25 @@ def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]
         c_copy["rtsp_url"] = url
         collected_cams[primary_id] = c_copy
 
-    # 1. Fetch from Client Portal Cloud (branch & org filtered)
-    if org_id and branch_id:
-        try:
-            req_url = f"{portal_url}/api/cameras?active_only=true&organization_id={urllib.parse.quote(org_id)}&branch_id={urllib.parse.quote(branch_id)}"
-            req = urllib.request.Request(req_url, headers={
-                "User-Agent": "QuantEye-Node",
-                "X-Client-Auth": "true",
-                "X-Organization-Id": org_id,
-                "X-Branch-Id": branch_id
-            }, method="GET")
-            with urllib.request.urlopen(req, timeout=3.5) as resp:
-                if resp.status == 200:
-                    query_successful = True
-                    p_cams = json.loads(resp.read().decode('utf-8'))
-                    if isinstance(p_cams, list):
-                        for c in p_cams:
-                            _add_cam(c)
-        except Exception as pe:
-            logger.debug(f"[PORTAL SYNC] Client portal camera query note: {pe}")
-
-    # 2. Fetch from Cloud Main Dashboard
+    # The Main Dashboard proxies portal cameras using its server-side integration key.
     if org_id and branch_id:
         try:
             cloud_cams_url = f"{cloud_url}/api/branches/{branch_id}/cameras?organization_id={urllib.parse.quote(org_id)}"
-            req = urllib.request.Request(cloud_cams_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
+            branch_key = str(CONFIG.get("branch_key") or "").strip()
+            req = urllib.request.Request(
+                cloud_cams_url,
+                headers={"User-Agent": "QuantEye-Node", "X-Branch-Key": branch_key},
+                method="GET",
+            )
             with urllib.request.urlopen(req, timeout=3.5) as resp:
                 if resp.status == 200:
-                    query_successful = True
                     data = json.loads(resp.read().decode('utf-8'))
-                    for c in data.get("cameras", []):
-                        _add_cam(c)
+                    if data.get("success") and isinstance(data.get("cameras"), list):
+                        query_successful = True
+                        for c in data["cameras"]:
+                            _add_cam(c)
         except Exception as ce:
-            logger.debug(f"[CLOUD SYNC] Main cloud camera query note: {ce}")
+            logger.warning(f"[CLOUD SYNC] Main Dashboard camera query failed; preserving cached cameras: {ce}")
 
     # If remote queries succeeded, return the exact live camera list (even if empty [])
     if query_successful:
@@ -2164,6 +2148,15 @@ def api_node_login_auth():
         requested_tenant = (str(org_id).strip(), str(branch_id).strip())
         if CONFIG.get("linked") and active_tenant != requested_tenant:
             _clear_node_tenant_runtime_state()
+
+        # Keep the last-known camera list only when reconnecting to the same tenant
+        # and activation could not retrieve the current cloud configuration.
+        if (
+            val_data.get("camera_sync_available") is False
+            and active_tenant == requested_tenant
+            and not cameras
+        ):
+            cameras = CONFIG.get("cameras", [])
 
         # Update runtime config
         CONFIG['linked'] = True

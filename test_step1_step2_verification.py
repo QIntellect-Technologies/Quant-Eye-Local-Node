@@ -162,6 +162,46 @@ class TestStep1And2ClientNode(unittest.TestCase):
         self.assertTrue(data['success'])
         self.assertIn('cameras', data)
 
+    @patch('urllib.request.urlopen')
+    def test_camera_sync_authenticates_branch_and_preserves_cache_on_failure(self, mock_urlopen):
+        cached_camera = {"id": "cam-cached", "rtsp_url": "rtsp://camera.local/stream"}
+        client_app.CONFIG.update({
+            "cloud_url": "http://cloud.test",
+            "branch_key": "QE-TEST-BRANCH-KEY",
+            "cameras": [cached_camera],
+        })
+        mock_urlopen.side_effect = OSError("cloud is unavailable")
+
+        cameras = client_app.fetch_all_cloud_cameras("ORG-TEST", "BR-TEST")
+        self.assertEqual(len(cameras), 1)
+        self.assertEqual(cameras[0]["id"], cached_camera["id"])
+        self.assertEqual(cameras[0]["rtsp_url"], cached_camera["rtsp_url"])
+        request = mock_urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("X-branch-key"), "QE-TEST-BRANCH-KEY")
+
+    @patch('urllib.request.urlopen')
+    def test_authoritative_empty_camera_sync_clears_cache(self, mock_urlopen):
+        class MockResponse:
+            status = 200
+
+            def read(self):
+                return b'{"success": true, "cameras": []}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        client_app.CONFIG.update({
+            "cloud_url": "http://cloud.test",
+            "branch_key": "QE-TEST-BRANCH-KEY",
+            "cameras": [{"id": "cam-stale", "rtsp_url": "rtsp://camera.local/stale"}],
+        })
+        mock_urlopen.return_value = MockResponse()
+
+        self.assertEqual(client_app.fetch_all_cloud_cameras("ORG-TEST", "BR-TEST"), [])
+
     def test_logout_clears_active_organization_runtime_state(self):
         client_app.CONFIG.update({
             "linked": True,

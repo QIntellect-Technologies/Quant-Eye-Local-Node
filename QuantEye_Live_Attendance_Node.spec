@@ -12,9 +12,6 @@ a = Analysis(
         ('templates', 'templates'),
         ('static', 'static'),
         ('models', 'models')
-        and os.path.basename(d[0]).lower() not in {
-            'config_node.json', 'config_node_dev_backup.json', 'config_clean.json'
-        }
     ],
     hiddenimports=[
         'cv2',
@@ -64,6 +61,14 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+a.datas = [
+    d for d in a.datas
+    if not d[0].replace('\\', '/').lower().endswith('buffalo_l.zip')
+    and os.path.basename(d[0]).lower() not in {
+        'config_node.json', 'config_node_dev_backup.json', 'config_clean.json'
+    }
+]
 
 # --- Size optimisation for portable client builds -------------------------
 # The CUDA stack (cuBLAS/cuFFT + ORT CUDA provider, ~1.3 GB) cannot run on a

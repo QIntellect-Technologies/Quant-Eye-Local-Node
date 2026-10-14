@@ -36,6 +36,8 @@ The example config is intentionally clean and contains no organization, branch k
 
 Attendance events are persisted in the local SQLite `client_cloud_delivery` outbox before delivery. Failed requests remain pending with bounded exponential backoff and the original event ID, so retries are idempotent and survive node restarts. If SQLite itself is unavailable, the event cannot be durably queued; the node logs this as a critical delivery error rather than reporting it as delivered.
 
+Camera configuration is fetched through the Main Dashboard using the node's saved branch key. The Main Dashboard retrieves only that branch's active cameras from the Client Portal with its server-side integration key; that integration key is never stored in or sent to the EXE. A successful empty response clears deleted cameras, while an unavailable cloud source preserves the node's last-known camera configuration.
+
 ### 3. Launching the Node
 
 Run the standalone desktop launcher:
