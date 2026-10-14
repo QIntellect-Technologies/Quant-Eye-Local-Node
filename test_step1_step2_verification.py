@@ -478,6 +478,15 @@ class TestStep1And2ClientNode(unittest.TestCase):
             {"embeddings": [[0.25] * 512], "source": "training-test"},
         )
 
+    def test_live_attendance_header_does_not_show_shift_timing(self):
+        template_path = os.path.join(client_node_dir, "templates", "live_node.html")
+        with open(template_path, "r", encoding="utf-8") as template_file:
+            template = template_file.read()
+
+        self.assertNotIn("headerShiftBadge", template)
+        self.assertNotIn("headerShiftText", template)
+        self.assertNotIn("loadActiveShiftTiming", template)
+
     def test_cloud_staff_sync_imports_branch_profiles_through_authenticated_relay(self):
         client_app.CONFIG.update({
             "linked": True,

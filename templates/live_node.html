@@ -1096,11 +1096,6 @@
           <span id="headerBranchNameText">{% if config.get('linked') %}{{ config.get('organization_name', '') }} &bull; {{ config.get('branch_name', '') }}{% else %}Not Linked &bull; Click to Connect{% endif %}</span>
         </span>
         <span class="header-separator">|</span>
-        <span id="headerShiftBadge" style="display:inline-flex; align-items:center; gap:6px; background:#eff6ff; color:#1d4ed8; padding:4px 12px; border-radius:8px; font-weight:700; font-size:0.82rem; border:1px solid #bfdbfe;" title="Active Cloud Shift Timing">
-          <i class="fa-solid fa-clock" style="color:#2563eb;"></i>
-          <span id="headerShiftText">Loading Shift...</span>
-        </span>
-        <span class="header-separator">|</span>
         <span class="header-current-page" id="headerCurrentPageTitle">Live AI Attendance</span>
       </div>
 
@@ -1466,20 +1461,6 @@
       }
     }
 
-    // Active Shift Timing Sync
-    async function loadActiveShiftTiming() {
-      try {
-        const res = await fetch('/api/node/shift');
-        const data = await res.json();
-        const textEl = document.getElementById('headerShiftText');
-        if (data.success && data.shift && textEl) {
-          textEl.textContent = data.shift.display || `${data.shift.name} (${data.shift.formatted})`;
-        }
-      } catch (e) {
-        console.debug('Shift fetch note:', e);
-      }
-    }
-
     // Real-Time Camera Management & Auto-Sync
     async function loadCameras() {
       try {
@@ -1672,7 +1653,6 @@
               renderCameraGrid();
             }
           }
-          loadActiveShiftTiming();
           if (data.attendance_sync_error) {
             showToast(
               `Staff and cameras synced (${data.employee_count} employees, ${allCameras.length} cameras). ${data.attendance_sync_error}`,
@@ -2029,14 +2009,12 @@
       openActivationModal();
       {% endif %}
       loadCameras();
-      loadActiveShiftTiming();
       loadPendingStaffQueue();
       pollLiveDetections();
 
       // Fast Real-Time Polls (Auto-syncs changes without manual refresh)
       setInterval(loadCameras, 1500);
       setInterval(pollLiveDetections, 1500);
-      setInterval(loadActiveShiftTiming, 30000);
       setInterval(() => loadPendingStaffQueue(false), 20000);
     });
   </script>
