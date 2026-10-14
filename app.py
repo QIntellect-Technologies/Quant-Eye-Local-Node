@@ -308,9 +308,12 @@ def _cloud_attendance_state_sync_worker() -> None:
         if CONFIG.get("linked") and CONFIG.get("branch_key"):
             try:
                 apply_cloud_attendance_sync_state()
-            except Exception:
-                logger.warning("Could not synchronize cloud attendance state; it will be retried.", exc_info=True)
-        _cloud_state_sync_shutdown.wait(timeout=3.0)
+            except Exception as error:
+                logger.warning(
+                    "Could not synchronize cloud attendance state; retrying in 30 seconds: %s",
+                    error,
+                )
+        _cloud_state_sync_shutdown.wait(timeout=30.0)
 
 
 # ==============================================================================
@@ -2167,7 +2170,16 @@ def api_node_cameras_refresh():
 
         imported_count = sync_client_profiles_from_cloud(org_id, branch_id, cloud_url)
         reload_face_cache()
-        attendance_state = apply_cloud_attendance_sync_state()
+        attendance_state = None
+        attendance_sync_error = None
+        try:
+            attendance_state = apply_cloud_attendance_sync_state()
+        except Exception as error:
+            attendance_sync_error = "Attendance status sync is temporarily unavailable and will retry."
+            logger.warning(
+                "Attendance-state sync failed during camera refresh; preserving camera and staff sync results.",
+                exc_info=True,
+            )
         init_camera_streams()
         cams = []
         with readers_lock:
@@ -2183,8 +2195,9 @@ def api_node_cameras_refresh():
             "success": True,
             "message": "Cloud employees, attendance state, and cameras synchronized",
             "employee_count": imported_count,
-            "manual_absent_count": attendance_state["manual_absent_count"],
-            "attendance_updates_applied": attendance_state["updated_local_count"],
+            "manual_absent_count": attendance_state["manual_absent_count"] if attendance_state else 0,
+            "attendance_updates_applied": attendance_state["updated_local_count"] if attendance_state else 0,
+            "attendance_sync_error": attendance_sync_error,
             "camera_count": len(cams),
             "cameras": cams
         })
@@ -2574,6 +2587,62 @@ def api_node_pending_staff():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def sync_trained_embeddings_to_cloud(user_id: str, embeddings: List[Any], source_name: str) -> bool:
+    """Send trained face vectors through Main Dashboard's branch-key authenticated relay."""
+    branch_id = str(CONFIG.get("branch_id") or "").strip()
+    branch_key = str(CONFIG.get("branch_key") or "").strip()
+    if not branch_id or not branch_key:
+        logger.error("Cannot relay trained embeddings: node branch credentials are missing.")
+        return False
+
+    sub_embeddings = []
+    if embeddings:
+        step = max(1, len(embeddings) // 10)
+        for index in range(0, len(embeddings), step):
+            embedding = embeddings[index]
+            sub_embeddings.append(
+                embedding.tolist() if isinstance(embedding, np.ndarray) else list(embedding)
+            )
+            if len(sub_embeddings) >= 10:
+                break
+
+    try:
+        cloud_base_url = _validate_dashboard_url(
+            str(CONFIG.get("cloud_url") or DEFAULT_CLOUD_URL)
+        )
+        sync_url = (
+            f"{cloud_base_url}/api/edge/branches/{branch_id}/employees/"
+            f"{int(user_id)}/embeddings"
+        )
+        payload = json.dumps({
+            "embeddings": sub_embeddings,
+            "source": source_name,
+        }).encode("utf-8")
+        sync_request = urllib.request.Request(
+            sync_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "QuantEye-Node",
+                "X-Branch-Key": branch_key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(sync_request, timeout=15.0) as response:
+            confirmation = json.loads(response.read().decode("utf-8"))
+            if response.status != 200 or confirmation.get("success") is not True:
+                raise RuntimeError("Main Dashboard did not confirm biometric synchronization.")
+            logger.info(
+                "[CLOUD SYNC] Synced %s biometric vectors for employee %s.",
+                confirmation.get("synced_count", len(sub_embeddings)),
+                user_id,
+            )
+            return True
+    except Exception:
+        logger.exception("[CLOUD SYNC] Could not sync biometric training for employee %s.", user_id)
+        return False
+
+
 @app.route('/api/node/train-video', methods=['POST'])
 def api_node_train_video():
     """
@@ -2629,56 +2698,11 @@ def api_node_train_video():
         reload_face_cache()
         logger.info(f"[BIOMETRIC ENROLL SUCCESS] Enrolled biometric profile for user {user_id} ({saved_count} frames)")
 
-        # Sync registered embeddings to Cloud Portal so Staff Directory marks Training: Complete
-        def _sync_embeddings_to_cloud(uid, embs, src_name):
-            p_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
-            # 1. Downsample embeddings to top 10 representative vectors to prevent network timeouts
-            sub_embs = []
-            if embs:
-                step = max(1, len(embs) // 10)
-                for i in range(0, len(embs), step):
-                    e = embs[i]
-                    sub_embs.append(e.tolist() if isinstance(e, np.ndarray) else list(e))
-                    if len(sub_embs) >= 10:
-                        break
-
-            # 2. Push to sync-embeddings endpoint
-            try:
-                sync_ep = f"{p_url}/api/users/{uid}/sync-embeddings"
-                post_payload = json.dumps({
-                    "embeddings": sub_embs,
-                    "source": src_name
-                }).encode('utf-8')
-                s_req = urllib.request.Request(sync_ep, data=post_payload, headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "QuantEye-Node",
-                    "X-Client-Auth": "true",
-                    "X-Organization-Id": CONFIG.get("organization_id", ""),
-                    "X-Branch-Id": CONFIG.get("branch_id", "")
-                }, method="POST")
-                with urllib.request.urlopen(s_req, timeout=15.0) as s_resp:
-                    if s_resp.status == 200:
-                        logger.info(f"[CLOUD SYNC] Synced biometric profile to Cloud Portal for user {uid}")
-            except Exception as se:
-                logger.warning(f"[CLOUD SYNC] Note syncing biometric profile to Cloud Portal: {se}")
-
-            # 3. Direct mark-trained call guarantees Cloud DB marks Training Complete even on high network latency
-            try:
-                mark_ep = f"{p_url}/api/users/{uid}/mark-trained"
-                m_req = urllib.request.Request(mark_ep, data=b"{}", headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "QuantEye-Node",
-                    "X-Client-Auth": "true",
-                    "X-Organization-Id": CONFIG.get("organization_id", ""),
-                    "X-Branch-Id": CONFIG.get("branch_id", "")
-                }, method="POST")
-                with urllib.request.urlopen(m_req, timeout=10.0) as m_resp:
-                    if m_resp.status == 200:
-                        logger.info(f"[CLOUD SYNC] Successfully confirmed Training Complete on Cloud Portal for user {uid}")
-            except Exception as me:
-                logger.debug(f"[CLOUD SYNC] Note calling mark-trained: {me}")
-
-        threading.Thread(target=_sync_embeddings_to_cloud, args=(user_id, embeddings, f"video_enroll_{video_file.filename}"), daemon=True).start()
+        threading.Thread(
+            target=sync_trained_embeddings_to_cloud,
+            args=(user_id, embeddings, f"video_enroll_{video_file.filename}"),
+            daemon=True,
+        ).start()
 
         return jsonify({
             "success": True,

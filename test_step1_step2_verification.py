@@ -418,6 +418,66 @@ class TestStep1And2ClientNode(unittest.TestCase):
         sync_attendance.assert_called_once_with()
         refresh_cameras.assert_called_once_with()
 
+    def test_camera_refresh_succeeds_when_optional_attendance_state_is_unavailable(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "branch_key": "issued-branch-key",
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "cloud_url": "https://main.example.test",
+            "cameras": [{"id": "camera-1", "name": "Front Door"}],
+        })
+        with patch.object(client_app, "sync_client_profiles_from_cloud", return_value=1), \
+             patch.object(client_app, "reload_face_cache"), \
+             patch.object(
+                 client_app,
+                 "apply_cloud_attendance_sync_state",
+                 side_effect=RuntimeError("HTTP Error 502: attendance state unavailable"),
+             ), \
+             patch.object(client_app, "init_camera_streams"):
+            response = self.client.post("/api/node/cameras/refresh")
+
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()
+        self.assertTrue(result["success"])
+        self.assertIn("attendance status sync", result["attendance_sync_error"].lower())
+        self.assertEqual(result["employee_count"], 1)
+        self.assertEqual(result["camera_count"], 1)
+
+    def test_trained_embeddings_use_branch_authenticated_main_relay(self):
+        client_app.CONFIG.update({
+            "branch_key": "issued-branch-key",
+            "branch_id": "BR-CLOUD-SYNC",
+            "cloud_url": "https://main.example.test",
+        })
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "success": True,
+            "synced_count": 1,
+            "is_trained": True,
+        }).encode("utf-8")
+
+        with patch("app.urllib.request.urlopen", return_value=response) as urlopen:
+            synced = client_app.sync_trained_embeddings_to_cloud(
+                "8001",
+                [[0.25] * 512],
+                "training-test",
+            )
+
+        self.assertTrue(synced)
+        sent_request = urlopen.call_args.args[0]
+        self.assertEqual(
+            sent_request.full_url,
+            "https://main.example.test/api/edge/branches/BR-CLOUD-SYNC/employees/8001/embeddings",
+        )
+        self.assertEqual(sent_request.get_header("X-branch-key"), "issued-branch-key")
+        self.assertEqual(
+            json.loads(sent_request.data),
+            {"embeddings": [[0.25] * 512], "source": "training-test"},
+        )
+
     def test_cloud_staff_sync_imports_branch_profiles_through_authenticated_relay(self):
         client_app.CONFIG.update({
             "linked": True,

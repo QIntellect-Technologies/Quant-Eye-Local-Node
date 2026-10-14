@@ -38,6 +38,8 @@ Attendance events are persisted in the local SQLite `client_cloud_delivery` outb
 
 Camera configuration is fetched through the Main Dashboard using the node's saved branch key. The Main Dashboard retrieves only that branch's active cameras from the Client Portal with its server-side integration key; that integration key is never stored in or sent to the EXE. A successful empty response clears deleted cameras, while an unavailable cloud source preserves the node's last-known camera configuration.
 
+Staff profiles and face-training vectors sync through Main Dashboard using the activated branch key. If attendance-state sync is temporarily unavailable, camera and staff refresh still completes and the node retries attendance-state sync in the background.
+
 ### 3. Launching the Node
 
 Run the standalone desktop launcher:

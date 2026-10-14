@@ -1673,7 +1673,14 @@
             }
           }
           loadActiveShiftTiming();
-          showToast(`Cloud sync complete! ${data.employee_count} employees, ${data.attendance_updates_applied} attendance updates, ${allCameras.length} cameras.`, 'success');
+          if (data.attendance_sync_error) {
+            showToast(
+              `Staff and cameras synced (${data.employee_count} employees, ${allCameras.length} cameras). ${data.attendance_sync_error}`,
+              'info'
+            );
+          } else {
+            showToast(`Cloud sync complete! ${data.employee_count} employees, ${data.attendance_updates_applied} attendance updates, ${allCameras.length} cameras.`, 'success');
+          }
         } else {
           showToast(data.error || 'Failed to refresh cameras', 'error');
         }
