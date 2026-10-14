@@ -17,6 +17,7 @@ import unittest
 import uuid
 import zipfile
 import atexit
+from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 _ORIGINAL_DB_PATH_ENV = os.environ.get("QINTELLECT_DB_PATH")
@@ -564,7 +565,7 @@ class TestStep1And2ClientNode(unittest.TestCase):
             )
 
         self.assertEqual(imported, 1)
-        sent_request = urlopen.call_args.args[0]
+        sent_request = urlopen.call_args_list[0].args[0]
         self.assertEqual(
             sent_request.full_url,
             "https://main.example.test/api/branches/BR-CLOUD-SYNC/employees?organization_id=ORG-CLOUD-SYNC",
@@ -626,10 +627,24 @@ class TestStep1And2ClientNode(unittest.TestCase):
             "embeddings": [[0.25] * 512],
             "is_trained": True,
         })
+        shift_response = MockResponse({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "shifts": [{
+                "id": 1,
+                "name": "Morning Shift",
+                "start_time": "23:04",
+                "end_time": "23:07",
+                "grace_period_minutes": 2,
+                "is_default": True,
+                "active": 1,
+            }],
+        })
 
         with patch(
             "app.urllib.request.urlopen",
-            side_effect=[employee_response, embedding_response],
+            side_effect=[employee_response, embedding_response, shift_response],
         ) as urlopen:
             imported = client_app.sync_client_profiles_from_cloud(
                 "ORG-CLOUD-SYNC",
@@ -638,7 +653,7 @@ class TestStep1And2ClientNode(unittest.TestCase):
             )
 
         self.assertEqual(imported, 1)
-        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(urlopen.call_count, 3)
         self.assertEqual(
             urlopen.call_args_list[1].args[0].full_url,
             "https://main.example.test/api/edge/branches/BR-CLOUD-SYNC/employees/8003/embeddings",
@@ -712,6 +727,64 @@ class TestStep1And2ClientNode(unittest.TestCase):
         self.assertEqual(name, "Cached Employee")
         self.assertEqual(trained, 1)
         self.assertEqual(emb_count, 1)
+
+    def test_cloud_shift_hours_overwrite_seeded_morning_window(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "branch_key": "issued-branch-key",
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+        })
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            conn.execute("DELETE FROM users WHERE id = 8018")
+            conn.execute(
+                "INSERT INTO users (id, name, organization_id, branch_id, active, shift_id) "
+                "VALUES (8018, 'Imran Khalid', 'ORG-CLOUD-SYNC', 'BR-CLOUD-SYNC', 1, 1)"
+            )
+            conn.execute(
+                "UPDATE shifts SET start_time = '09:00', end_time = '17:00', grace_period_minutes = 15 WHERE id = 1"
+            )
+
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "shifts": [{
+                "id": 1,
+                "name": "Morning Shift",
+                "start_time": "23:04",
+                "end_time": "23:07",
+                "grace_period_minutes": 2,
+                "is_default": True,
+                "active": 1,
+            }],
+        }).encode("utf-8")
+
+        with patch("app.urllib.request.urlopen", return_value=response) as urlopen:
+            imported = client_app.sync_branch_shifts_from_cloud(
+                "ORG-CLOUD-SYNC",
+                "BR-CLOUD-SYNC",
+                "https://main.example.test",
+            )
+
+        self.assertEqual(imported, 1)
+        self.assertEqual(urlopen.call_args.args[0].full_url, "https://main.example.test/api/edge/shifts")
+        self.assertEqual(urlopen.call_args.args[0].get_header("X-branch-key"), "issued-branch-key")
+        allowed, reason, info = client_app.db.check_user_shift_allowed(
+            8018,
+            datetime(2026, 10, 14, 23, 5, 0),
+        )
+        self.assertTrue(allowed, reason)
+        self.assertEqual(info["start_time"], "23:04")
+        blocked, blocked_reason, _ = client_app.db.check_user_shift_allowed(
+            8018,
+            datetime(2026, 10, 14, 9, 5, 0),
+        )
+        self.assertFalse(blocked)
+        self.assertIn("23:04", blocked_reason)
 
     def test_cloud_delivery_retries_persist_and_preserve_event_id(self):
         event_id = str(uuid.uuid4())

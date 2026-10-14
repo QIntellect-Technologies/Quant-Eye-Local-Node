@@ -592,6 +592,122 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
     except Exception as pe:
         logger.warning(f"[PORTAL SYNC] Could not sync branch employee profiles; preserving cached staff profiles: {pe}")
         return 0
+    finally:
+        if org_id and branch_id and str(CONFIG.get("branch_key") or "").strip():
+            try:
+                sync_branch_shifts_from_cloud(org_id, branch_id, cloud_url)
+            except Exception:
+                pass
+
+
+def sync_branch_shifts_from_cloud(org_id: str, branch_id: str, cloud_url: str) -> int:
+    """Write portal shift hours into the EXE SQLite cache so check-in uses live times, not the 09:00 seed."""
+    if not org_id or not branch_id:
+        return 0
+    branch_key = str(CONFIG.get("branch_key") or "").strip()
+    if not branch_key:
+        logger.error("[SHIFT SYNC] Branch key is missing; preserving cached shift hours.")
+        return 0
+    try:
+        cloud_clean = _validate_dashboard_url(
+            cloud_url or "https://quanteye-main-dashboard-production.up.railway.app"
+        )
+        req = urllib.request.Request(
+            f"{cloud_clean}/api/edge/shifts",
+            headers={"User-Agent": "QuantEye-Node", "X-Branch-Key": branch_key},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            if resp.status != 200:
+                logger.warning("[SHIFT SYNC] Cloud shift relay returned HTTP %s; preserving cached shift hours.", resp.status)
+                return 0
+            data = json.loads(resp.read().decode("utf-8"))
+        if (
+            data.get("success") is not True
+            or str(data.get("organization_id")) != str(org_id)
+            or str(data.get("branch_id")) != str(branch_id)
+            or not isinstance(data.get("shifts"), list)
+        ):
+            logger.error("[SHIFT SYNC] Cloud returned an invalid shift list; preserving cached shift hours.")
+            return 0
+        shifts = data["shifts"]
+        if not shifts:
+            logger.info("[SHIFT SYNC] Cloud has 0 shifts for %s/%s; preserving cached shift hours.", org_id, branch_id)
+            return 0
+
+        with sqlite3.connect(db.DB_PATH) as conn:
+            cur = conn.cursor()
+            for statement in (
+                "ALTER TABLE shifts ADD COLUMN organization_id TEXT",
+                "ALTER TABLE shifts ADD COLUMN branch_id TEXT",
+                "ALTER TABLE shifts ADD COLUMN checkout_grace_period_minutes INTEGER DEFAULT 0",
+            ):
+                try:
+                    cur.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
+
+            imported = 0
+            for shift in shifts:
+                try:
+                    shift_id = int(shift["id"])
+                except (KeyError, TypeError, ValueError):
+                    logger.error("[SHIFT SYNC] Cloud returned a shift with an invalid id; skipping that row.")
+                    continue
+                name = str(shift.get("name") or "Shift").strip() or "Shift"
+                start_time = str(shift.get("start_time") or "09:00").strip() or "09:00"
+                end_time = str(shift.get("end_time") or "17:00").strip() or "17:00"
+                try:
+                    grace = int(shift.get("grace_period_minutes") if shift.get("grace_period_minutes") is not None else 15)
+                except (TypeError, ValueError):
+                    grace = 15
+                try:
+                    checkout_grace = int(shift.get("checkout_grace_period_minutes") or 0)
+                except (TypeError, ValueError):
+                    checkout_grace = 0
+                working_days = shift.get("working_days") or [0, 1, 2, 3, 4, 5]
+                if isinstance(working_days, str):
+                    working_days_json = working_days
+                else:
+                    working_days_json = json.dumps(working_days)
+                is_default = 1 if shift.get("is_default") else 0
+                active = 1 if shift.get("active", 1) else 0
+                exists = cur.execute("SELECT id FROM shifts WHERE id = ?", (shift_id,)).fetchone()
+                if exists:
+                    cur.execute(
+                        """
+                        UPDATE shifts
+                        SET name = ?, start_time = ?, end_time = ?, grace_period_minutes = ?,
+                            checkout_grace_period_minutes = ?, working_days = ?, is_default = ?,
+                            active = ?, organization_id = ?, branch_id = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            name, start_time, end_time, grace, checkout_grace, working_days_json,
+                            is_default, active, org_id, branch_id, shift_id,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO shifts (
+                            id, name, start_time, end_time, grace_period_minutes,
+                            checkout_grace_period_minutes, working_days, is_default, active,
+                            organization_id, branch_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            shift_id, name, start_time, end_time, grace, checkout_grace,
+                            working_days_json, is_default, active, org_id, branch_id,
+                        ),
+                    )
+                imported += 1
+            conn.commit()
+        logger.info("[SHIFT SYNC] Synced %s shift schedule(s) from Cloud for %s/%s.", imported, org_id, branch_id)
+        return imported
+    except Exception as error:
+        logger.warning("[SHIFT SYNC] Could not sync branch shifts; preserving cached shift hours: %s", error)
+        return 0
 
 
 def reload_face_cache():
