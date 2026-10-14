@@ -418,6 +418,67 @@ class TestStep1And2ClientNode(unittest.TestCase):
         sync_attendance.assert_called_once_with()
         refresh_cameras.assert_called_once_with()
 
+    def test_cloud_staff_sync_imports_branch_profiles_through_authenticated_relay(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "branch_key": "issued-branch-key",
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+        })
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            conn.execute("DELETE FROM embeddings WHERE user_id IN (8001, 8002)")
+            conn.execute("DELETE FROM users WHERE id IN (8001, 8002)")
+            conn.execute(
+                "INSERT INTO users (id, name, organization_id, branch_id, active) "
+                "VALUES (8002, 'Other Branch Employee', 'ORG-CLOUD-SYNC', 'BR-OTHER', 1)"
+            )
+
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "employees": [{
+                "id": 8001,
+                "name": "New Cloud Employee",
+                "email": "employee@example.test",
+                "department": "Operations",
+                "position": "Staff Member",
+                "employee_code": "EMP-8001",
+                "organization_id": "ORG-CLOUD-SYNC",
+                "branch_id": "BR-CLOUD-SYNC",
+                "active": 1,
+            }],
+        }).encode("utf-8")
+
+        with patch("app.urllib.request.urlopen", return_value=response) as urlopen:
+            imported = client_app.sync_client_profiles_from_cloud(
+                "ORG-CLOUD-SYNC",
+                "BR-CLOUD-SYNC",
+                "https://main.example.test",
+            )
+
+        self.assertEqual(imported, 1)
+        sent_request = urlopen.call_args.args[0]
+        self.assertEqual(
+            sent_request.full_url,
+            "https://main.example.test/api/branches/BR-CLOUD-SYNC/employees?organization_id=ORG-CLOUD-SYNC",
+        )
+        self.assertEqual(sent_request.get_header("X-branch-key"), "issued-branch-key")
+        scoped_users = client_app.db.get_all_users(
+            organization_id="ORG-CLOUD-SYNC",
+            branch_id="BR-CLOUD-SYNC",
+        )
+        self.assertEqual([user["id"] for user in scoped_users], [8001])
+        self.assertFalse(scoped_users[0]["has_embedding"])
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            other_branch = conn.execute(
+                "SELECT name FROM users WHERE id = 8002"
+            ).fetchone()
+        self.assertEqual(other_branch[0], "Other Branch Employee")
+
     def test_cloud_delivery_retries_persist_and_preserve_event_id(self):
         event_id = str(uuid.uuid4())
         event = {"event_id": event_id, "user_id": 101, "name": "Retry Employee"}

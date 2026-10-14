@@ -330,25 +330,39 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
     cloud_clean = _validate_dashboard_url(
         cloud_url or "https://quanteye-main-dashboard-production.up.railway.app"
     )
-    portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
-    portal_url = _validate_dashboard_url(portal_url)
     imported_count = 0
-    portal_queried_successfully = False
 
-    # 1. Fetch staff members directly from Cloud Client Portal (/api/users)
+    # The Main Dashboard relays this request to the session-protected Client Portal.
     try:
-        req_url = f"{portal_url}/api/users"
+        req_url = f"{cloud_clean}/api/branches/{branch_id}/employees?organization_id={org_id}"
+        branch_key = str(CONFIG.get("branch_key") or "").strip()
+        if not branch_key:
+            logger.error("[PORTAL SYNC] Branch key is missing; preserving cached staff profiles.")
+            return 0
         req = urllib.request.Request(req_url, headers={
             "User-Agent": "QuantEye-Node",
-            "X-Client-Auth": "true",
-            "X-Organization-Id": org_id,
-            "X-Branch-Id": branch_id or "DEFAULT_BRANCH"
+            "X-Branch-Key": branch_key,
         }, method="GET")
         with urllib.request.urlopen(req, timeout=4.0) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
-                users = data.get("users", [])
-                portal_queried_successfully = True
+                users = data.get("employees", [])
+                if (
+                    data.get("success") is not True
+                    or str(data.get("organization_id")) != str(org_id)
+                    or str(data.get("branch_id")) != str(branch_id)
+                    or not isinstance(users, list)
+                ):
+                    logger.error("[PORTAL SYNC] Cloud returned a mismatched or invalid branch profile response; preserving cached staff profiles.")
+                    return 0
+
+                cloud_ids = []
+                for user in users:
+                    try:
+                        cloud_ids.append(int(user["id"]))
+                    except (KeyError, TypeError, ValueError):
+                        logger.error("[PORTAL SYNC] Cloud returned an employee with an invalid numeric ID; preserving cached staff profiles.")
+                        return 0
                 
                 with sqlite3.connect(db.DB_PATH) as conn:
                     cur = conn.cursor()
@@ -361,41 +375,39 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                     try: cur.execute("ALTER TABLE users ADD COLUMN position TEXT")
                     except Exception: pass
 
-                    cloud_ids = [int(u.get("id")) for u in users if u.get("id") is not None]
-
                     if not cloud_ids:
-                        # Cloud has 0 staff for this organization -> purge all local staff and embeddings
+                        # An authenticated, branch-matched empty response is authoritative.
                         cur.execute("""
                             DELETE FROM embeddings 
                             WHERE user_id IN (
                                 SELECT id FROM users 
-                                WHERE organization_id = ? OR organization_id IS NULL OR organization_id = '' OR organization_id = 'DEFAULT_ORG'
+                                WHERE organization_id = ? AND branch_id = ?
                             )
-                        """, (org_id,))
+                        """, (org_id, branch_id))
                         cur.execute("""
                             DELETE FROM users 
-                            WHERE organization_id = ? OR organization_id IS NULL OR organization_id = '' OR organization_id = 'DEFAULT_ORG'
-                        """, (org_id,))
+                            WHERE organization_id = ? AND branch_id = ?
+                        """, (org_id, branch_id))
                         conn.commit()
-                        logger.info(f"[PORTAL SYNC] Cloud has 0 staff profiles. Cleared all local users & embeddings for {org_id}.")
+                        logger.info(f"[PORTAL SYNC] Cloud has 0 staff profiles. Cleared branch staff and embeddings for {org_id}/{branch_id}.")
                         reload_face_cache()
                         return 0
 
-                    # Cloud has active staff -> delete any local staff who no longer exist in Cloud
+                    # Remove only profiles owned by this exact organization and branch.
                     placeholders = ','.join('?' for _ in cloud_ids)
                     cur.execute(f"""
                         DELETE FROM embeddings 
                         WHERE user_id IN (
                             SELECT id FROM users 
-                            WHERE (organization_id = ? OR organization_id IS NULL OR organization_id = '' OR organization_id = 'DEFAULT_ORG')
+                            WHERE organization_id = ? AND branch_id = ?
                               AND id NOT IN ({placeholders})
                         )
-                    """, [org_id] + cloud_ids)
+                    """, [org_id, branch_id] + cloud_ids)
                     cur.execute(f"""
                         DELETE FROM users 
-                        WHERE (organization_id = ? OR organization_id IS NULL OR organization_id = '' OR organization_id = 'DEFAULT_ORG')
+                        WHERE organization_id = ? AND branch_id = ?
                           AND id NOT IN ({placeholders})
-                    """, [org_id] + cloud_ids)
+                    """, [org_id, branch_id] + cloud_ids)
 
                     # Upsert active staff from Cloud
                     for u in users:
@@ -406,11 +418,18 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                         u_dept = (u.get("department") or "General").strip()
                         u_pos = (u.get("position") or "Staff Member").strip()
                         u_code = (u.get("notes") or f"EMP-{u_id}").strip()
-                        u_org = u.get("organization_id") or org_id
-                        u_branch = u.get("branch_id") or branch_id or "DEFAULT_BRANCH"
+                        u_org = str(u.get("organization_id") or org_id)
+                        u_branch = str(u.get("branch_id") or branch_id)
+                        if u_org != str(org_id) or u_branch != str(branch_id):
+                            logger.error("[PORTAL SYNC] Cloud returned a profile outside the activated branch; preserving cached staff profiles.")
+                            conn.rollback()
+                            return 0
                         u_active = int(u.get("active", 1))
 
-                        cur.execute("SELECT id FROM users WHERE id = ? OR name = ?", (u_id, u_name))
+                        cur.execute("""
+                            SELECT id FROM users
+                            WHERE id = ? AND organization_id = ? AND branch_id = ?
+                        """, (int(u_id), org_id, branch_id))
                         row = cur.fetchone()
                         if row:
                             cur.execute("""
@@ -422,89 +441,15 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                             cur.execute("""
                                 INSERT INTO users (id, name, email, phone, department, position, notes, active, organization_id, branch_id)
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (u_id, u_name, u_email, u_phone, u_dept, u_pos, u_code, u_active, u_org, u_branch))
+                            """, (int(u_id), u_name, u_email, u_phone, u_dept, u_pos, u_code, u_active, u_org, u_branch))
                         imported_count += 1
                     conn.commit()
-                logger.info(f"[PORTAL SYNC] Synced {imported_count} staff profiles from Cloud Portal for {org_id}")
-
-            # Also sync shifts from Cloud Portal so shift timings match Cloud 100%
-            try:
-                shifts_url = f"{portal_url}/api/shifts"
-                sreq = urllib.request.Request(shifts_url, headers={
-                    "User-Agent": "QuantEye-Node",
-                    "X-Client-Auth": "true",
-                    "X-Organization-Id": org_id,
-                    "X-Branch-Id": branch_id or "DEFAULT_BRANCH"
-                }, method="GET")
-                with urllib.request.urlopen(sreq, timeout=3.5) as sresp:
-                    if sresp.status == 200:
-                        sdata = json.loads(sresp.read().decode('utf-8'))
-                        cloud_shifts = sdata.get("shifts", [])
-                        with sqlite3.connect(db.DB_PATH) as sconn:
-                            scur = sconn.cursor()
-                            for cs in cloud_shifts:
-                                sid = cs.get("id")
-                                sname = cs.get("name", "Morning Shift")
-                                st = cs.get("start_time", "09:00")
-                                et = cs.get("end_time", "18:00")
-                                gp = cs.get("grace_period_minutes", 15)
-                                scur.execute("""
-                                    INSERT INTO shifts (id, name, start_time, end_time, grace_period_minutes)
-                                    VALUES (?, ?, ?, ?, ?)
-                                    ON CONFLICT(id) DO UPDATE SET
-                                        name = excluded.name,
-                                        start_time = excluded.start_time,
-                                        end_time = excluded.end_time,
-                                        grace_period_minutes = excluded.grace_period_minutes
-                                """, (sid, sname, st, et, gp))
-                            sconn.commit()
-            except Exception as se:
-                logger.debug(f"[PORTAL SYNC] Shift sync note: {se}")
-    except Exception as pe:
-        logger.warning(f"[PORTAL SYNC] Note querying portal users: {pe}")
-
-    # If Cloud Portal query succeeded, do not run secondary or local fallback!
-    if portal_queried_successfully:
+                logger.info(f"[PORTAL SYNC] Synced {imported_count} staff profiles from Cloud Portal for {org_id}/{branch_id}")
+                reload_face_cache()
         return imported_count
-
-    # 2. Secondary fallback: Fetch branch employees from Main Cloud API
-    if branch_id:
-        try:
-            req_url = f"{cloud_clean}/api/branches/{branch_id}/employees?organization_id={org_id}"
-            req = urllib.request.Request(req_url, headers={"User-Agent": "QuantEye-Node"}, method="GET")
-            with urllib.request.urlopen(req, timeout=3.5) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode('utf-8'))
-                    employees = data.get("employees", [])
-                    with sqlite3.connect(db.DB_PATH) as conn:
-                        cur = conn.cursor()
-                        for emp in employees:
-                            emp_name = (emp.get("name") or "Employee").strip()
-                            emp_code = emp.get("employee_code") or f"EMP-{emp.get('id')}"
-                            dept = emp.get("department") or "General"
-                            pos = emp.get("position") or "Staff Member"
-
-                            cur.execute("""
-                                SELECT id FROM users 
-                                WHERE (notes = ? OR name = ?) AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')
-                            """, (emp_code, emp_name, org_id))
-                            row = cur.fetchone()
-                            if row:
-                                cur.execute("""
-                                    UPDATE users SET name = ?, department = ?, position = ?, organization_id = ?, branch_id = ?, active = 1
-                                    WHERE id = ?
-                                """, (emp_name, dept, pos, org_id, branch_id, row[0]))
-                            else:
-                                cur.execute("""
-                                    INSERT INTO users (name, department, position, notes, active, organization_id, branch_id)
-                                    VALUES (?, ?, ?, ?, 1, ?, ?)
-                                """, (emp_name, dept, pos, emp_code, org_id, branch_id))
-                            imported_count += 1
-                        conn.commit()
-        except Exception as ce:
-            logger.debug(f"[CLOUD SYNC] Note querying cloud employees: {ce}")
-
-    return imported_count
+    except Exception as pe:
+        logger.warning(f"[PORTAL SYNC] Could not sync branch employee profiles; preserving cached staff profiles: {pe}")
+        return 0
 
 
 def reload_face_cache():
@@ -2595,10 +2540,10 @@ def api_node_pending_staff():
                        COALESCE(u.notes, ''), COUNT(e.id) as emb_count, COALESCE(u.email, '')
                 FROM users u
                 LEFT JOIN embeddings e ON u.id = e.user_id
-                WHERE (u.organization_id = ? OR u.organization_id IS NULL OR u.organization_id = '' OR u.organization_id = 'DEFAULT_ORG')
+                WHERE u.organization_id = ? AND u.branch_id = ? AND u.active = 1
                 GROUP BY u.id
                 ORDER BY u.id DESC
-            """, (org_id,))
+            """, (org_id, branch_id))
             rows = cur.fetchall()
 
             all_staff = []
