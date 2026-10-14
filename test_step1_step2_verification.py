@@ -162,6 +162,81 @@ class TestStep1And2ClientNode(unittest.TestCase):
         self.assertTrue(data['success'])
         self.assertIn('cameras', data)
 
+    def test_logout_clears_active_organization_runtime_state(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "organization_id": "ORG-OLD",
+            "organization_name": "Old Organization",
+            "branch_id": "BR-OLD",
+            "branch_name": "Old Branch",
+            "branch_key": "old-branch-key",
+            "username": "old@example.test",
+            "cameras": [{"id": "old-camera"}],
+        })
+        client_app.EMBEDDING_CACHE[7] = {"name": "Old Employee"}
+        client_app.ENROLLED_MATRIX = client_app.np.ones((1, 512), dtype=client_app.np.float32)
+        client_app.ENROLLED_USER_IDS = [7]
+        client_app.ENROLLED_USER_METADATA = [{"id": 7, "name": "Old Employee"}]
+        client_app.LATEST_STREAM_DETECTIONS.append({"name": "Old Employee"})
+        client_app.TODAY_LOGGED_ATTENDANCE.add((7, "old-camera"))
+        client_app.USER_ATTENDANCE_STATE[7] = {"checkin_time": "old"}
+
+        response = self.client.post('/api/node/logout')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
+        self.assertFalse(client_app.CONFIG["linked"])
+        self.assertIsNone(client_app.CONFIG["organization_id"])
+        self.assertIsNone(client_app.CONFIG["branch_id"])
+        self.assertIsNone(client_app.CONFIG["branch_key"])
+        self.assertEqual(client_app.CONFIG["username"], "")
+        self.assertEqual(client_app.CONFIG["cameras"], [])
+        self.assertEqual(client_app.EMBEDDING_CACHE, {})
+        self.assertIsNone(client_app.ENROLLED_MATRIX)
+        self.assertEqual(client_app.ENROLLED_USER_IDS, [])
+        self.assertEqual(client_app.ENROLLED_USER_METADATA, [])
+        self.assertEqual(client_app.LATEST_STREAM_DETECTIONS, [])
+        self.assertEqual(client_app.TODAY_LOGGED_ATTENDANCE, set())
+        self.assertEqual(client_app.USER_ATTENDANCE_STATE, {})
+
+        page = self.client.get('/')
+        self.assertIn(b'<body class="node-unlinked">', page.data)
+
+    def test_face_cache_only_uses_exact_active_tenant_and_branch(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "organization_id": "ORG-NEW",
+            "branch_id": "BR-NEW",
+        })
+        users = [
+            {"id": 1, "name": "Old tenant", "organization_id": "ORG-OLD", "branch_id": "BR-OLD"},
+            {"id": 2, "name": "New tenant", "organization_id": "ORG-NEW", "branch_id": "BR-NEW"},
+            {"id": 3, "name": "Unscoped", "organization_id": "DEFAULT_ORG", "branch_id": "DEFAULT_BRANCH"},
+        ]
+        with patch.object(client_app.db, "get_all_users", return_value=users), \
+             patch.object(client_app.db, "get_embeddings_for_user", return_value=[{"embedding": [1.0, 0.0]}]), \
+             patch.object(client_app.fp, "compute_aggregate_embedding", return_value=client_app.np.array([1.0, 0.0])):
+            client_app.reload_face_cache()
+
+        self.assertEqual(client_app.ENROLLED_USER_IDS, [2])
+        self.assertEqual(set(client_app.EMBEDDING_CACHE), {2})
+
+    def test_unlinked_node_keeps_face_cache_empty(self):
+        client_app.CONFIG.update({
+            "linked": False,
+            "organization_id": None,
+            "branch_id": None,
+        })
+        client_app.EMBEDDING_CACHE[1] = {"name": "Old employee"}
+        client_app.ENROLLED_MATRIX = client_app.np.ones((1, 512), dtype=client_app.np.float32)
+        with patch.object(client_app.db, "get_all_users") as get_users:
+            client_app.reload_face_cache()
+
+        get_users.assert_not_called()
+        self.assertEqual(client_app.EMBEDDING_CACHE, {})
+        self.assertIsNone(client_app.ENROLLED_MATRIX)
+        self.assertEqual(client_app.ENROLLED_USER_IDS, [])
+
     def test_cloud_status_endpoint(self):
         resp = self.client.get('/api/node/cloud-status')
         self.assertEqual(resp.status_code, 200)
@@ -175,7 +250,7 @@ class TestStep1And2ClientNode(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         content = resp.data.decode('utf-8')
         self.assertIn("QuantEye", content)
-        self.assertIn("Link Client Organization", content)
+        self.assertIn("Sign in to your organization", content)
         self.assertIn('id="authUsernameInput"', content)
         self.assertIn('id="authPasswordInput"', content)
         self.assertIn('id="liveMultiGrid"', content)

@@ -510,6 +510,15 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
 def reload_face_cache():
     global EMBEDDING_CACHE, ENROLLED_MATRIX, ENROLLED_USER_IDS, ENROLLED_USER_METADATA
     logger.info("[*] Refreshing in-memory facial embedding cache from database...")
+    if not CONFIG.get("linked") or not CONFIG.get("organization_id") or not CONFIG.get("branch_id"):
+        with cache_lock:
+            EMBEDDING_CACHE = {}
+            ENROLLED_MATRIX = None
+            ENROLLED_USER_IDS = []
+            ENROLLED_USER_METADATA = []
+        logger.info("[INFO] Face profile cache remains empty until an organization and branch are linked.")
+        return
+
     new_cache = {}
     matrix_rows = []
     user_ids = []
@@ -524,12 +533,12 @@ def reload_face_cache():
         u_org = user.get('organization_id')
         u_branch = user.get('branch_id')
         
-        # Enforce tenant filtering with support for tenant branch schedules
+        # Never reuse another tenant's records or unscoped legacy rows while linked.
         if target_org:
-            if u_org and str(u_org).strip() not in (str(target_org).strip(), 'DEFAULT_ORG', 'all', 'ALL'):
+            if str(u_org or '').strip() != str(target_org).strip():
                 continue
         if target_branch:
-            if u_branch and str(u_branch).strip() not in (str(target_branch).strip(), 'DEFAULT_BRANCH', 'all', 'ALL', ''):
+            if str(u_branch or '').strip() != str(target_branch).strip():
                 continue
 
         user_embeddings = db.get_embeddings_for_user(user['id'])
@@ -2018,34 +2027,62 @@ def get_node_active_shift():
     })
 
 
+def _clear_node_tenant_runtime_state() -> None:
+    """Stop tenant-bound streams and discard in-memory data before changing organizations."""
+    global ACTIVE_CAMERA_READERS
+    global EMBEDDING_CACHE, ENROLLED_MATRIX, ENROLLED_USER_IDS, ENROLLED_USER_METADATA
+    global TODAY_LOGGED_DATE, USER_ATTENDANCE_STATE_DATE
+
+    with readers_lock:
+        for cid, reader in list(ACTIVE_CAMERA_READERS.items()):
+            try:
+                reader.release()
+            except Exception as error:
+                logger.warning("Could not release camera reader %s during tenant switch: %s", cid, error)
+        ACTIVE_CAMERA_READERS.clear()
+
+    with cache_lock:
+        EMBEDDING_CACHE = {}
+        ENROLLED_MATRIX = None
+        ENROLLED_USER_IDS = []
+        ENROLLED_USER_METADATA = []
+        MANUALLY_ABSENT_USERS.clear()
+        LATEST_STREAM_DETECTIONS.clear()
+    with today_logged_lock:
+        TODAY_LOGGED_ATTENDANCE.clear()
+        USER_ATTENDANCE_STATE.clear()
+        TODAY_LOGGED_DATE = None
+        USER_ATTENDANCE_STATE_DATE = ''
+    with _cloud_absent_users_lock:
+        _cloud_absent_users_synced.clear()
+
+
 @app.route('/api/node/logout', methods=['POST'])
 def api_node_logout():
     """
     Log out from current organization/branch.
     Clears runtime state, stops active camera stream readers, and resets config_node.json.
     """
-    global CONFIG, ACTIVE_CAMERA_READERS
-    with readers_lock:
-        for cid, reader in list(ACTIVE_CAMERA_READERS.items()):
-            try:
-                reader.release()
-            except Exception:
-                pass
-        ACTIVE_CAMERA_READERS.clear()
-
+    global CONFIG
+    _clear_node_tenant_runtime_state()
     CONFIG['linked'] = False
     CONFIG['organization_id'] = None
     CONFIG['organization_name'] = None
     CONFIG['branch_id'] = None
     CONFIG['branch_name'] = None
     CONFIG['branch_key'] = None
+    CONFIG['username'] = ''
     CONFIG['cameras'] = []
 
     try:
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(CONFIG, f, indent=2)
     except Exception as e:
-        logger.warning(f"Error persisting reset config: {e}")
+        logger.exception("Could not persist node logout; the prior organization may be restored on restart.")
+        return jsonify({
+            "success": False,
+            "error": "Could not save the logout. Please retry before signing in to another organization."
+        }), 500
 
     logger.info("[NODE LOGOUT] Successfully logged out from current organization.")
     return jsonify({
@@ -2119,6 +2156,14 @@ def api_node_login_auth():
         org_name = val_data['organization_name']
         branch_name = val_data['branch_name']
         cameras = val_data.get('cameras', [])
+
+        active_tenant = (
+            str(CONFIG.get("organization_id") or "").strip(),
+            str(CONFIG.get("branch_id") or "").strip(),
+        )
+        requested_tenant = (str(org_id).strip(), str(branch_id).strip())
+        if CONFIG.get("linked") and active_tenant != requested_tenant:
+            _clear_node_tenant_runtime_state()
 
         # Update runtime config
         CONFIG['linked'] = True

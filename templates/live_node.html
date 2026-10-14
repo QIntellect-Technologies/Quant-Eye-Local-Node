@@ -923,6 +923,38 @@
       z-index: 1000;
       padding: 20px;
     }
+    body.node-unlinked > .sidebar,
+    body.node-unlinked > .main-panel,
+    body.node-unlinked > #toastContainer,
+    body.node-login-open > .sidebar,
+    body.node-login-open > .main-panel,
+    body.node-login-open > #toastContainer {
+      display: none !important;
+    }
+    body.node-unlinked #activationModal {
+      display: flex !important;
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      align-items: center;
+      justify-content: center;
+      background: #eef8ff;
+      backdrop-filter: none;
+    }
+    body.node-login-open #activationModal {
+      display: flex !important;
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      align-items: center;
+      justify-content: center;
+      background: #eef8ff;
+      backdrop-filter: none;
+    }
+    body.node-unlinked #activationModal .btn-close,
+    body.node-unlinked #activationModal .app-modal-footer button[type="button"] {
+      display: none !important;
+    }
 
     .app-modal-card {
       background: #ffffff;
@@ -1009,7 +1041,7 @@
     }
   </style>
 </head>
-<body>
+<body class="{% if not config.get('linked') %}node-unlinked{% endif %}">
 
   <!-- Floating Toast Notifications -->
   <div id="toastContainer" class="app-toast-container"></div>
@@ -1354,13 +1386,13 @@
   <div id="activationModal" class="app-modal-backdrop">
     <div class="app-modal-card">
       <div class="app-modal-header">
-        <h4><i class="fa-solid fa-key" style="color:#0284c7; margin-right:6px;"></i> Link Client Organization</h4>
+        <h4><i class="fa-solid fa-key" style="color:#0284c7; margin-right:6px;"></i> Sign in to your organization</h4>
         <button type="button" class="btn-close" onclick="closeActivationModal()"></button>
       </div>
       <form onsubmit="handleActivationSubmit(event)">
         <div class="app-modal-body">
           <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; padding:10px 12px; margin-bottom:14px; font-size:0.78rem; color:#1e40af;">
-            Enter your Cloud Client Credentials or Branch Key to link this Node to an organization.
+            Sign in with your organization credentials and branch key to connect this node.
           </div>
           <div class="mb-3">
             <label class="form-label" style="font-size:0.8rem; font-weight:700; color:#475569;">Username / Email</label>
@@ -1918,20 +1950,21 @@
       try {
         const res = await fetch('/api/node/logout', { method: 'POST' });
         const data = await res.json();
-        if (data.success) {
-          showToast('Logged out successfully', 'success');
-          openActivationModal();
-        }
+        if (!res.ok || !data.success) throw new Error(data.error || 'Logout failed.');
+        window.location.reload();
       } catch (e) {
         showToast('Error during logout: ' + e.message, 'error');
       }
     }
 
     function openActivationModal() {
+      document.body.classList.add('node-login-open');
       document.getElementById('activationModal').style.display = 'flex';
     }
 
     function closeActivationModal() {
+      if (document.body.classList.contains('node-unlinked')) return;
+      document.body.classList.remove('node-login-open');
       document.getElementById('activationModal').style.display = 'none';
     }
 
