@@ -1,6 +1,8 @@
 import sqlite3
 import json
 import os
+import hashlib
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple, Any, Union
@@ -8,6 +10,92 @@ from logger_config import get_logger
 from config import DB_PATH, ATTENDANCE_LOG_RETENTION_DAYS
 
 logger = get_logger(__name__)
+_CLIENT_CLOUD_SPOOL_DIR = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), ".client_cloud_delivery_spool")
+_CLIENT_CLOUD_SPOOL_LOCK = threading.Lock()
+
+
+def _migrate_payroll_run_tenant_uniqueness(cursor: sqlite3.Cursor) -> None:
+    staged_table = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'payroll_runs_scoped'"
+    ).fetchone()
+    if staged_table:
+        source_count = cursor.execute("SELECT COUNT(*) FROM payroll_runs").fetchone()[0]
+        staged_count = cursor.execute("SELECT COUNT(*) FROM payroll_runs_scoped").fetchone()[0]
+        if source_count == 0 and staged_count > 0:
+            cursor.execute("DROP TABLE payroll_runs")
+            cursor.execute("ALTER TABLE payroll_runs_scoped RENAME TO payroll_runs")
+        else:
+            cursor.execute("DROP TABLE payroll_runs_scoped")
+
+    month_only_unique = False
+    for index in cursor.execute("PRAGMA index_list(payroll_runs)").fetchall():
+        if not index[2]:
+            continue
+        columns = [
+            row[2] for row in cursor.execute(f"PRAGMA index_info('{index[1]}')").fetchall()
+        ]
+        if columns == ["payroll_month"]:
+            month_only_unique = True
+            break
+    if month_only_unique:
+        cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_run_update")
+        cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_run_delete")
+        cursor.execute("""
+            CREATE TABLE payroll_runs_scoped (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payroll_month TEXT NOT NULL,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                employee_count INTEGER NOT NULL DEFAULT 0,
+                total_basic_salary REAL NOT NULL DEFAULT 0,
+                total_deduction REAL NOT NULL DEFAULT 0,
+                total_net_salary REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'Finalized',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finalized_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_allowances REAL NOT NULL DEFAULT 0,
+                total_overtime REAL NOT NULL DEFAULT 0,
+                organization_id TEXT NOT NULL DEFAULT 'DEFAULT_ORG',
+                branch_id TEXT NOT NULL DEFAULT 'DEFAULT_BRANCH',
+                UNIQUE (organization_id, branch_id, payroll_month)
+            )
+        """)
+        cursor.execute("""
+            INSERT INTO payroll_runs_scoped (
+                id, payroll_month, period_start, period_end, employee_count,
+                total_basic_salary, total_deduction, total_net_salary, status,
+                created_at, finalized_at, total_allowances, total_overtime,
+                organization_id, branch_id
+            )
+            SELECT id, payroll_month, period_start, period_end, employee_count,
+                   total_basic_salary, total_deduction, total_net_salary, status,
+                   created_at, finalized_at, total_allowances, total_overtime,
+                   COALESCE(NULLIF(organization_id, ''), 'DEFAULT_ORG'),
+                   COALESCE(NULLIF(branch_id, ''), 'DEFAULT_BRANCH')
+            FROM payroll_runs
+        """)
+        cursor.execute("DROP TABLE payroll_runs")
+        cursor.execute("ALTER TABLE payroll_runs_scoped RENAME TO payroll_runs")
+
+    cursor.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS ux_payroll_runs_tenant_month
+           ON payroll_runs(organization_id, branch_id, payroll_month)"""
+    )
+    cursor.executescript("""
+        CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_run_update
+        BEFORE UPDATE ON payroll_runs
+        WHEN OLD.status = 'Finalized'
+        BEGIN
+            SELECT RAISE(ABORT, 'Finalized payroll runs are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_run_delete
+        BEFORE DELETE ON payroll_runs
+        WHEN OLD.status = 'Finalized'
+        BEGIN
+            SELECT RAISE(ABORT, 'Finalized payroll runs are immutable');
+        END;
+    """)
+
 
 def _get_local_instance_id() -> str:
     """Retrieve persistent local instance ID from config_integration.json or fallback."""
@@ -377,7 +465,7 @@ def init_db():
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS payroll_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    payroll_month TEXT NOT NULL UNIQUE,
+                    payroll_month TEXT NOT NULL,
                     period_start TEXT NOT NULL,
                     period_end TEXT NOT NULL,
                     employee_count INTEGER NOT NULL DEFAULT 0,
@@ -386,7 +474,10 @@ def init_db():
                     total_net_salary REAL NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'Finalized',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    finalized_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    finalized_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    organization_id TEXT NOT NULL DEFAULT 'DEFAULT_ORG',
+                    branch_id TEXT NOT NULL DEFAULT 'DEFAULT_BRANCH',
+                    UNIQUE (organization_id, branch_id, payroll_month)
                 )
             ''')
             cursor.execute('''
@@ -861,6 +952,12 @@ def init_db():
                 except sqlite3.OperationalError:
                     pass
 
+            conn.commit()
+            cursor.execute("PRAGMA foreign_keys = OFF")
+            _migrate_payroll_run_tenant_uniqueness(cursor)
+            conn.commit()
+            cursor.execute("PRAGMA foreign_keys = ON")
+
             # Create composite tenant indexes for ultra-fast, 100% isolated queries
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_org ON users(organization_id, active)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_org ON attendance(organization_id, timestamp)')
@@ -895,6 +992,24 @@ def init_db():
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_outbox_event_id ON sync_outbox_queue(event_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_outbox_org_branch ON sync_outbox_queue(organization_id, branch_id)')
 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS client_cloud_delivery (
+                    event_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_attempt_at TIMESTAMP,
+                    last_error TEXT,
+                    delivered_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_client_cloud_delivery_due '
+                'ON client_cloud_delivery(status, next_attempt_at)'
+            )
+
             conn.commit()
             
         logger.info(f"✓ Database initialized at {DB_PATH}")
@@ -902,6 +1017,132 @@ def init_db():
     except Exception as e:
         logger.error(f"✗ Database initialization failed: {e}")
         return False
+
+
+def enqueue_client_cloud_delivery(event_id: str, payload: Dict[str, Any]) -> None:
+    """Persist a cloud delivery before waking its asynchronous sender."""
+    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO client_cloud_delivery (event_id, payload_json)
+                   VALUES (?, ?)""",
+                (event_id, payload_json),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        _write_client_cloud_delivery_spool(event_id, payload_json)
+        logger.exception(
+            "SQLite unavailable; attendance event %s was persisted to the durable delivery spool.",
+            event_id,
+        )
+
+
+def _client_cloud_spool_path(event_id: str) -> str:
+    filename = hashlib.sha256(event_id.encode("utf-8")).hexdigest() + ".json"
+    return os.path.join(_CLIENT_CLOUD_SPOOL_DIR, filename)
+
+
+def _write_client_cloud_delivery_spool(event_id: str, payload_json: str) -> None:
+    os.makedirs(_CLIENT_CLOUD_SPOOL_DIR, exist_ok=True)
+    spool_path = _client_cloud_spool_path(event_id)
+    temporary_path = f"{spool_path}.{uuid.uuid4().hex}.tmp"
+    spool_entry = json.dumps(
+        {"event_id": event_id, "payload_json": payload_json},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with _CLIENT_CLOUD_SPOOL_LOCK:
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as spool_file:
+                spool_file.write(spool_entry)
+                spool_file.flush()
+                os.fsync(spool_file.fileno())
+            os.replace(temporary_path, spool_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+
+def _restore_client_cloud_delivery_spool() -> None:
+    if not os.path.isdir(_CLIENT_CLOUD_SPOOL_DIR):
+        return
+    with _CLIENT_CLOUD_SPOOL_LOCK:
+        spool_files = sorted(
+            name for name in os.listdir(_CLIENT_CLOUD_SPOOL_DIR) if name.endswith(".json")
+        )
+        if not spool_files:
+            return
+        restored_paths = []
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            for filename in spool_files:
+                spool_path = os.path.join(_CLIENT_CLOUD_SPOOL_DIR, filename)
+                try:
+                    with open(spool_path, "r", encoding="utf-8") as spool_file:
+                        entry = json.load(spool_file)
+                    event_id = str(entry["event_id"])
+                    payload_json = str(entry["payload_json"])
+                    if not isinstance(json.loads(payload_json), dict):
+                        raise ValueError("spooled event payload must be an object")
+                except (OSError, KeyError, TypeError, ValueError) as error:
+                    logger.error("Invalid durable cloud delivery spool entry %s: %s", filename, error)
+                    continue
+                conn.execute(
+                    """INSERT OR IGNORE INTO client_cloud_delivery (event_id, payload_json)
+                       VALUES (?, ?)""",
+                    (event_id, payload_json),
+                )
+                restored_paths.append(spool_path)
+            conn.commit()
+        for spool_path in restored_paths:
+            try:
+                os.remove(spool_path)
+            except OSError:
+                logger.exception("Could not remove restored cloud delivery spool entry %s.", spool_path)
+
+
+def get_due_client_cloud_deliveries(limit: int = 50) -> List[Dict[str, Any]]:
+    _restore_client_cloud_delivery_spool()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT event_id, payload_json, attempts
+               FROM client_cloud_delivery
+               WHERE status = 'pending'
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now', 'localtime'))
+               ORDER BY created_at, event_id
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_client_cloud_delivery_succeeded(event_id: str) -> None:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute(
+            """UPDATE client_cloud_delivery
+               SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP,
+                   last_attempt_at = CURRENT_TIMESTAMP, last_error = NULL
+               WHERE event_id = ?""",
+            (event_id,),
+        )
+        conn.commit()
+
+
+def mark_client_cloud_delivery_failed(event_id: str, error: str) -> None:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute(
+            """UPDATE client_cloud_delivery
+               SET attempts = attempts + 1,
+                   next_attempt_at = datetime(
+                       'now', 'localtime',
+                       '+' || MIN(300, (2 << MIN(attempts, 7))) || ' seconds'
+                   ),
+                   last_attempt_at = CURRENT_TIMESTAMP, last_error = ?
+               WHERE event_id = ? AND status = 'pending'""",
+            (error[:500], event_id),
+        )
+        conn.commit()
 
 
 def add_user(
@@ -2364,6 +2605,7 @@ def get_detailed_attendance_report(
     late_time_threshold: str = "09:15:00",
     user_id: Optional[int] = None,
     organization_id: Optional[str] = None,
+    branch_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate comprehensive department-wise, shift-wise, staff-wise, and camera-wise attendance reports.
@@ -2490,6 +2732,12 @@ def get_detailed_attendance_report(
                 else:
                     user_query += " AND u.organization_id = ?"
                     user_params.append(organization_id)
+            if branch_id and branch_id != 'all':
+                if branch_id == 'DEFAULT_BRANCH':
+                    user_query += " AND (u.branch_id = 'DEFAULT_BRANCH' OR u.branch_id IS NULL)"
+                else:
+                    user_query += " AND u.branch_id = ?"
+                    user_params.append(branch_id)
 
             user_query += " ORDER BY u.department ASC, u.name ASC"
             cursor.execute(user_query, user_params)
@@ -3129,8 +3377,8 @@ def mark_user_absent_today(user_id: int, target_date: Optional[str] = None, orga
 
                 cursor.execute('''
                     INSERT OR REPLACE INTO manual_absent (user_id, date, organization_id, branch_id)
-                    VALUES (?, date('now', 'localtime'), user_org, user_branch)
-                ''', (user_id,))
+                    VALUES (?, date('now', 'localtime'), ?, ?)
+                ''', (user_id, user_org, user_branch))
             conn.commit()
         logger.info(f"✓ Manually marked user ID {user_id} absent for {target_date or 'today'} (removed {deleted_count} logs, recorded manual_absent)")
         return True
@@ -4600,20 +4848,27 @@ def check_leave_quota(
 
 
 
-def add_overtime(user_id: int, user_name: str = '', ot_date: str = '', hours: float = 0.0, reason: str = '') -> Optional[int]:
+def add_overtime(user_id: int, user_name: str = '', ot_date: str = '', hours: float = 0.0, reason: str = '',
+                 organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> Optional[int]:
     """Record an overtime log."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            if not user_name:
-                cursor.execute("SELECT name FROM users WHERE id = ?", (user_id,))
-                user_row = cursor.fetchone()
-                if user_row:
+            cursor.execute("SELECT name, organization_id, branch_id FROM users WHERE id = ?", (user_id,))
+            user_row = cursor.fetchone()
+            if user_row:
+                if not user_name:
                     user_name = user_row[0]
+                if not organization_id:
+                    organization_id = user_row[1] or 'DEFAULT_ORG'
+                if not branch_id:
+                    branch_id = user_row[2] or 'DEFAULT_BRANCH'
+            organization_id = organization_id or 'DEFAULT_ORG'
+            branch_id = branch_id or 'DEFAULT_BRANCH'
             cursor.execute(
-                '''INSERT INTO overtime (user_id, user_name, ot_date, hours, reason)
-                   VALUES (?, ?, ?, ?, ?)''',
-                (user_id, user_name, ot_date, hours, reason)
+                '''INSERT INTO overtime (user_id, user_name, ot_date, hours, reason, organization_id, branch_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, user_name, ot_date, hours, reason, organization_id, branch_id)
             )
             conn.commit()
             return cursor.lastrowid
@@ -4667,7 +4922,8 @@ def get_overtime_rate_preview(user_id: int, overtime_date: str) -> Optional[Dict
 
 def get_overtime(user_id: Optional[int] = None, status: Optional[str] = None,
                  department: Optional[str] = None, ot_date: Optional[str] = None,
-                 start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict]:
+                 start_date: Optional[str] = None, end_date: Optional[str] = None,
+                 organization_id: Optional[str] = None, branch_id: Optional[str] = None) -> List[Dict]:
     """Get overtime records optionally filtered by user_id, status, department, and date range."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -4702,6 +4958,18 @@ def get_overtime(user_id: Optional[int] = None, status: Optional[str] = None,
             if end_date:
                 query += " AND o.ot_date <= ?"
                 params.append(end_date)
+            if organization_id and organization_id != 'all':
+                if organization_id == 'DEFAULT_ORG':
+                    query += " AND (COALESCE(o.organization_id, u.organization_id, 'DEFAULT_ORG') = 'DEFAULT_ORG' OR o.organization_id IS NULL OR u.organization_id IS NULL)"
+                else:
+                    query += " AND (o.organization_id = ? OR (o.organization_id IS NULL AND u.organization_id = ?))"
+                    params.extend([organization_id, organization_id])
+            if branch_id and branch_id != 'all':
+                if branch_id == 'DEFAULT_BRANCH':
+                    query += " AND (COALESCE(o.branch_id, u.branch_id, 'DEFAULT_BRANCH') = 'DEFAULT_BRANCH' OR o.branch_id IS NULL OR u.branch_id IS NULL)"
+                else:
+                    query += " AND (o.branch_id = ? OR (o.branch_id IS NULL AND u.branch_id = ?))"
+                    params.extend([branch_id, branch_id])
             query += " ORDER BY o.ot_date DESC, o.created_at DESC"
             cursor.execute(query, params)
             overtime_rows = cursor.fetchall()
@@ -5746,6 +6014,8 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
     records list for those callers.
     """
     _sanitize_orphan_payroll_records()
+    organization_id = organization_id or 'DEFAULT_ORG'
+    branch_id = branch_id or 'DEFAULT_BRANCH'
     if month is not None:
         if payroll_month is None:
             raise ValueError("Payroll year is required when month is provided")
@@ -5760,7 +6030,9 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
         raise ValueError("Payroll month must use YYYY-MM format") from e
     if month_start.strftime("%Y-%m") != str(payroll_month):
         raise ValueError("Payroll month must use YYYY-MM format")
-    finalized_run = get_monthly_payroll(payroll_month, organization_id=organization_id)
+    finalized_run = get_monthly_payroll(
+        payroll_month, organization_id=organization_id, branch_id=branch_id
+    )
     if finalized_run:
         return finalized_run
 
@@ -5797,8 +6069,12 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
             LEFT JOIN salary_configs sc ON sc.user_id = u.id
             WHERE (u.active = 1 OR (u.exit_date IS NOT NULL AND u.exit_date >= ?))
               AND (u.organization_id = ? OR (u.organization_id IS NULL AND ? = 'DEFAULT_ORG') OR (? = 'DEFAULT_ORG' AND u.organization_id = ''))
+              AND (u.branch_id = ? OR (u.branch_id IS NULL AND ? = 'DEFAULT_BRANCH') OR (? = 'DEFAULT_BRANCH' AND u.branch_id = ''))
             ORDER BY u.department COLLATE NOCASE, u.name COLLATE NOCASE
-        ''', (month_start.isoformat(), organization_id, organization_id, organization_id))
+        ''', (
+            month_start.isoformat(), organization_id, organization_id, organization_id,
+            branch_id, branch_id, branch_id,
+        ))
         employees = [dict(row) for row in cursor.fetchall()]
 
         # Query approved overtime for this payroll month
@@ -5807,8 +6083,14 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
             FROM overtime
             WHERE LOWER(status) = 'approved'
               AND ot_date >= ? AND ot_date <= ?
+              AND (organization_id = ? OR (organization_id IS NULL AND ? = 'DEFAULT_ORG') OR (? = 'DEFAULT_ORG' AND organization_id = ''))
+              AND (branch_id = ? OR (branch_id IS NULL AND ? = 'DEFAULT_BRANCH') OR (? = 'DEFAULT_BRANCH' AND branch_id = ''))
             GROUP BY user_id, ot_date
-        ''', (month_start.isoformat(), month_end.isoformat()))
+        ''', (
+            month_start.isoformat(), month_end.isoformat(),
+            organization_id, organization_id, organization_id,
+            branch_id, branch_id, branch_id,
+        ))
         approved_ot_rows = [dict(row) for row in cursor.fetchall()]
         approved_ot_by_user: Dict[int, List[Dict[str, Any]]] = {}
         for overtime_row in approved_ot_rows:
@@ -6065,7 +6347,9 @@ def calculate_monthly_payroll(payroll_month: str | int | None = None, month: Opt
         'records': rows,
     }
     preview['payroll_run_id'] = _persist_draft_monthly_payroll(preview, organization_id=organization_id, branch_id=branch_id)
-    finalized_run = get_monthly_payroll(payroll_month, organization_id=organization_id)
+    finalized_run = get_monthly_payroll(
+        payroll_month, organization_id=organization_id, branch_id=branch_id
+    )
     if finalized_run:
         return finalized_run
     if month is not None and payroll_month.endswith(f"-{int(month):02d}"):
@@ -6107,13 +6391,16 @@ def _insert_payroll_records(cursor: sqlite3.Cursor, run_id: int, rows: List[Dict
 
 def _persist_draft_monthly_payroll(preview: Dict[str, Any], organization_id: str = 'DEFAULT_ORG', branch_id: Optional[str] = None) -> int:
     _sanitize_orphan_payroll_records()
+    organization_id = organization_id or 'DEFAULT_ORG'
+    branch_id = branch_id or 'DEFAULT_BRANCH'
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
-        if organization_id == 'DEFAULT_ORG':
-            cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (preview['payroll_month'], organization_id))
-        else:
-            cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ? AND organization_id = ?", (preview['payroll_month'], organization_id))
+        cursor.execute(
+            "SELECT id, status FROM payroll_runs "
+            "WHERE payroll_month = ? AND organization_id = ? AND branch_id = ?",
+            (preview['payroll_month'], organization_id, branch_id),
+        )
         existing = cursor.fetchone()
         if existing and existing[1] == 'Finalized':
             return existing[0]
@@ -6128,7 +6415,7 @@ def _persist_draft_monthly_payroll(preview: Dict[str, Any], organization_id: str
             ''', (
                 preview['period_start'], preview['period_end'], preview['employee_count'],
                 preview['total_basic_salary'], preview.get('total_allowances', 0.0), preview.get('total_overtime', 0.0),
-                preview['total_deduction'], preview['total_net_salary'], organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH', run_id
+                preview['total_deduction'], preview['total_net_salary'], organization_id, branch_id, run_id
             ))
             cursor.execute("DELETE FROM payroll_records WHERE payroll_run_id = ?", (run_id,))
         else:
@@ -6142,7 +6429,7 @@ def _persist_draft_monthly_payroll(preview: Dict[str, Any], organization_id: str
                 preview['payroll_month'], preview['period_start'], preview['period_end'],
                 preview['employee_count'], preview['total_basic_salary'], preview.get('total_allowances', 0.0),
                 preview.get('total_overtime', 0.0), preview['total_deduction'],
-                preview['total_net_salary'], organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH'
+                preview['total_net_salary'], organization_id, branch_id
             ))
             run_id = cursor.lastrowid
         if run_id is None:
@@ -6152,57 +6439,46 @@ def _persist_draft_monthly_payroll(preview: Dict[str, Any], organization_id: str
         return run_id
 
 
-def get_payroll_history(limit: int = 24, organization_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_payroll_history(
+    limit: int = 24,
+    organization_id: Optional[str] = None,
+    branch_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """List persisted monthly payroll runs without recalculating them, filtered by tenant."""
     safe_limit = max(1, min(int(limit), 120))
+    organization_id = organization_id or 'DEFAULT_ORG'
+    branch_id = branch_id or 'DEFAULT_BRANCH'
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        if organization_id:
-            if organization_id == 'DEFAULT_ORG':
-                cursor.execute('''
-                    SELECT id, payroll_month, period_start, period_end, employee_count,
-                           total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
-                           created_at, finalized_at, organization_id, branch_id
-                    FROM payroll_runs
-                    WHERE (organization_id = ? OR organization_id IS NULL OR organization_id = '')
-                    ORDER BY payroll_month DESC, id DESC
-                    LIMIT ?
-                ''', (organization_id, safe_limit))
-            else:
-                cursor.execute('''
-                    SELECT id, payroll_month, period_start, period_end, employee_count,
-                           total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
-                           created_at, finalized_at, organization_id, branch_id
-                    FROM payroll_runs
-                    WHERE organization_id = ?
-                    ORDER BY payroll_month DESC, id DESC
-                    LIMIT ?
-                ''', (organization_id, safe_limit))
-        else:
-            cursor.execute('''
-                SELECT id, payroll_month, period_start, period_end, employee_count,
-                       total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
-                       created_at, finalized_at, organization_id, branch_id
-                FROM payroll_runs
-                ORDER BY payroll_month DESC, id DESC
-                LIMIT ?
-            ''', (safe_limit,))
+        cursor.execute('''
+            SELECT id, payroll_month, period_start, period_end, employee_count,
+                   total_basic_salary, total_allowances, total_overtime, total_deduction, total_net_salary, status,
+                   created_at, finalized_at, organization_id, branch_id
+            FROM payroll_runs
+            WHERE organization_id = ? AND branch_id = ?
+            ORDER BY payroll_month DESC, id DESC
+            LIMIT ?
+        ''', (organization_id, branch_id, safe_limit))
         return [dict(row) for row in cursor.fetchall()]
 
 
-def get_monthly_payroll(payroll_month: str, organization_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def get_monthly_payroll(
+    payroll_month: str,
+    organization_id: Optional[str] = None,
+    branch_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Load a finalized payroll snapshot for a month, if one exists for the specified tenant."""
+    organization_id = organization_id or 'DEFAULT_ORG'
+    branch_id = branch_id or 'DEFAULT_BRANCH'
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        if organization_id:
-            if organization_id == 'DEFAULT_ORG':
-                cursor.execute("SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized' AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (payroll_month, organization_id))
-            else:
-                cursor.execute("SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized' AND organization_id = ?", (payroll_month, organization_id))
-        else:
-            cursor.execute("SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized'", (payroll_month,))
+        cursor.execute(
+            "SELECT * FROM payroll_runs WHERE payroll_month = ? AND status = 'Finalized' "
+            "AND organization_id = ? AND branch_id = ?",
+            (payroll_month, organization_id, branch_id),
+        )
         run = cursor.fetchone()
         if not run:
             return None
@@ -6237,14 +6513,17 @@ def finalize_monthly_payroll(preview: Dict[str, Any], organization_id: str = 'DE
     if any(row.get('rule_missing') for row in preview.get('records', [])):
         missing_names = [row['employee_name'] for row in preview.get('records', []) if row.get('rule_missing')]
         raise ValueError("Configure active payroll rules for: " + ', '.join(missing_names))
+    organization_id = organization_id or 'DEFAULT_ORG'
+    branch_id = branch_id or 'DEFAULT_BRANCH'
     try:
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            if organization_id == 'DEFAULT_ORG':
-                cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ? AND (organization_id = ? OR organization_id IS NULL OR organization_id = '')", (preview['payroll_month'], organization_id))
-            else:
-                cursor.execute("SELECT id, status FROM payroll_runs WHERE payroll_month = ? AND organization_id = ?", (preview['payroll_month'], organization_id))
+            cursor.execute(
+                "SELECT id, status FROM payroll_runs "
+                "WHERE payroll_month = ? AND organization_id = ? AND branch_id = ?",
+                (preview['payroll_month'], organization_id, branch_id),
+            )
             existing = cursor.fetchone()
             if existing and existing[1] == 'Finalized':
                 return None
@@ -6259,7 +6538,7 @@ def finalize_monthly_payroll(preview: Dict[str, Any], organization_id: str = 'DE
                 ''', (
                     preview['period_start'], preview['period_end'], preview['employee_count'],
                     preview['total_basic_salary'], preview.get('total_allowances', 0.0), preview.get('total_overtime', 0.0),
-                    preview['total_deduction'], preview['total_net_salary'], organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH', run_id
+                    preview['total_deduction'], preview['total_net_salary'], organization_id, branch_id, run_id
                 ))
                 cursor.execute("DELETE FROM payroll_records WHERE payroll_run_id = ?", (run_id,))
             else:
@@ -6273,7 +6552,7 @@ def finalize_monthly_payroll(preview: Dict[str, Any], organization_id: str = 'DE
                     preview['payroll_month'], preview['period_start'], preview['period_end'],
                     preview['employee_count'], preview['total_basic_salary'], preview.get('total_allowances', 0.0),
                     preview.get('total_overtime', 0.0), preview['total_deduction'],
-                    preview['total_net_salary'], organization_id or 'DEFAULT_ORG', branch_id or 'DEFAULT_BRANCH'
+                    preview['total_net_salary'], organization_id, branch_id
                 ))
                 run_id = cursor.lastrowid
             if run_id is None:
@@ -6285,7 +6564,9 @@ def finalize_monthly_payroll(preview: Dict[str, Any], organization_id: str = 'DE
                 WHERE id = ?
             ''', (run_id,))
             conn.commit()
-        return get_monthly_payroll(preview['payroll_month'], organization_id=organization_id)
+        return get_monthly_payroll(
+            preview['payroll_month'], organization_id=organization_id, branch_id=branch_id
+        )
     except Exception as e:
         logger.error(f"Failed to finalize payroll for {preview.get('payroll_month')}: {e}")
         raise

@@ -15,8 +15,7 @@ a = Analysis(
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
-        ('models', 'models'),
-        ('config_node.json', '.')
+        ('models', 'models')
     ],
     hiddenimports=[
         'cv2',
@@ -77,7 +76,13 @@ def _is_cuda_bin(dest):
     return name in _CUDA_EXACT or name.startswith(_CUDA_DLL_PREFIXES)
 
 a.binaries = [b for b in a.binaries if not _is_cuda_bin(b[0])]
-a.datas = [d for d in a.datas if not d[0].replace('\\', '/').lower().endswith('buffalo_l.zip')]
+a.datas = [
+    d for d in a.datas
+    if not d[0].replace('\\', '/').lower().endswith('buffalo_l.zip')
+    and os.path.basename(d[0]).lower() not in {
+        'config_node.json', 'config_node_dev_backup.json', 'config_clean.json'
+    }
+]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

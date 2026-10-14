@@ -26,13 +26,15 @@
 
 ### 2. Configuration
 
-Copy the example configuration:
+The node starts unlinked. Link it from the first-launch activation screen using the organization's issued branch credential. Activation validates the credential with Main Dashboard and writes the returned organization, branch, credential, server URL, and camera configuration to the local `config_node.json`.
 
 ```bash
 cp config_node.example.json config_node.json
 ```
 
-Adjust the RTSP URLs, camera IDs, and target dashboard URL in `config_node.json`.
+The example config is intentionally clean and contains no organization, branch key, or cameras. Do not distribute a runtime `config_node.json`; it contains the linked node's branch credential. CPU/GPU build specs exclude runtime configuration, and outbound service URLs must use HTTPS outside explicit local development/test mode.
+
+Attendance events are persisted in the local SQLite `client_cloud_delivery` outbox before delivery. Failed requests remain pending with bounded exponential backoff and the original event ID, so retries are idempotent and survive node restarts. If SQLite itself is unavailable, the event cannot be durably queued; the node logs this as a critical delivery error rather than reporting it as delivered.
 
 ### 3. Launching the Node
 

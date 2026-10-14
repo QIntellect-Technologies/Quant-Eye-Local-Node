@@ -34,7 +34,9 @@ ENV310/
 !.env.example
 .edge_credentials.json
 config_node.json
+config_node_dev_backup.json
 !config_node.example.json
+.client_cloud_delivery_spool/
 
 # Local runtime data & SQLite databases
 *.db

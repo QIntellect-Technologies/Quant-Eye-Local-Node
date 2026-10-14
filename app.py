@@ -14,6 +14,9 @@ import json
 import base64
 import threading
 import queue
+import uuid
+import secrets
+from urllib.parse import urlsplit
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 import sqlite3
@@ -76,7 +79,15 @@ templates_dir = os.path.join(BUNDLE_DIR, 'templates')
 static_dir = os.path.join(BUNDLE_DIR, 'static')
 
 app = Flask(__name__, template_folder=templates_dir, static_folder=static_dir)
-app.secret_key = "quanteye-client-node-secret-key"
+_node_secret_key = os.environ.get("FLASK_SECRET_KEY")
+_production_runtime = (
+    bool(os.environ.get("RAILWAY_ENVIRONMENT"))
+    or os.environ.get("APP_ENV", "").lower() == "production"
+    or os.environ.get("FLASK_ENV", "").lower() == "production"
+)
+if _production_runtime and len((_node_secret_key or "").strip()) < 32:
+    raise RuntimeError("FLASK_SECRET_KEY must contain at least 32 characters in production.")
+app.secret_key = _node_secret_key or secrets.token_urlsafe(48)
 
 # Persistent config must reside next to EXE, NOT inside temporary _MEIPASS
 CONFIG_PATH = os.path.join(EXE_DIR, 'config_node.json')
@@ -130,79 +141,93 @@ detections_lock = threading.Lock()
 # REAL-TIME ASYNC EVENT DISPATCHER TO CLOUD
 # ==============================================================================
 
-cloud_event_queue = queue.Queue(maxsize=1000)
+_cloud_delivery_wakeup = threading.Event()
+_cloud_delivery_shutdown = threading.Event()
+_cloud_state_sync_shutdown = threading.Event()
+_cloud_absent_users_synced = set()
+_cloud_absent_users_lock = threading.Lock()
+
+
+def _validate_dashboard_url(url: str) -> str:
+    parsed = urlsplit(url)
+    is_development = (
+        app.testing
+        or os.environ.get("FLASK_ENV", "").lower() in {"development", "testing"}
+        or os.environ.get("APP_ENV", "").lower() in {"development", "test"}
+    )
+    local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme != "https" and not (
+        not _production_runtime and is_development and local_http
+    ):
+        raise ValueError("Main Dashboard URL must use HTTPS outside explicit local development/test mode.")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Main Dashboard URL is invalid.")
+    return url.rstrip("/")
+
+def _submit_attendance_event_to_main(event: Dict[str, Any]) -> int:
+    """Submit one event using the persisted branch credential."""
+    branch_key = str(CONFIG.get("branch_key") or "").strip()
+    if not CONFIG.get("linked") or not branch_key:
+        raise RuntimeError("Node has no authenticated branch binding")
+    cloud_base_url = _validate_dashboard_url(str(CONFIG.get('cloud_url') or DEFAULT_CLOUD_URL))
+    cloud_url = f"{cloud_base_url}/api/sync/attendance-event"
+    req = urllib.request.Request(
+        cloud_url,
+        data=json.dumps(event).encode('utf-8'),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "QuantEye-Node",
+            "X-Branch-Key": branch_key,
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=3.5) as response:
+        return response.status
+
+
+def _deliver_due_cloud_events() -> int:
+    """Attempt each currently due durable delivery and persist its outcome."""
+    due_events = db.get_due_client_cloud_deliveries()
+    for record in due_events:
+        event_id = record["event_id"]
+        try:
+            event = json.loads(record["payload_json"])
+            status_code = _submit_attendance_event_to_main(event)
+            if status_code not in (200, 201):
+                raise RuntimeError(f"Main Dashboard did not acknowledge event (HTTP {status_code}).")
+            db.mark_client_cloud_delivery_succeeded(event_id)
+            logger.info("[CLOUD SYNC OK] Event %s delivered to Main Dashboard.", event_id)
+        except Exception as error:
+            db.mark_client_cloud_delivery_failed(event_id, str(error))
+            logger.warning(
+                "[MAIN CLOUD ATTENDANCE ERROR] Event %s remains queued for retry: %s",
+                event_id,
+                error,
+            )
+    return len(due_events)
+
 
 def push_event_to_cloud_worker():
-    """Background worker continuously flushing recognized attendance events to Cloud Portal & Main Dashboard."""
-    while True:
+    """Deliver durable attendance events with bounded exponential retry delay."""
+    while not _cloud_delivery_shutdown.is_set():
         try:
-            event = cloud_event_queue.get()
-            cloud_url = f"{CONFIG.get('cloud_url', DEFAULT_CLOUD_URL).rstrip('/')}/api/sync/attendance-event"
-            portal_url = f"{CONFIG.get('client_portal_url', 'https://quanteye-ai-attendence-production.up.railway.app').rstrip('/')}/api/sync/attendance-event"
-            req_data = json.dumps(event).encode('utf-8')
+            processed = _deliver_due_cloud_events()
+            if not processed:
+                _cloud_delivery_wakeup.wait(timeout=3)
+                _cloud_delivery_wakeup.clear()
+        except Exception:
+            logger.exception("Error in durable cloud attendance delivery worker.")
+            _cloud_delivery_wakeup.wait(timeout=3)
+            _cloud_delivery_wakeup.clear()
 
-            # 1. Deliver to Cloud Client Portal
-            try:
-                preq = urllib.request.Request(
-                    portal_url,
-                    data=req_data,
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "QuantEye-Node",
-                        "X-Client-Auth": "true",
-                        "X-Organization-Id": str(event.get("organization_id", "")),
-                        "X-Branch-Id": str(event.get("branch_id", ""))
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(preq, timeout=4.0) as presp:
-                    if presp.status in (200, 201):
-                        resp_content = presp.read().decode('utf-8')
-                        try:
-                            resp_json = json.loads(resp_content)
-                            if resp_json.get("attendance_logged"):
-                                logger.info(f"✓ [CLOUD PORTAL ATTENDANCE OK] Live attendance for '{event.get('name')}' ({event.get('event_type', 'CHECKIN')}) recorded: {resp_json.get('reason')}")
-                            else:
-                                reason = resp_json.get("reason", "Rejected by cloud rules")
-                                logger.warning(f"[CLOUD PORTAL REJECTED] '{event.get('name')}': {reason}")
-                                uid = event.get("user_id")
-                                if uid and event.get("event_type") != "CHECKOUT":
-                                    with attendance_state_lock:
-                                        USER_ATTENDANCE_STATE.pop(uid, None)
-                        except Exception:
-                            logger.info(f"[ATTENDANCE SYNC OK] Live attendance for '{event.get('name')}' delivered to Cloud Portal.")
-            except Exception as pe:
-                logger.warning(f"[PORTAL ATTENDANCE ERROR] Failed syncing '{event.get('name')}': {pe}")
-                uid = event.get("user_id")
-                if uid and event.get("event_type") != "CHECKOUT":
-                    with attendance_state_lock:
-                        USER_ATTENDANCE_STATE.pop(uid, None)
-
-            # 2. Deliver to Cloud Main Dashboard
-            try:
-                req = urllib.request.Request(
-                    cloud_url,
-                    data=req_data,
-                    headers={"Content-Type": "application/json", "User-Agent": "QuantEye-Node"},
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=3.5) as resp:
-                    if resp.status in (200, 201):
-                        logger.info(f"[CLOUD SYNC OK] Event for '{event.get('name')}' delivered to Main Cloud.")
-            except Exception as ce:
-                logger.debug(f"[MAIN CLOUD NOTE] {ce}")
-
-        except Exception as e:
-            logger.error(f"Error in push_event_to_cloud_worker: {e}")
-        finally:
-            cloud_event_queue.task_done()
-
-threading.Thread(target=push_event_to_cloud_worker, daemon=True).start()
+_cloud_delivery_thread = threading.Thread(target=push_event_to_cloud_worker, daemon=True)
+_cloud_delivery_thread.start()
 
 
 def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: float, camera_id: str, camera_name: str, face_crop_b64: Optional[str] = None, timestamp: Optional[str] = None, event_type: str = "CHECKIN"):
     """Enqueue immediate event for Cloud dispatch."""
     event_payload = {
+        "event_id": str(uuid.uuid4()),
         "organization_id": CONFIG.get("organization_id", "ORG-001"),
         "branch_id": CONFIG.get("branch_id", "BR-FORK-01"),
         "camera_id": camera_id,
@@ -217,9 +242,75 @@ def dispatch_attendance_event_to_cloud(user_id: int, name: str, confidence: floa
         "timestamp": timestamp or datetime.now().isoformat()
     }
     try:
-        cloud_event_queue.put_nowait(event_payload)
-    except queue.Full:
-        logger.warning("Cloud sync queue full, dropping oldest event")
+        db.enqueue_client_cloud_delivery(event_payload["event_id"], event_payload)
+        _cloud_delivery_wakeup.set()
+    except Exception:
+        logger.critical(
+            "Could not persist cloud delivery event %s; it was not delivered to Main Dashboard.",
+            event_payload["event_id"],
+            exc_info=True,
+        )
+
+
+def fetch_cloud_attendance_sync_state() -> Dict[str, Any]:
+    """Fetch the authenticated branch's current manual-absence overrides from Main."""
+    branch_key = str(CONFIG.get("branch_key") or "").strip()
+    if not CONFIG.get("linked") or not branch_key:
+        raise RuntimeError("Node has no authenticated branch binding")
+    cloud_base_url = _validate_dashboard_url(str(CONFIG.get("cloud_url") or DEFAULT_CLOUD_URL))
+    req = urllib.request.Request(
+        f"{cloud_base_url}/api/edge/sync-state",
+        headers={"User-Agent": "QuantEye-Node", "X-Branch-Key": branch_key},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=5.0) as response:
+        state = json.loads(response.read().decode("utf-8"))
+    if not isinstance(state, dict) or not state.get("success"):
+        raise RuntimeError("Main Dashboard did not return a valid attendance sync state")
+    if (
+        state.get("organization_id") != CONFIG.get("organization_id")
+        or state.get("branch_id") != CONFIG.get("branch_id")
+        or not isinstance(state.get("manual_absent_user_ids"), list)
+    ):
+        raise RuntimeError("Main Dashboard attendance sync state does not match this node's branch")
+    return state
+
+
+def apply_cloud_attendance_sync_state(state: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+    """Mirror newly reported cloud absences locally so a later camera check-in is fresh."""
+    state = state or fetch_cloud_attendance_sync_state()
+    current_absent_ids = {int(user_id) for user_id in state["manual_absent_user_ids"]}
+    synced_count = 0
+
+    with _cloud_absent_users_lock:
+        _cloud_absent_users_synced.intersection_update(current_absent_ids)
+        new_absent_ids = current_absent_ids - _cloud_absent_users_synced
+        for user_id in sorted(new_absent_ids):
+            if not db.mark_user_absent_today(
+                user_id,
+                organization_id=str(CONFIG.get("organization_id") or ""),
+            ):
+                raise RuntimeError(
+                    f"Could not mirror cloud absence for employee {user_id} into the local node database"
+                )
+            clear_logged_today_in_memory(user_id)
+            _cloud_absent_users_synced.add(user_id)
+            synced_count += 1
+    return {
+        "manual_absent_count": len(current_absent_ids),
+        "updated_local_count": synced_count,
+    }
+
+
+def _cloud_attendance_state_sync_worker() -> None:
+    """Poll Main for dashboard attendance overrides so connected nodes converge quickly."""
+    while not _cloud_state_sync_shutdown.is_set():
+        if CONFIG.get("linked") and CONFIG.get("branch_key"):
+            try:
+                apply_cloud_attendance_sync_state()
+            except Exception:
+                logger.warning("Could not synchronize cloud attendance state; it will be retried.", exc_info=True)
+        _cloud_state_sync_shutdown.wait(timeout=3.0)
 
 
 # ==============================================================================
@@ -236,8 +327,11 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
     if not org_id:
         return 0
 
-    cloud_clean = cloud_url.rstrip('/') if cloud_url else "https://quanteye-main-dashboard-production.up.railway.app"
+    cloud_clean = _validate_dashboard_url(
+        cloud_url or "https://quanteye-main-dashboard-production.up.railway.app"
+    )
     portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
+    portal_url = _validate_dashboard_url(portal_url)
     imported_count = 0
     portal_queried_successfully = False
 
@@ -944,6 +1038,14 @@ def process_user_attendance_event(user_id: int, name: str, confidence: float, so
             return "CHECKOUT", f"Check-Out recorded at {now.strftime('%I:%M %p')} on {location}"
 
         return "ATTENDANCE_COMPLETED", "Attendance active and completed for assigned shift"
+
+
+_cloud_attendance_state_sync_thread = threading.Thread(
+    target=_cloud_attendance_state_sync_worker,
+    name="cloud-attendance-state-sync",
+    daemon=True,
+)
+_cloud_attendance_state_sync_thread.start()
 
 
 class CameraStreamReader:
@@ -1966,6 +2068,10 @@ def api_node_login_auth():
     password = (data.get('password') or '').strip()
     branch_key = (data.get('branch_key') or '').strip()
     cloud_url = (data.get('cloud_url') or CONFIG.get('cloud_url', DEFAULT_CLOUD_URL)).strip().rstrip('/')
+    try:
+        cloud_url = _validate_dashboard_url(cloud_url)
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 400
 
     if not branch_key and not username:
         return jsonify({"success": False, "error": "Username/Email and Branch Key are required"}), 400
@@ -2068,8 +2174,17 @@ def api_node_activate_key():
 
 @app.route('/api/node/cameras/refresh', methods=['POST', 'GET'])
 def api_node_cameras_refresh():
-    """Dynamically re-pull cloud camera settings and reload local streams."""
+    """Refresh branch employees, attendance overrides, face cache, and camera streams from Cloud."""
     try:
+        org_id = str(CONFIG.get("organization_id") or "").strip()
+        branch_id = str(CONFIG.get("branch_id") or "").strip()
+        cloud_url = str(CONFIG.get("cloud_url") or DEFAULT_CLOUD_URL)
+        if not CONFIG.get("linked") or not org_id or not branch_id:
+            return jsonify({"success": False, "error": "Node must be activated with a branch credential first"}), 400
+
+        imported_count = sync_client_profiles_from_cloud(org_id, branch_id, cloud_url)
+        reload_face_cache()
+        attendance_state = apply_cloud_attendance_sync_state()
         init_camera_streams()
         cams = []
         with readers_lock:
@@ -2083,7 +2198,10 @@ def api_node_cameras_refresh():
                 cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
         return jsonify({
             "success": True,
-            "message": f"Successfully re-synced {len(cams)} cameras from Cloud",
+            "message": "Cloud employees, attendance state, and cameras synchronized",
+            "employee_count": imported_count,
+            "manual_absent_count": attendance_state["manual_absent_count"],
+            "attendance_updates_applied": attendance_state["updated_local_count"],
             "camera_count": len(cams),
             "cameras": cams
         })

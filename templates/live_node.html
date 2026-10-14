@@ -1610,7 +1610,7 @@
     async function restartAndSyncCameras() {
       const btn = document.getElementById('headerRestartBtn');
       if (btn) btn.classList.add('loading');
-      showToast('Syncing real-time camera settings from Cloud...', 'success');
+      showToast('Syncing employees, attendance status, and cameras from Cloud...', 'success');
 
       try {
         const res = await fetch('/api/node/cameras/refresh', { method: 'POST' });
@@ -1634,7 +1634,7 @@
             }
           }
           loadActiveShiftTiming();
-          showToast(`Camera synchronization complete! (${allCameras.length} active)`, 'success');
+          showToast(`Cloud sync complete! ${data.employee_count} employees, ${data.attendance_updates_applied} attendance updates, ${allCameras.length} cameras.`, 'success');
         } else {
           showToast(data.error || 'Failed to refresh cameras', 'error');
         }

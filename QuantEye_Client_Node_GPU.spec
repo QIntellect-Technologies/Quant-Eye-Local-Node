@@ -32,8 +32,7 @@ a = Analysis(
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
-        ('models', 'models'),
-        ('config_node.json', '.')
+        ('models', 'models')
     ],
     hiddenimports=[
         'cv2',
@@ -85,7 +84,13 @@ a = Analysis(
 )
 
 # Strip only duplicate model zip, retain all CUDA & GPU binaries for NVIDIA acceleration
-a.datas = [d for d in a.datas if not d[0].replace('\\', '/').lower().endswith('buffalo_l.zip')]
+a.datas = [
+    d for d in a.datas
+    if not d[0].replace('\\', '/').lower().endswith('buffalo_l.zip')
+    and os.path.basename(d[0]).lower() not in {
+        'config_node.json', 'config_node_dev_backup.json', 'config_clean.json'
+    }
+]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

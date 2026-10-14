@@ -11,8 +11,10 @@ a = Analysis(
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
-        ('models', 'models'),
-        ('config_node.json', '.')
+        ('models', 'models')
+        and os.path.basename(d[0]).lower() not in {
+            'config_node.json', 'config_node_dev_backup.json', 'config_clean.json'
+        }
     ],
     hiddenimports=[
         'cv2',
