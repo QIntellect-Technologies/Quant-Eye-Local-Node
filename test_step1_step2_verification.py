@@ -361,6 +361,40 @@ class TestStep1And2ClientNode(unittest.TestCase):
         self.assertTrue(client_app.db.is_user_manually_absent_today(user_id))
         self.assertNotIn(user_id, client_app.USER_ATTENDANCE_STATE)
 
+        cleared = client_app.apply_cloud_attendance_sync_state({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "manual_absent_user_ids": [],
+        })
+        self.assertEqual(cleared["cleared_local_count"], 1)
+        self.assertFalse(client_app.db.is_user_manually_absent_today(user_id))
+
+    def test_shift_fetch_uses_main_dashboard_branch_key_not_portal_cookies(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "branch_key": "issued-branch-key",
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "cloud_url": "https://main.example.test",
+        })
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = json.dumps({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "shifts": [{"id": 1, "name": "Day", "start_time": "09:00", "end_time": "17:00", "is_default": True, "grace_period_minutes": 15}],
+        }).encode("utf-8")
+        with patch("app.urllib.request.urlopen", return_value=response) as urlopen:
+            shift = client_app.fetch_active_cloud_shift("ORG-CLOUD-SYNC", "BR-CLOUD-SYNC")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://main.example.test/api/edge/shifts")
+        self.assertEqual(request.get_header("X-branch-key"), "issued-branch-key")
+        self.assertNotIn("X-Client-Auth", request.headers)
+        self.assertEqual(shift["name"], "Day")
+
     def test_attendance_sync_state_request_uses_saved_branch_credential(self):
         client_app.CONFIG.update({
             "linked": True,

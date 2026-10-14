@@ -1095,6 +1095,7 @@
           <i class="fa-solid fa-building" style="color:#0284c7;"></i>
           <span id="headerBranchNameText">{% if config.get('linked') %}{{ config.get('organization_name', '') }} &bull; {{ config.get('branch_name', '') }}{% else %}Not Linked &bull; Click to Connect{% endif %}</span>
         </span>
+        <span id="headerSyncStatus" style="font-size:0.75rem; color:#64748b; font-weight:600;"></span>
         <span class="header-separator">|</span>
         <span class="header-current-page" id="headerCurrentPageTitle">Live AI Attendance</span>
       </div>
@@ -1651,6 +1652,15 @@
               selectSingleCamera(allCameras[0].id, allCameras[0].name);
             } else {
               renderCameraGrid();
+            }
+          }
+          if (data.last_sync) {
+            const syncEl = document.getElementById('headerSyncStatus');
+            if (syncEl) {
+              const hop = data.last_sync.hop ? ` (${data.last_sync.hop} hop)` : '';
+              syncEl.textContent = data.last_sync.ok === false
+                ? `Sync error${hop}`
+                : 'Last sync OK';
             }
           }
           if (data.attendance_sync_error) {

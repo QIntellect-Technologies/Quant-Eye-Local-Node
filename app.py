@@ -122,6 +122,20 @@ def load_config() -> Dict[str, Any]:
     return default_cfg
 
 CONFIG = load_config()
+NODE_BUILD_DATE = os.environ.get("QUANTEYE_NODE_BUILD_DATE") or "2026-10-14"
+LAST_CLOUD_SYNC = {
+    "ok": None,
+    "at": None,
+    "hop": None,
+    "error": None,
+}
+
+
+def _record_cloud_sync(ok: bool, hop: Optional[str] = None, error: Optional[str] = None) -> None:
+    LAST_CLOUD_SYNC["ok"] = bool(ok)
+    LAST_CLOUD_SYNC["at"] = datetime.now().isoformat()
+    LAST_CLOUD_SYNC["hop"] = hop
+    LAST_CLOUD_SYNC["error"] = error
 
 # Global Embeddings Vector Matrix
 EMBEDDING_CACHE = {}
@@ -283,8 +297,8 @@ def apply_cloud_attendance_sync_state(state: Optional[Dict[str, Any]] = None) ->
     synced_count = 0
 
     with _cloud_absent_users_lock:
-        _cloud_absent_users_synced.intersection_update(current_absent_ids)
-        new_absent_ids = current_absent_ids - _cloud_absent_users_synced
+        released_ids = set(_cloud_absent_users_synced) - current_absent_ids
+        new_absent_ids = current_absent_ids - set(_cloud_absent_users_synced)
         for user_id in sorted(new_absent_ids):
             if not db.mark_user_absent_today(
                 user_id,
@@ -294,11 +308,18 @@ def apply_cloud_attendance_sync_state(state: Optional[Dict[str, Any]] = None) ->
                     f"Could not mirror cloud absence for employee {user_id} into the local node database"
                 )
             clear_logged_today_in_memory(user_id)
-            _cloud_absent_users_synced.add(user_id)
             synced_count += 1
+        present_released = 0
+        for user_id in sorted(released_ids):
+            db.clear_manual_absent_today(user_id)
+            MANUALLY_ABSENT_USERS.discard(user_id)
+            present_released += 1
+        _cloud_absent_users_synced.clear()
+        _cloud_absent_users_synced.update(current_absent_ids)
     return {
         "manual_absent_count": len(current_absent_ids),
         "updated_local_count": synced_count,
+        "cleared_local_count": present_released,
     }
 
 
@@ -1708,11 +1729,24 @@ def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]
             with urllib.request.urlopen(req, timeout=3.5) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
-                    if data.get("success") and isinstance(data.get("cameras"), list):
+                    if (
+                        data.get("success")
+                        and str(data.get("organization_id") or "") == str(org_id)
+                        and str(data.get("branch_id") or "") == str(branch_id)
+                        and isinstance(data.get("cameras"), list)
+                    ):
                         query_successful = True
+                        _record_cloud_sync(True, hop=None, error=None)
                         for c in data["cameras"]:
                             _add_cam(c)
+                    else:
+                        _record_cloud_sync(False, hop="main", error="Camera payload did not match this branch")
+        except urllib.error.HTTPError as ce:
+            hop = "local" if ce.code in (502, 503) else "main"
+            _record_cloud_sync(False, hop=hop, error=f"Camera sync HTTP {ce.code}")
+            logger.warning(f"[CLOUD SYNC] Main Dashboard camera query failed; preserving cached cameras: {ce}")
         except Exception as ce:
+            _record_cloud_sync(False, hop="main", error=str(ce))
             logger.warning(f"[CLOUD SYNC] Main Dashboard camera query failed; preserving cached cameras: {ce}")
 
     # If remote queries succeeded, return the exact live camera list (even if empty [])
@@ -1828,9 +1862,13 @@ def api_node_status():
         "success": True,
         "linked": CONFIG.get("linked", False),
         "organization_id": CONFIG.get("organization_id"),
+        "organization_name": CONFIG.get("organization_name"),
         "branch_id": CONFIG.get("branch_id"),
+        "branch_name": CONFIG.get("branch_name"),
         "active_cameras": active_count,
-        "face_match_threshold": CONFIG.get("face_match_threshold", 0.45)
+        "face_match_threshold": CONFIG.get("face_match_threshold", 0.45),
+        "build_date": NODE_BUILD_DATE,
+        "last_sync": dict(LAST_CLOUD_SYNC),
     })
 
 
@@ -1950,33 +1988,44 @@ def get_node_cloud_status():
         "cloud_connected": is_connected,
         "cloud_url": cloud_url,
         "organization_id": CONFIG.get("organization_id"),
-        "branch_id": CONFIG.get("branch_id")
+        "organization_name": CONFIG.get("organization_name"),
+        "branch_id": CONFIG.get("branch_id"),
+        "branch_name": CONFIG.get("branch_name"),
+        "build_date": NODE_BUILD_DATE,
+        "last_sync": dict(LAST_CLOUD_SYNC),
     })
 
 
 def fetch_active_cloud_shift(org_id: str = None, branch_id: str = None) -> Dict[str, Any]:
     """
-    Fetch active shifts in real time from Cloud Client Portal (/api/shifts).
+    Fetch active shifts through Main Dashboard using the branch key.
     Calculates the currently active or default shift based on current time.
     """
-    portal_url = CONFIG.get("client_portal_url", "https://quanteye-ai-attendence-production.up.railway.app").rstrip('/')
     shifts = []
+    branch_key = str(CONFIG.get("branch_key") or "").strip()
+    org_id = org_id or CONFIG.get("organization_id")
+    branch_id = branch_id or CONFIG.get("branch_id")
 
-    # 1. Fetch from Cloud Client Portal
-    try:
-        req_url = f"{portal_url}/api/shifts"
-        if org_id:
-            req_url += f"?organization_id={urllib.parse.quote(org_id)}"
-        req = urllib.request.Request(req_url, headers={
-            "User-Agent": "QuantEye-Node",
-            "X-Client-Auth": "true"
-        }, method="GET")
-        with urllib.request.urlopen(req, timeout=3.5) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode('utf-8'))
-                shifts = data.get("shifts", [])
-    except Exception as e:
-        logger.debug(f"[SHIFT SYNC] Could not fetch shifts from cloud ({e}). Falling back to local.")
+    if CONFIG.get("linked") and branch_key and org_id and branch_id:
+        try:
+            cloud_url = _validate_dashboard_url(str(CONFIG.get("cloud_url") or DEFAULT_CLOUD_URL))
+            req = urllib.request.Request(
+                f"{cloud_url}/api/edge/shifts",
+                headers={"User-Agent": "QuantEye-Node", "X-Branch-Key": branch_key},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if (
+                        data.get("success") is True
+                        and str(data.get("organization_id") or "") == str(org_id)
+                        and str(data.get("branch_id") or "") == str(branch_id)
+                        and isinstance(data.get("shifts"), list)
+                    ):
+                        shifts = data["shifts"]
+        except Exception as e:
+            logger.debug(f"[SHIFT SYNC] Could not fetch shifts from Main Dashboard ({e}). Falling back to local.")
 
     # 2. Fallback to local DB if available
     if not shifts:
@@ -2288,10 +2337,13 @@ def api_node_cameras_refresh():
             attendance_state = apply_cloud_attendance_sync_state()
         except Exception as error:
             attendance_sync_error = "Attendance status sync is temporarily unavailable and will retry."
+            _record_cloud_sync(False, hop="local", error=attendance_sync_error)
             logger.warning(
                 "Attendance-state sync failed during camera refresh; preserving camera and staff sync results.",
                 exc_info=True,
             )
+        else:
+            _record_cloud_sync(True, hop=None, error=None)
         init_camera_streams()
         cams = []
         with readers_lock:
@@ -2311,10 +2363,13 @@ def api_node_cameras_refresh():
             "attendance_updates_applied": attendance_state["updated_local_count"] if attendance_state else 0,
             "attendance_sync_error": attendance_sync_error,
             "camera_count": len(cams),
-            "cameras": cams
+            "cameras": cams,
+            "last_sync": dict(LAST_CLOUD_SYNC),
+            "build_date": NODE_BUILD_DATE,
         })
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        _record_cloud_sync(False, hop="main", error=str(e))
+        return jsonify({"success": False, "error": str(e), "failed_hop": LAST_CLOUD_SYNC.get("hop"), "last_sync": dict(LAST_CLOUD_SYNC)}), 500
 
 
 @app.route('/api/node/employees', methods=['GET'])
