@@ -162,6 +162,13 @@ class TestStep1And2ClientNode(unittest.TestCase):
         self.assertTrue(data['success'])
         self.assertIn('cameras', data)
 
+    def test_live_page_renders_camera_state_after_first_empty_poll(self):
+        response = self.client.get('/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"let lastCameraKey = null;", response.data)
+        self.assertIn(b"lastCameraKey === null || newKey !== lastCameraKey", response.data)
+        self.assertIn(b"No Cameras Configured", response.data)
+
     @patch('urllib.request.urlopen')
     def test_camera_sync_authenticates_branch_and_preserves_cache_on_failure(self, mock_urlopen):
         cached_camera = {"id": "cam-cached", "rtsp_url": "rtsp://camera.local/stream"}

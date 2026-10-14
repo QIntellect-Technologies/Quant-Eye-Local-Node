@@ -1424,7 +1424,7 @@
   <script>
     // State
     let allCameras = [];
-    let lastCameraKey = '';
+    let lastCameraKey = null;
     let currentLayout = 'grid';
     let selectedCameraId = null;
     let detectionsFeed = [];
@@ -1484,10 +1484,11 @@
     async function loadCameras() {
       try {
         const res = await fetch('/api/node/cameras');
+        if (!res.ok) throw new Error(`Camera API returned HTTP ${res.status}`);
         const data = await res.json();
         if (data.success && Array.isArray(data.cameras)) {
           const newKey = data.cameras.map(c => `${c.id}:${c.name}`).sort().join('|');
-          if (newKey !== lastCameraKey) {
+          if (lastCameraKey === null || newKey !== lastCameraKey) {
             lastCameraKey = newKey;
             allCameras = data.cameras;
             renderCameraTabs();
@@ -1514,9 +1515,15 @@
               }
             }
           }
+        } else {
+          throw new Error(data.error || 'Camera API returned an invalid response');
         }
       } catch (e) {
         console.debug('Cameras polling note:', e);
+        const container = document.getElementById('cctvCameraTabs');
+        if (container && lastCameraKey === null) {
+          container.innerHTML = `<button class="camera-tab-btn active" type="button"><i class="fa-solid fa-triangle-exclamation"></i> <span>Camera sync unavailable - retrying</span></button>`;
+        }
       }
     }
 
