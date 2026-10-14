@@ -548,6 +548,87 @@ class TestStep1And2ClientNode(unittest.TestCase):
             ).fetchone()
         self.assertEqual(other_branch[0], "Other Branch Employee")
 
+    def test_cloud_trained_employee_templates_sync_into_local_recognition_database(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "branch_key": "issued-branch-key",
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+        })
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            conn.execute("DELETE FROM embeddings WHERE user_id = 8003")
+            conn.execute("DELETE FROM users WHERE id = 8003")
+
+        class MockResponse:
+            def __init__(self, payload):
+                self.status = 200
+                self.payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return None
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        employee_response = MockResponse({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "employees": [{
+                "id": 8003,
+                "name": "Cloud-Trained Employee",
+                "organization_id": "ORG-CLOUD-SYNC",
+                "branch_id": "BR-CLOUD-SYNC",
+                "active": 1,
+                "embedding_count": 1,
+                "has_embedding": True,
+            }],
+        })
+        embedding_response = MockResponse({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "user_id": 8003,
+            "embeddings": [[0.25] * 512],
+            "is_trained": True,
+        })
+
+        with patch(
+            "app.urllib.request.urlopen",
+            side_effect=[employee_response, embedding_response],
+        ) as urlopen:
+            imported = client_app.sync_client_profiles_from_cloud(
+                "ORG-CLOUD-SYNC",
+                "BR-CLOUD-SYNC",
+                "https://main.example.test",
+            )
+
+        self.assertEqual(imported, 1)
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(
+            urlopen.call_args_list[1].args[0].full_url,
+            "https://main.example.test/api/edge/branches/BR-CLOUD-SYNC/employees/8003/embeddings",
+        )
+        self.assertEqual(
+            urlopen.call_args_list[1].args[0].get_header("X-branch-key"),
+            "issued-branch-key",
+        )
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            count, trained, embedding_org, embedding_branch = conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM embeddings WHERE user_id = 8003),
+                    face_trained,
+                    (SELECT organization_id FROM embeddings WHERE user_id = 8003 LIMIT 1),
+                    (SELECT branch_id FROM embeddings WHERE user_id = 8003 LIMIT 1)
+                FROM users WHERE id = 8003
+                """
+            ).fetchone()
+        self.assertEqual(count, 1)
+        self.assertEqual(trained, 1)
+        self.assertEqual(embedding_org, "ORG-CLOUD-SYNC")
+        self.assertEqual(embedding_branch, "BR-CLOUD-SYNC")
+
     def test_cloud_delivery_retries_persist_and_preserve_event_id(self):
         event_id = str(uuid.uuid4())
         event = {"event_id": event_id, "user_id": 101, "name": "Retry Employee"}

@@ -320,6 +320,49 @@ def _cloud_attendance_state_sync_worker() -> None:
 # FAST VECTORIZED FACE MATCHING
 # ==============================================================================
 
+def fetch_trained_employee_embeddings(
+    user_id: int,
+    org_id: str,
+    branch_id: str,
+    cloud_url: str,
+) -> List[List[float]]:
+    """Fetch the canonical face templates for one trained employee in this branch."""
+    branch_key = str(CONFIG.get("branch_key") or "").strip()
+    if not branch_key:
+        raise RuntimeError("Branch key is missing.")
+
+    cloud_clean = _validate_dashboard_url(cloud_url)
+    request_url = (
+        f"{cloud_clean}/api/edge/branches/{branch_id}/employees/{user_id}/embeddings"
+    )
+    req = urllib.request.Request(request_url, headers={
+        "User-Agent": "QuantEye-Node",
+        "X-Branch-Key": branch_key,
+    }, method="GET")
+    with urllib.request.urlopen(req, timeout=15.0) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    vectors = data.get("embeddings")
+    if (
+        response.status != 200
+        or data.get("success") is not True
+        or str(data.get("organization_id")) != str(org_id)
+        or str(data.get("branch_id")) != str(branch_id)
+        or int(data.get("user_id", -1)) != int(user_id)
+        or not isinstance(vectors, list)
+        or not 1 <= len(vectors) <= 20
+    ):
+        raise ValueError("Cloud returned invalid or mismatched employee face templates.")
+
+    validated_vectors = []
+    for vector in vectors:
+        validated = np.asarray(vector, dtype=np.float32)
+        if validated.shape != (512,) or not np.isfinite(validated).all():
+            raise ValueError("Cloud returned a malformed employee face template.")
+        validated_vectors.append(validated.tolist())
+    return validated_vectors
+
+
 def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str) -> int:
     """
     Sync client employees from Cloud Portal and Main Cloud for this organization & branch.
@@ -366,6 +409,48 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                     except (KeyError, TypeError, ValueError):
                         logger.error("[PORTAL SYNC] Cloud returned an employee with an invalid numeric ID; preserving cached staff profiles.")
                         return 0
+
+                synced_embeddings = {}
+                for user in users:
+                    try:
+                        cloud_embedding_count = int(user.get("embedding_count") or 0)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "[PORTAL SYNC] Employee %s returned an invalid face-template count.",
+                            user.get("id"),
+                        )
+                        continue
+                    if user.get("has_embedding") is not True and cloud_embedding_count <= 0:
+                        continue
+
+                    user_id = int(user["id"])
+                    with sqlite3.connect(db.DB_PATH) as conn:
+                        local_embedding_count = conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM embeddings e
+                            JOIN users u ON u.id = e.user_id
+                            WHERE u.id = ? AND u.organization_id = ? AND u.branch_id = ?
+                              AND e.organization_id = ? AND e.branch_id = ?
+                            """,
+                            (user_id, org_id, branch_id, org_id, branch_id),
+                        ).fetchone()[0]
+                    if local_embedding_count > 0 and local_embedding_count == cloud_embedding_count:
+                        continue
+
+                    try:
+                        synced_embeddings[user_id] = fetch_trained_employee_embeddings(
+                            user_id,
+                            org_id,
+                            branch_id,
+                            cloud_clean,
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            "[PORTAL SYNC] Could not retrieve trained face templates for employee %s; preserving local templates and retrying on the next sync: %s",
+                            user_id,
+                            error,
+                        )
                 
                 with sqlite3.connect(db.DB_PATH) as conn:
                     cur = conn.cursor()
@@ -437,14 +522,41 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                         if row:
                             cur.execute("""
                                 UPDATE users 
-                                SET name = ?, email = ?, phone = ?, department = ?, position = ?, notes = ?, active = ?, organization_id = ?, branch_id = ?
+                                SET name = ?, email = ?, phone = ?, department = ?, position = ?, notes = ?, active = ?, organization_id = ?, branch_id = ?,
+                                    face_trained = CASE WHEN ? THEN 1 ELSE COALESCE(face_trained, 0) END
                                 WHERE id = ?
-                            """, (u_name, u_email, u_phone, u_dept, u_pos, u_code, u_active, u_org, u_branch, row[0]))
+                            """, (
+                                u_name, u_email, u_phone, u_dept, u_pos, u_code, u_active,
+                                u_org, u_branch, int(int(u_id) in synced_embeddings), row[0],
+                            ))
                         else:
                             cur.execute("""
-                                INSERT INTO users (id, name, email, phone, department, position, notes, active, organization_id, branch_id)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (int(u_id), u_name, u_email, u_phone, u_dept, u_pos, u_code, u_active, u_org, u_branch))
+                                INSERT INTO users (id, name, email, phone, department, position, notes, active, organization_id, branch_id, face_trained)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                int(u_id), u_name, u_email, u_phone, u_dept, u_pos, u_code,
+                                u_active, u_org, u_branch, int(int(u_id) in synced_embeddings),
+                            ))
+                        employee_embeddings = synced_embeddings.get(int(u_id))
+                        if employee_embeddings:
+                            cur.execute("DELETE FROM embeddings WHERE user_id = ?", (int(u_id),))
+                            cur.executemany(
+                                """
+                                INSERT INTO embeddings (
+                                    user_id, embedding, source_video, organization_id, branch_id
+                                ) VALUES (?, ?, ?, ?, ?)
+                                """,
+                                [
+                                    (
+                                        int(u_id),
+                                        json.dumps(vector).encode("utf-8"),
+                                        "cloud_face_template_sync",
+                                        u_org,
+                                        u_branch,
+                                    )
+                                    for vector in employee_embeddings
+                                ],
+                            )
                         imported_count += 1
                     conn.commit()
                 logger.info(f"[PORTAL SYNC] Synced {imported_count} staff profiles from Cloud Portal for {org_id}/{branch_id}")
@@ -2688,10 +2800,25 @@ def api_node_train_video():
             for emb in embeddings:
                 emb_list = emb.tolist() if isinstance(emb, np.ndarray) else list(emb)
                 cur.execute(
-                    "INSERT INTO embeddings (user_id, embedding, source_video) VALUES (?, ?, ?)",
-                    (user_id, json.dumps(emb_list).encode(), f"video_enroll_{video_file.filename}")
+                    "INSERT INTO embeddings (user_id, embedding, source_video, organization_id, branch_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        user_id,
+                        json.dumps(emb_list).encode(),
+                        f"video_enroll_{video_file.filename}",
+                        CONFIG.get("organization_id") or "DEFAULT_ORG",
+                        CONFIG.get("branch_id") or "DEFAULT_BRANCH",
+                    )
                 )
                 saved_count += 1
+            cur.execute(
+                "UPDATE users SET face_trained = 1 WHERE id = ? AND organization_id = ? AND branch_id = ?",
+                (
+                    int(user_id),
+                    CONFIG.get("organization_id") or "DEFAULT_ORG",
+                    CONFIG.get("branch_id") or "DEFAULT_BRANCH",
+                ),
+            )
             conn.commit()
 
         # Instantly refresh in-memory face matching matrix
