@@ -485,20 +485,26 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                     except Exception: pass
 
                     if not cloud_ids:
-                        # An authenticated, branch-matched empty response is authoritative.
-                        cur.execute("""
-                            DELETE FROM embeddings 
-                            WHERE user_id IN (
-                                SELECT id FROM users 
-                                WHERE organization_id = ? AND branch_id = ?
-                            )
-                        """, (org_id, branch_id))
-                        cur.execute("""
-                            DELETE FROM users 
+                        local_count = cur.execute(
+                            """
+                            SELECT COUNT(*) FROM users
                             WHERE organization_id = ? AND branch_id = ?
-                        """, (org_id, branch_id))
-                        conn.commit()
-                        logger.info(f"[PORTAL SYNC] Cloud has 0 staff profiles. Cleared branch staff and embeddings for {org_id}/{branch_id}.")
+                            """,
+                            (org_id, branch_id),
+                        ).fetchone()[0]
+                        if local_count > 0:
+                            logger.error(
+                                "[PORTAL SYNC] Cloud returned 0 staff for %s/%s but this node already has %s cached profiles; preserving local staff and face templates.",
+                                org_id,
+                                branch_id,
+                                local_count,
+                            )
+                            return 0
+                        logger.info(
+                            "[PORTAL SYNC] Cloud has 0 staff profiles for empty branch %s/%s.",
+                            org_id,
+                            branch_id,
+                        )
                         reload_face_cache()
                         return 0
 
@@ -1963,6 +1969,15 @@ def get_node_detections():
     with cache_lock:
         feed = list(LATEST_STREAM_DETECTIONS)
     return jsonify({"success": True, "detections": feed})
+
+
+@app.route('/api/node/clear-live-detections', methods=['POST', 'GET'])
+def clear_node_live_detections():
+    """Clear the on-screen live attendance list without changing stored attendance rows."""
+    global LATEST_STREAM_DETECTIONS
+    with cache_lock:
+        LATEST_STREAM_DETECTIONS.clear()
+    return jsonify({"success": True, "message": "Live detections cleared successfully"}), 200
 
 
 @app.route('/api/live-detections', methods=['GET'])

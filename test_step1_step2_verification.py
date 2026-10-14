@@ -663,6 +663,56 @@ class TestStep1And2ClientNode(unittest.TestCase):
         self.assertEqual(embedding_org, "ORG-CLOUD-SYNC")
         self.assertEqual(embedding_branch, "BR-CLOUD-SYNC")
 
+    def test_empty_cloud_staff_list_does_not_wipe_cached_branch_profiles(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "branch_key": "issued-branch-key",
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+        })
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            conn.execute("DELETE FROM embeddings WHERE user_id = 8004")
+            conn.execute("DELETE FROM users WHERE id = 8004")
+            conn.execute(
+                "INSERT INTO users (id, name, organization_id, branch_id, active, face_trained) "
+                "VALUES (8004, 'Cached Employee', 'ORG-CLOUD-SYNC', 'BR-CLOUD-SYNC', 1, 1)"
+            )
+            conn.execute(
+                "INSERT INTO embeddings (user_id, embedding, organization_id, branch_id) "
+                "VALUES (?, ?, ?, ?)",
+                (8004, json.dumps([0.5] * 512).encode("utf-8"), "ORG-CLOUD-SYNC", "BR-CLOUD-SYNC"),
+            )
+
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "employees": [],
+        }).encode("utf-8")
+
+        with patch("app.urllib.request.urlopen", return_value=response):
+            imported = client_app.sync_client_profiles_from_cloud(
+                "ORG-CLOUD-SYNC",
+                "BR-CLOUD-SYNC",
+                "https://main.example.test",
+            )
+
+        self.assertEqual(imported, 0)
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            name, trained, emb_count = conn.execute(
+                """
+                SELECT name, face_trained,
+                       (SELECT COUNT(*) FROM embeddings WHERE user_id = 8004)
+                FROM users WHERE id = 8004
+                """
+            ).fetchone()
+        self.assertEqual(name, "Cached Employee")
+        self.assertEqual(trained, 1)
+        self.assertEqual(emb_count, 1)
+
     def test_cloud_delivery_retries_persist_and_preserve_event_id(self):
         event_id = str(uuid.uuid4())
         event = {"event_id": event_id, "user_id": 101, "name": "Retry Employee"}

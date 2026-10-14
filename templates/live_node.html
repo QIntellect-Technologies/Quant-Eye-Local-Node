@@ -1214,7 +1214,7 @@
             </div>
             <div style="display:flex; align-items:center; gap:6px;">
               <span id="liveTotalCountBadge" style="background:#e0f2fe; color:#0369a1; font-weight:800; font-size:0.72rem; padding:2px 8px; border-radius:6px; border:1px solid #bae6fd;">Total: 0</span>
-              <button type="button" class="btn btn-sm btn-outline-danger" onclick="clearLiveDetectionsList()" style="padding:2px 7px; font-size:0.72rem; border-radius:6px;" title="Clear List">
+              <button type="button" class="btn btn-sm btn-outline-danger" onclick="clearLiveDetectionsList()" style="padding:2px 7px; font-size:0.72rem; border-radius:6px;" title="Delete History">
                 <i class="fa-solid fa-trash-can"></i>
               </button>
             </div>
@@ -1757,8 +1757,15 @@
       renderTickerFeed();
     }
 
-    function clearLiveDetectionsList() {
+    async function clearLiveDetectionsList() {
+      if (!confirm('Clear all live attendance entries from this view?')) return;
+      try {
+        await fetch('/api/node/clear-live-detections', { method: 'POST' });
+      } catch (e) {
+        console.warn('Clear live detections API error:', e);
+      }
       detectionsFeed = [];
+      tickerCurrentPage = 1;
       renderTickerFeed();
       const badge = document.getElementById('liveTotalCountBadge');
       if (badge) badge.textContent = 'Total: 0';
