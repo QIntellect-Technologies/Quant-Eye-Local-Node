@@ -540,6 +540,14 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                             conn.rollback()
                             return 0
                         u_active = int(u.get("active", 1))
+                        try:
+                            u_shift = int(u.get("shift_id") or 1)
+                        except (TypeError, ValueError):
+                            u_shift = 1
+                        if u_shift < 1:
+                            u_shift = 1
+                        u_checkin_cams = str(u.get("checkin_cameras") or "all").strip() or "all"
+                        u_checkout_cams = str(u.get("checkout_cameras") or "all").strip() or "all"
 
                         cur.execute("""
                             SELECT id FROM users
@@ -550,19 +558,22 @@ def sync_client_profiles_from_cloud(org_id: str, branch_id: str, cloud_url: str)
                             cur.execute("""
                                 UPDATE users 
                                 SET name = ?, email = ?, phone = ?, department = ?, position = ?, notes = ?, active = ?, organization_id = ?, branch_id = ?,
+                                    shift_id = ?, checkin_cameras = ?, checkout_cameras = ?,
                                     face_trained = CASE WHEN ? THEN 1 ELSE COALESCE(face_trained, 0) END
                                 WHERE id = ?
                             """, (
                                 u_name, u_email, u_phone, u_dept, u_pos, u_code, u_active,
-                                u_org, u_branch, int(int(u_id) in synced_embeddings), row[0],
+                                u_org, u_branch, u_shift, u_checkin_cams, u_checkout_cams,
+                                int(int(u_id) in synced_embeddings), row[0],
                             ))
                         else:
                             cur.execute("""
-                                INSERT INTO users (id, name, email, phone, department, position, notes, active, organization_id, branch_id, face_trained)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                INSERT INTO users (id, name, email, phone, department, position, notes, active, organization_id, branch_id, face_trained, shift_id, checkin_cameras, checkout_cameras)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (
                                 int(u_id), u_name, u_email, u_phone, u_dept, u_pos, u_code,
                                 u_active, u_org, u_branch, int(int(u_id) in synced_embeddings),
+                                u_shift, u_checkin_cams, u_checkout_cams,
                             ))
                         employee_embeddings = synced_embeddings.get(int(u_id))
                         if employee_embeddings:
@@ -702,8 +713,42 @@ def sync_branch_shifts_from_cloud(org_id: str, branch_id: str, cloud_url: str) -
                         ),
                     )
                 imported += 1
+            assignments = data.get("assignments") or []
+            assigned = 0
+            if isinstance(assignments, list):
+                for assignment in assignments:
+                    try:
+                        user_id = int(assignment["user_id"])
+                        assigned_shift_id = int(assignment["shift_id"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if assigned_shift_id < 1:
+                        continue
+                    local_user = cur.execute(
+                        "SELECT id FROM users WHERE id = ? AND organization_id = ? AND branch_id = ?",
+                        (user_id, org_id, branch_id),
+                    ).fetchone()
+                    if not local_user:
+                        continue
+                    in_cams = str(assignment.get("checkin_cameras") or "all").strip() or "all"
+                    out_cams = str(assignment.get("checkout_cameras") or "all").strip() or "all"
+                    cur.execute(
+                        """
+                        UPDATE users
+                        SET shift_id = ?, checkin_cameras = ?, checkout_cameras = ?
+                        WHERE id = ? AND organization_id = ? AND branch_id = ?
+                        """,
+                        (assigned_shift_id, in_cams, out_cams, user_id, org_id, branch_id),
+                    )
+                    assigned += 1
             conn.commit()
-        logger.info("[SHIFT SYNC] Synced %s shift schedule(s) from Cloud for %s/%s.", imported, org_id, branch_id)
+        logger.info(
+            "[SHIFT SYNC] Synced %s shift schedule(s) and %s staff assignment(s) from Cloud for %s/%s.",
+            imported,
+            assigned,
+            org_id,
+            branch_id,
+        )
         return imported
     except Exception as error:
         logger.warning("[SHIFT SYNC] Could not sync branch shifts; preserving cached shift hours: %s", error)

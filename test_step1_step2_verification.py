@@ -554,6 +554,9 @@ class TestStep1And2ClientNode(unittest.TestCase):
                 "organization_id": "ORG-CLOUD-SYNC",
                 "branch_id": "BR-CLOUD-SYNC",
                 "active": 1,
+                "shift_id": 3,
+                "checkin_cameras": "Room",
+                "checkout_cameras": "AI TEAM ROOM",
             }],
         }).encode("utf-8")
 
@@ -576,6 +579,9 @@ class TestStep1And2ClientNode(unittest.TestCase):
             branch_id="BR-CLOUD-SYNC",
         )
         self.assertEqual([user["id"] for user in scoped_users], [8001])
+        self.assertEqual(scoped_users[0]["shift_id"], 3)
+        self.assertEqual(scoped_users[0]["checkin_cameras"], "Room")
+        self.assertEqual(scoped_users[0]["checkout_cameras"], "AI TEAM ROOM")
         self.assertFalse(scoped_users[0]["has_embedding"])
         with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
             other_branch = conn.execute(
@@ -785,6 +791,113 @@ class TestStep1And2ClientNode(unittest.TestCase):
         )
         self.assertFalse(blocked)
         self.assertIn("23:04", blocked_reason)
+
+    def test_cloud_shift_assignments_move_staff_off_default_morning_shift(self):
+        client_app.CONFIG.update({
+            "linked": True,
+            "branch_key": "issued-branch-key",
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+        })
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            conn.execute("DELETE FROM users WHERE id = 8019")
+            conn.execute("DELETE FROM shifts WHERE id = 3")
+            conn.execute(
+                "INSERT INTO users (id, name, organization_id, branch_id, active, shift_id) "
+                "VALUES (8019, 'Imran Khalid', 'ORG-CLOUD-SYNC', 'BR-CLOUD-SYNC', 1, 1)"
+            )
+            conn.execute(
+                "UPDATE shifts SET name = 'Morning Shift', start_time = '09:10', end_time = '17:13', grace_period_minutes = 2 WHERE id = 1"
+            )
+
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "success": True,
+            "organization_id": "ORG-CLOUD-SYNC",
+            "branch_id": "BR-CLOUD-SYNC",
+            "shifts": [
+                {
+                    "id": 1,
+                    "name": "Morning Shift",
+                    "start_time": "09:10",
+                    "end_time": "17:13",
+                    "grace_period_minutes": 2,
+                    "is_default": True,
+                    "active": 1,
+                },
+                {
+                    "id": 3,
+                    "name": "Evening",
+                    "start_time": "21:35",
+                    "end_time": "21:38",
+                    "grace_period_minutes": 2,
+                    "is_default": False,
+                    "active": 1,
+                },
+            ],
+            "assignments": [{
+                "user_id": 8019,
+                "shift_id": 3,
+                "checkin_cameras": "Room",
+                "checkout_cameras": "AI TEAM ROOM",
+            }],
+        }).encode("utf-8")
+
+        with patch("app.urllib.request.urlopen", return_value=response):
+            imported = client_app.sync_branch_shifts_from_cloud(
+                "ORG-CLOUD-SYNC",
+                "BR-CLOUD-SYNC",
+                "https://main.example.test",
+            )
+
+        self.assertEqual(imported, 2)
+        allowed, reason, info = client_app.db.check_user_shift_allowed(
+            8019,
+            datetime(2026, 10, 15, 21, 36, 0),
+        )
+        self.assertTrue(allowed, reason)
+        self.assertEqual(info["name"], "Evening")
+        blocked, blocked_reason, blocked_info = client_app.db.check_user_shift_allowed(
+            8019,
+            datetime(2026, 10, 15, 9, 11, 0),
+        )
+        self.assertFalse(blocked)
+        self.assertEqual(blocked_info["name"], "Evening")
+        self.assertIn("21:35", blocked_reason)
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            in_cams, out_cams = conn.execute(
+                "SELECT checkin_cameras, checkout_cameras FROM users WHERE id = 8019"
+            ).fetchone()
+        self.assertEqual(in_cams, "Room")
+        self.assertEqual(out_cams, "AI TEAM ROOM")
+
+    def test_room_assignment_does_not_authorize_ai_team_room_camera(self):
+        with client_app.db.sqlite3.connect(client_app.db.DB_PATH) as conn:
+            conn.execute("DELETE FROM cameras WHERE camera_id IN ('cam_1669', 'cam_8577')")
+            conn.execute("DELETE FROM users WHERE id = 8020")
+            conn.execute(
+                "INSERT INTO cameras (camera_id, name, room_name, camera_type, rtsp_url, active) "
+                "VALUES ('cam_1669', 'NVR', 'Room', 'nvr', 'rtsp://room', 1)"
+            )
+            conn.execute(
+                "INSERT INTO cameras (camera_id, name, room_name, camera_type, rtsp_url, active) "
+                "VALUES ('cam_8577', 'DVR', 'AI TEAM ROOM', 'dvr', 'rtsp://team', 1)"
+            )
+            conn.execute(
+                "INSERT INTO users (id, name, active, checkin_cameras, checkout_cameras) "
+                "VALUES (8020, 'Imran Khalid', 1, 'Room', 'AI TEAM ROOM')"
+            )
+
+        allowed_in, reason_in = client_app.db.check_user_camera_allowed(8020, "cam_1669", "checkin")
+        blocked_out, reason_out = client_app.db.check_user_camera_allowed(8020, "cam_1669", "checkout")
+        allowed_out, reason_team = client_app.db.check_user_camera_allowed(8020, "cam_8577", "checkout")
+
+        self.assertTrue(allowed_in, reason_in)
+        self.assertFalse(blocked_out)
+        self.assertIn("not authorized", reason_out.lower())
+        self.assertTrue(allowed_out, reason_team)
 
     def test_cloud_delivery_retries_persist_and_preserve_event_id(self):
         event_id = str(uuid.uuid4())
