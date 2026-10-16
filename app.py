@@ -659,6 +659,7 @@ def sync_branch_shifts_from_cloud(org_id: str, branch_id: str, cloud_url: str) -
                     pass
 
             imported = 0
+            keep_ids = []
             for shift in shifts:
                 try:
                     shift_id = int(shift["id"])
@@ -713,6 +714,13 @@ def sync_branch_shifts_from_cloud(org_id: str, branch_id: str, cloud_url: str) -
                         ),
                     )
                 imported += 1
+                keep_ids.append(shift_id)
+            if keep_ids:
+                placeholders = ",".join("?" for _ in keep_ids)
+                cur.execute(
+                    f"UPDATE shifts SET active = 0 WHERE organization_id = ? AND id NOT IN ({placeholders})",
+                    (org_id, *keep_ids),
+                )
             assignments = data.get("assignments") or []
             assigned = 0
             if isinstance(assignments, list):

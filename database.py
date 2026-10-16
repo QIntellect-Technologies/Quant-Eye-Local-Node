@@ -1877,9 +1877,9 @@ def get_all_shifts(active_only: bool = True, organization_id: Optional[str] = No
                 where_clauses.append("s.active = 1")
             if organization_id and organization_id != 'all':
                 if organization_id == 'DEFAULT_ORG':
-                    where_clauses.append("(s.organization_id = 'DEFAULT_ORG' OR s.organization_id IS NULL OR s.id = 1)")
+                    where_clauses.append("(s.organization_id = 'DEFAULT_ORG' OR s.organization_id IS NULL OR s.organization_id = '')")
                 else:
-                    where_clauses.append("(s.organization_id = ? OR s.id = 1)")
+                    where_clauses.append("s.organization_id = ?")
                     params.append(organization_id)
             where_clause = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
             cursor.execute(f'''
