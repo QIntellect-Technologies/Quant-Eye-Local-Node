@@ -42,6 +42,7 @@ a = Analysis(
         'flask',
         'werkzeug',
         'sqlite3',
+        'certifi',
         'PIL'
     ],
     hookspath=[],

@@ -20,8 +20,14 @@ from urllib.parse import urlsplit
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 import sqlite3
+import ssl
 import urllib.request
 import urllib.error
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 # Fix Windows console stream
 class DummyStream:
@@ -160,6 +166,40 @@ _cloud_delivery_shutdown = threading.Event()
 _cloud_state_sync_shutdown = threading.Event()
 _cloud_absent_users_synced = set()
 _cloud_absent_users_lock = threading.Lock()
+
+
+def _https_context() -> ssl.SSLContext:
+    """Trust current public CAs plus the Windows store. Frozen EXEs otherwise keep an old list."""
+    if certifi is not None:
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    else:
+        ctx = ssl.create_default_context()
+    if sys.platform == "win32":
+        try:
+            for store_name in ("CA", "ROOT"):
+                for der, encoding, _trust in ssl.enum_certificates(store_name):
+                    if encoding == "x509_asn":
+                        try:
+                            ctx.load_verify_locations(cadata=der)
+                        except ssl.SSLError:
+                            continue
+        except Exception:
+            pass
+    return ctx
+
+
+ssl._create_default_https_context = _https_context
+
+
+def _cloud_connection_error(error: Exception) -> str:
+    text = str(error)
+    lowered = text.lower()
+    if "certificate" in lowered or "ssl" in lowered:
+        return (
+            "Could not securely connect to the cloud. "
+            "Set this laptop's date and time to automatic, then try again."
+        )
+    return f"Connection error: {text}"
 
 
 def _validate_dashboard_url(url: str) -> str:
@@ -2361,6 +2401,7 @@ def api_node_logout():
             "error": "Could not save the logout. Please retry before signing in to another organization."
         }), 500
 
+    db.ensure_client_cloud_delivery_table()
     logger.info("[NODE LOGOUT] Successfully logged out from current organization.")
     return jsonify({
         "success": True,
@@ -2491,7 +2532,7 @@ def api_node_login_auth():
         except Exception:
             return jsonify({"success": False, "error": f"Server rejected login (HTTP {he.code})"}), he.code
     except Exception as e:
-        return jsonify({"success": False, "error": f"Connection error: {str(e)}"}), 502
+        return jsonify({"success": False, "error": _cloud_connection_error(e)}), 502
 
 
 @app.route('/api/node/activate-key', methods=['POST'])

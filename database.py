@@ -14,18 +14,60 @@ _CLIENT_CLOUD_SPOOL_DIR = os.path.join(os.path.dirname(os.path.abspath(DB_PATH))
 _CLIENT_CLOUD_SPOOL_LOCK = threading.Lock()
 
 
+
+def ensure_client_cloud_delivery_table(cursor: Optional[sqlite3.Cursor] = None) -> None:
+    """Guarantee client_cloud_delivery outbox table and indexes always exist."""
+    sql = '''
+        CREATE TABLE IF NOT EXISTS client_cloud_delivery (
+            event_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_attempt_at TIMESTAMP,
+            last_error TEXT,
+            delivered_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_client_cloud_delivery_due 
+        ON client_cloud_delivery(status, next_attempt_at);
+    '''
+    try:
+        if cursor is not None:
+            cursor.executescript(sql)
+        else:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.executescript(sql)
+                conn.commit()
+    except Exception as e:
+        logger.error(f"ensure_client_cloud_delivery_table error: {e}")
+
+
 def _migrate_payroll_run_tenant_uniqueness(cursor: sqlite3.Cursor) -> None:
+    # Always drop triggers that depend on payroll_runs before modifying or checking payroll_runs
+    cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_run_update")
+    cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_run_delete")
+    cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_record_insert")
+    cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_record_update")
+    cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_record_delete")
+
     staged_table = cursor.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'payroll_runs_scoped'"
     ).fetchone()
     if staged_table:
-        source_count = cursor.execute("SELECT COUNT(*) FROM payroll_runs").fetchone()[0]
-        staged_count = cursor.execute("SELECT COUNT(*) FROM payroll_runs_scoped").fetchone()[0]
-        if source_count == 0 and staged_count > 0:
-            cursor.execute("DROP TABLE payroll_runs")
+        runs_table = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'payroll_runs'"
+        ).fetchone()
+        if not runs_table:
             cursor.execute("ALTER TABLE payroll_runs_scoped RENAME TO payroll_runs")
         else:
-            cursor.execute("DROP TABLE payroll_runs_scoped")
+            source_count = cursor.execute("SELECT COUNT(*) FROM payroll_runs").fetchone()[0]
+            staged_count = cursor.execute("SELECT COUNT(*) FROM payroll_runs_scoped").fetchone()[0]
+            if source_count == 0 and staged_count > 0:
+                cursor.execute("DROP TABLE payroll_runs")
+                cursor.execute("ALTER TABLE payroll_runs_scoped RENAME TO payroll_runs")
+            else:
+                cursor.execute("DROP TABLE payroll_runs_scoped")
 
     month_only_unique = False
     for index in cursor.execute("PRAGMA index_list(payroll_runs)").fetchall():
@@ -38,8 +80,6 @@ def _migrate_payroll_run_tenant_uniqueness(cursor: sqlite3.Cursor) -> None:
             month_only_unique = True
             break
     if month_only_unique:
-        cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_run_update")
-        cursor.execute("DROP TRIGGER IF EXISTS prevent_finalized_payroll_run_delete")
         cursor.execute("""
             CREATE TABLE payroll_runs_scoped (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +134,24 @@ def _migrate_payroll_run_tenant_uniqueness(cursor: sqlite3.Cursor) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'Finalized payroll runs are immutable');
         END;
+        CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_record_insert
+        BEFORE INSERT ON payroll_records
+        WHEN EXISTS (SELECT 1 FROM payroll_runs WHERE id = NEW.payroll_run_id AND status = 'Finalized')
+        BEGIN
+            SELECT RAISE(ABORT, 'Finalized payroll records are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_record_update
+        BEFORE UPDATE ON payroll_records
+        WHEN EXISTS (SELECT 1 FROM payroll_runs WHERE id = OLD.payroll_run_id AND status = 'Finalized')
+        BEGIN
+            SELECT RAISE(ABORT, 'Finalized payroll records are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS prevent_finalized_payroll_record_delete
+        BEFORE DELETE ON payroll_records
+        WHEN EXISTS (SELECT 1 FROM payroll_runs WHERE id = OLD.payroll_run_id AND status = 'Finalized')
+        BEGIN
+            SELECT RAISE(ABORT, 'Finalized payroll records are immutable');
+        END;
     """)
 
 
@@ -137,6 +195,7 @@ def init_db():
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            ensure_client_cloud_delivery_table(cursor)
 
             # Users table (scoped per organization)
             cursor.execute('''
@@ -1024,6 +1083,7 @@ def enqueue_client_cloud_delivery(event_id: str, payload: Dict[str, Any]) -> Non
     payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     try:
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            ensure_client_cloud_delivery_table(conn.cursor())
             conn.execute(
                 """INSERT OR IGNORE INTO client_cloud_delivery (event_id, payload_json)
                    VALUES (?, ?)""",
@@ -1075,6 +1135,7 @@ def _restore_client_cloud_delivery_spool() -> None:
             return
         restored_paths = []
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            ensure_client_cloud_delivery_table(conn.cursor())
             for filename in spool_files:
                 spool_path = os.path.join(_CLIENT_CLOUD_SPOOL_DIR, filename)
                 try:
@@ -1102,6 +1163,7 @@ def _restore_client_cloud_delivery_spool() -> None:
 
 
 def get_due_client_cloud_deliveries(limit: int = 50) -> List[Dict[str, Any]]:
+    ensure_client_cloud_delivery_table()
     _restore_client_cloud_delivery_spool()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
@@ -1118,6 +1180,7 @@ def get_due_client_cloud_deliveries(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def mark_client_cloud_delivery_succeeded(event_id: str) -> None:
+    ensure_client_cloud_delivery_table()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute(
             """UPDATE client_cloud_delivery
@@ -1130,6 +1193,7 @@ def mark_client_cloud_delivery_succeeded(event_id: str) -> None:
 
 
 def mark_client_cloud_delivery_failed(event_id: str, error: str) -> None:
+    ensure_client_cloud_delivery_table()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute(
             """UPDATE client_cloud_delivery
@@ -7024,8 +7088,10 @@ def get_camera_room_mappings(active_only: bool = True, organization_id: Optional
 # Automatically ensure schema and migrations are up-to-date on load
 try:
     init_db()
+    ensure_client_cloud_delivery_table()
 except Exception as _e:
     logger.warning(f"Database auto-migration on import failed: {_e}")
 
 if __name__ == '__main__':
     init_db()
+    ensure_client_cloud_delivery_table()
