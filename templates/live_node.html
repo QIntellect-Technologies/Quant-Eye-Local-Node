@@ -1469,7 +1469,8 @@
         if (!res.ok) throw new Error(`Camera API returned HTTP ${res.status}`);
         const data = await res.json();
         if (data.success && Array.isArray(data.cameras)) {
-          const newKey = data.cameras.map(c => `${c.id}:${c.name}`).sort().join('|');
+          // LE-1: key includes name + location so Settings renames refresh header/tiles.
+          const newKey = data.cameras.map(c => `${c.id}:${c.name}:${c.room_name || c.location || ''}`).sort().join('|');
           if (lastCameraKey === null || newKey !== lastCameraKey) {
             lastCameraKey = newKey;
             allCameras = data.cameras;
@@ -1521,21 +1522,24 @@
       allCameras.forEach((cam, idx) => {
         const isAct = (selectedCameraId === cam.id || (!selectedCameraId && idx === 0));
         if (isAct && !selectedCameraId) selectedCameraId = cam.id;
+        const loc = (cam.room_name || cam.location || '').trim();
+        const label = loc ? `${cam.name} · ${loc}` : cam.name;
         html += `
-          <button type="button" class="camera-tab-btn ${isAct ? 'active' : ''}" onclick="selectSingleCamera('${cam.id}', '${cam.name.replace(/'/g, "\\'")}')">
+          <button type="button" class="camera-tab-btn ${isAct ? 'active' : ''}" onclick="selectSingleCamera('${cam.id}', '${cam.name.replace(/'/g, "\\'")}', '${loc.replace(/'/g, "\\'")}')">
             <i class="fa-solid fa-camera"></i>
-            <span>${cam.name}</span>
+            <span>${label}</span>
           </button>
         `;
       });
       container.innerHTML = html;
     }
 
-    function selectSingleCamera(camId, camName) {
+    function selectSingleCamera(camId, camName, camLoc) {
       selectedCameraId = camId;
       renderCameraTabs();
       const badge = document.getElementById('singleCamBadgeName');
-      if (badge) badge.textContent = camName.toUpperCase();
+      const loc = (camLoc || (allCameras.find(c => c.id === camId) || {}).room_name || (allCameras.find(c => c.id === camId) || {}).location || '').trim();
+      if (badge) badge.textContent = loc ? `${camName.toUpperCase()} · ${loc.toUpperCase()}` : camName.toUpperCase();
       const img = document.getElementById('streamView');
       if (img) img.src = `/stream/${camId}`;
       setLiveCameraLayout('single');
@@ -1589,11 +1593,13 @@
 
       let html = '';
       allCameras.forEach(cam => {
+        const loc = (cam.room_name || cam.location || '').trim();
+        const badgeLabel = loc ? `${cam.name.toUpperCase()} · ${loc.toUpperCase()}` : cam.name.toUpperCase();
         html += `
           <div class="grid-cam-card" id="camCard_${cam.id}">
             <div class="cctv-badge">
               <span class="cctv-badge-dot"></span>
-              <span>${cam.name.toUpperCase()}</span>
+              <span>${badgeLabel}</span>
             </div>
             <div class="cctv-top-actions">
               <button type="button" class="cctv-fullscreen-btn" onclick="toggleCameraFullscreen('camCard_${cam.id}')">
@@ -1638,7 +1644,7 @@
         const data = await res.json();
         if (data.success) {
           allCameras = data.cameras || [];
-          lastCameraKey = allCameras.map(c => `${c.id}:${c.name}`).sort().join('|');
+          lastCameraKey = allCameras.map(c => `${c.id}:${c.name}:${c.room_name || c.location || ''}`).sort().join('|');
           renderCameraTabs();
           const emptyEl = document.getElementById('emptyCameraState');
 

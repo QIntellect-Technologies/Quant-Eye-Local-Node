@@ -1928,6 +1928,8 @@ def fetch_all_cloud_cameras(org_id: str, branch_id: str) -> List[Dict[str, Any]]
         c_copy["camera_id"] = primary_id
         c_copy["name"] = c.get("name") or c.get("camera_name") or f"Camera {primary_id}"
         c_copy["camera_name"] = c_copy["name"]
+        c_copy["room_name"] = c.get("room_name") or c.get("location") or "Live Monitoring"
+        c_copy["location"] = c_copy["room_name"]
         c_copy["rtsp_url"] = url
         collected_cams[primary_id] = c_copy
 
@@ -1995,12 +1997,13 @@ def init_camera_streams():
     for cam in cameras_to_use:
         cid = str(cam.get("id") or cam.get("camera_id"))
         cname = cam.get("name") or cam.get("camera_name", f"Camera {cid}")
+        room = str(cam.get("room_name") or cam.get("location") or "").strip() or "Live Monitoring"
         raw_source = cam.get("rtsp_url")
         source = "" if raw_source is None else str(raw_source).strip()
         cam_type = str(cam.get("camera_type", "rtsp")).lower()
         if not source or (source == "0" and cam_type != "webcam"):
             continue
-        valid_cams[cid] = (cname, source)
+        valid_cams[cid] = (cname, source, room)
 
     # 1. Stop and remove stale / deleted cameras under lock
     with active_readers_lock:
@@ -2015,17 +2018,22 @@ def init_camera_streams():
                     logger.debug(f"Error stopping camera {cid}: {e}")
 
     # 2. Add or update cameras using exact get_or_create_reader (outside lock, handles its own lock and hardware capture)
-    for cid, (cname, source) in valid_cams.items():
+    for cid, (cname, source, room) in valid_cams.items():
         try:
             reader = get_or_create_reader(cid, source)
-            logger.info(f"Active camera stream reader: {cname} ({cid}) -> {source}")
+            # LE-1: keep live labels in sync when name/location change without RTSP change.
+            if reader:
+                reader.camera_label = cname
+                reader.camera_name = cname
+                reader.room_name = room
+            logger.info(f"Active camera stream reader: {cname} ({cid}) @ {room} -> {source}")
         except Exception as e:
             logger.error(f"Failed to start camera {cid}: {e}")
 
 _last_cloud_cam_hash = None
 
 def _background_camera_sync_loop():
-    """Poll Cloud every 3 seconds for real-time camera additions or deletions."""
+    """Poll Cloud every 3 seconds for real-time camera additions, deletions, or rename/location updates."""
     global _last_cloud_cam_hash
     while True:
         try:
@@ -2034,7 +2042,16 @@ def _background_camera_sync_loop():
             branch_id = CONFIG.get("branch_id")
             if org_id and branch_id:
                 cams = fetch_all_cloud_cameras(org_id, branch_id)
-                cam_hash = json.dumps([(c.get("id") or c.get("camera_id"), c.get("rtsp_url")) for c in cams], sort_keys=True)
+                # LE-1: include name + room so label/location edits refresh streams/UI.
+                cam_hash = json.dumps([
+                    (
+                        c.get("id") or c.get("camera_id"),
+                        c.get("rtsp_url"),
+                        c.get("name") or c.get("camera_name"),
+                        c.get("room_name") or c.get("location"),
+                    )
+                    for c in cams
+                ], sort_keys=True)
                 if _last_cloud_cam_hash is not None and cam_hash != _last_cloud_cam_hash:
                     logger.info(f"[REAL-TIME SYNC] Cloud camera changes detected ({len(cams)} cameras). Reloading streams...")
                     init_camera_streams()
@@ -2151,24 +2168,65 @@ def camera_stream_feed(camera_id):
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
+def _node_camera_list_payload():
+    """Build camera list for live UI, preferring latest CONFIG name/location (LE-1)."""
+    config_by_id = {}
+    for c in CONFIG.get("cameras", []) or []:
+        cid = str(c.get("id") or c.get("camera_id") or "").strip()
+        if not cid:
+            continue
+        config_by_id[cid] = c
+
+    cams = []
+    with active_readers_lock:
+        for cid, r in active_stream_readers.items():
+            cfg = config_by_id.get(str(cid), {})
+            cname = (
+                cfg.get("name")
+                or cfg.get("camera_name")
+                or getattr(r, "camera_label", None)
+                or getattr(r, "camera_name", None)
+                or f"Camera {cid}"
+            )
+            room = (
+                cfg.get("room_name")
+                or cfg.get("location")
+                or getattr(r, "room_name", None)
+                or "Live Monitoring"
+            )
+            try:
+                r.camera_label = cname
+                r.camera_name = cname
+                r.room_name = room
+            except Exception:
+                pass
+            cams.append({
+                "id": cid,
+                "name": cname,
+                "room_name": room,
+                "location": room,
+                "stream_url": f"/stream/{cid}",
+            })
+
+    if not cams:
+        for cid, c in config_by_id.items():
+            cname = c.get("name") or c.get("camera_name", f"Camera {cid}")
+            room = c.get("room_name") or c.get("location") or "Live Monitoring"
+            cams.append({
+                "id": cid,
+                "name": cname,
+                "room_name": room,
+                "location": room,
+                "stream_url": f"/stream/{cid}",
+            })
+    return cams
+
+
 @app.route('/api/node/cameras')
 @app.route('/api/cameras')
 def get_node_cameras():
     """Return active cameras for frontend grid layout."""
-    cams = []
-    with active_readers_lock:
-        for cid, r in active_stream_readers.items():
-            cname = getattr(r, 'camera_label', None) or getattr(r, 'camera_name', f"Camera {cid}")
-            cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
-
-    # If stream readers are still connecting in background, provide configured cameras immediately
-    if not cams:
-        for c in CONFIG.get("cameras", []):
-            cid = str(c.get("id") or c.get("camera_id"))
-            cname = c.get("name") or c.get("camera_name", f"Camera {cid}")
-            cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
-
-    return jsonify({"success": True, "cameras": cams})
+    return jsonify({"success": True, "cameras": _node_camera_list_payload()})
 
 
 @app.route('/api/node/detections')
@@ -2570,16 +2628,7 @@ def api_node_cameras_refresh():
         else:
             _record_cloud_sync(True, hop=None, error=None)
         init_camera_streams()
-        cams = []
-        with readers_lock:
-            for cid, r in ACTIVE_CAMERA_READERS.items():
-                cname = getattr(r, 'camera_label', None) or getattr(r, 'camera_name', f"Camera {cid}")
-                cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
-        if not cams:
-            for c in CONFIG.get("cameras", []):
-                cid = str(c.get("id") or c.get("camera_id"))
-                cname = c.get("name") or c.get("camera_name", f"Camera {cid}")
-                cams.append({"id": cid, "name": cname, "stream_url": f"/stream/{cid}"})
+        cams = _node_camera_list_payload()
         return jsonify({
             "success": True,
             "message": "Cloud employees, attendance state, and cameras synchronized",
