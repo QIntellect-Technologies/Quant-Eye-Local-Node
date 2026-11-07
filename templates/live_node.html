@@ -1487,12 +1487,10 @@
               selectedCameraId = null;
             } else {
               if (emptyEl) emptyEl.style.display = 'none';
+              // LE-1: always re-apply name/location so header + tiles update without reload.
               if (currentLayout === 'single') {
-                if (!allCameras.some(c => c.id === selectedCameraId)) {
-                  selectSingleCamera(allCameras[0].id, allCameras[0].name);
-                } else {
-                  setLiveCameraLayout('single');
-                }
+                const cam = allCameras.find(c => c.id === selectedCameraId) || allCameras[0];
+                selectSingleCamera(cam.id, cam.name, cam.room_name || cam.location || '');
               } else {
                 setLiveCameraLayout('grid');
               }
