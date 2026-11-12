@@ -471,12 +471,12 @@
       color: #ffffff;
     }
 
-    /* Main CCTV Stage Layout */
+    /* Main CCTV Stage Layout — CM-01: start alignment so >6 tiles are not clipped */
     .cctv-layout {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 300px;
       gap: 16px;
-      align-items: stretch;
+      align-items: start;
     }
 
     @media (max-width: 1100px) {
@@ -490,6 +490,12 @@
       flex-direction: column;
       gap: 10px;
       min-width: 0;
+      overflow: visible;
+    }
+
+    #multiCameraGridContainer {
+      overflow: visible;
+      width: 100%;
     }
 
     /* Empty Camera Notification Card */
@@ -626,12 +632,14 @@
       transform: scale(1.02);
     }
 
-    /* Multi-Camera Grid (STRICT 2-COLUMN GRID) */
+    /* Multi-Camera Grid — CM-01: wrap every camera, no 6-tile viewport clip */
     .cctv-multi-grid {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
       gap: 12px;
       width: 100%;
+      overflow: visible;
+      align-items: stretch;
     }
 
     @media (max-width: 768px) {
@@ -642,6 +650,7 @@
 
     .grid-cam-card {
       position: relative;
+      min-width: 0;
       background: #020617;
       border-radius: 12px;
       overflow: hidden;
